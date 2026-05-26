@@ -64,7 +64,7 @@ TIMEOUT_DM_MESSAGES: list[str] = [
     "Your timeout is sponsored by Solace, Ghosty, and your own incredible nerve. 60 seconds 🌸✨",
 ]
 
-LOCKDOWN_PREFIXES: tuple[str, ...] = ("?area", "?c4")
+LOCKDOWN_PREFIXES: tuple[str, ...] = ("?area", "?c4", "?checkers")
 
 LOCKDOWN_DM_MESSAGES: list[str] = [
     "🚨 AREA LOCKDOWN INITIATED — you triggered the protocol. 5 minutes. Do not move 👻",

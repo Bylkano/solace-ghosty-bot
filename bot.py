@@ -47,6 +47,7 @@ COGS = [
     "cogs.general",
     "cogs.moderation",
     "cogs.events",
+    "cogs.economy",
 ]
 
 

@@ -528,7 +528,7 @@ class Heist(commands.Cog):
         channel_id = None
 
         # PUT YOUR EVENT CHANNEL ID HERE
-        EVENT_CHANNEL_ID = 123456789
+        EVENT_CHANNEL_ID = 1508881699662987325
 
         channel_id = EVENT_CHANNEL_ID
 

@@ -48,6 +48,7 @@ COGS = [
     "cogs.moderation",
     "cogs.events",
     "cogs.economy",
+    "cogs.heist",
 ]
 
 

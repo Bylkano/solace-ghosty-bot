@@ -1,145 +1,350 @@
 import discord
+
 from discord.ext import commands, tasks
+
 from discord import app_commands
 
+
+
 import json
+
 import os
+
 import random
+
 from datetime import datetime
 
 
+
 HEIST_FILE = "heist_teams.json"
+
 ECONOMY_FILE = "economy.json"
+
 SHOP_FILE = "blackmarket.json"
 
+CONFIG_FILE = "heist_config.json"
+
+
 
 # =========================
+
 # JSON HELPERS
+
 # =========================
+
+
 
 def load_json(path, default):
+
     if not os.path.exists(path):
+
         with open(path, "w") as f:
+
             json.dump(default, f, indent=4)
+
         return default
 
+
+
     with open(path, "r") as f:
+
         try:
+
             return json.load(f)
+
         except:
+
             return default
 
 
+
+
+
 def save_json(path, data):
+
     with open(path, "w") as f:
+
         json.dump(data, f, indent=4)
 
 
-# =========================
-# DEFAULT SHOP
+
+
+
 # =========================
 
+# SHOP SETUP
+
+# =========================
+
+
+
 def setup_shop():
+
     if not os.path.exists(SHOP_FILE):
+
         default_shop = {
-            "shield": {
-                "price": 5000,
-                "description": "Blocks the next heist attack"
-            },
-            "spy": {
-                "price": 7000,
-                "description": "Reveal another team's balance"
-            },
-            "double_heist": {
-                "price": 10000,
-                "description": "Next heist gives double rewards"
-            },
-            "insurance": {
-                "price": 4000,
-                "description": "Reduces failed heist penalty"
-            },
-            "freeze": {
-                "price": 8000,
-                "description": "Freeze another team's heists"
-            }
+
+            "shield": {"price": 5000, "description": "Blocks next heist attack"},
+
+            "spy": {"price": 7000, "description": "Reveal team balance"},
+
+            "double_heist": {"price": 10000, "description": "Double rewards"},
+
+            "insurance": {"price": 4000, "description": "Reduce losses"},
+
+            "freeze": {"price": 8000, "description": "Freeze a team"}
+
         }
 
         save_json(SHOP_FILE, default_shop)
 
 
-# =========================
-# COG
+
+
+
 # =========================
 
+# CONFIG SYSTEM
+
+# =========================
+
+
+
+def load_config():
+
+    return load_json(CONFIG_FILE, {"disabled_commands": []})
+
+
+
+
+
+def is_disabled(cmd):
+
+    return cmd in load_config().get("disabled_commands", [])
+
+
+
+
+
+# =========================
+
+# COG
+
+# =========================
+
+
+
 class Heist(commands.Cog):
+
     def __init__(self, bot):
+
         self.bot = bot
 
         setup_shop()
 
+
+
         self.random_events.start()
 
-    # =========================
-    # ECONOMY HELPERS
-    # =========================
+        self.money_trucks.start()
+
+        self.world_events.start()
+
+
+
+    # ===== ECONOMY =====
 
     def get_balance(self, user_id):
-        economy = load_json(ECONOMY_FILE, {})
-        user_id = str(user_id)
 
-        if user_id not in economy:
-            economy[user_id] = {
-                "wallet": 0
-            }
-            save_json(ECONOMY_FILE, economy)
+        eco = load_json(ECONOMY_FILE, {})
 
-        return economy[user_id]["wallet"]
+        return eco.get(str(user_id), {}).get("wallet", 0)
 
-    def add_balance(self, user_id, amount):
-        economy = load_json(ECONOMY_FILE, {})
-        user_id = str(user_id)
 
-        if user_id not in economy:
-            economy[user_id] = {
-                "wallet": 0
-            }
 
-        economy[user_id]["wallet"] += amount
+    def add_balance(self, user_id, amt):
 
-        if economy[user_id]["wallet"] < 0:
-            economy[user_id]["wallet"] = 0
+        eco = load_json(ECONOMY_FILE, {})
 
-        save_json(ECONOMY_FILE, economy)
+        uid = str(user_id)
 
-    # =========================
-    # TEAM HELPERS
-    # =========================
 
-    def get_team_total(self, team_name):
+
+        if uid not in eco:
+
+            eco[uid] = {"wallet": 0}
+
+
+
+        eco[uid]["wallet"] += amt
+
+        eco[uid]["wallet"] = max(0, eco[uid]["wallet"])
+
+        save_json(ECONOMY_FILE, eco)
+
+
+
+    # ===== TEAMS =====
+
+    def get_team(self, user_id):
+
         teams = load_json(HEIST_FILE, {})
 
-        if team_name not in teams:
-            return 0
+        for t, d in teams.items():
 
-        total = 0
+            if user_id in d["members"]:
 
-        for member_id in teams[team_name]["members"]:
-            total += self.get_balance(member_id)
-
-        return total
-
-    def get_user_team(self, user_id):
-        teams = load_json(HEIST_FILE, {})
-
-        for team_name, data in teams.items():
-            if user_id in data["members"]:
-                return team_name
+                return t
 
         return None
 
+
+
+    def team_total(self, team):
+
+        teams = load_json(HEIST_FILE, {})
+
+        return sum(self.get_balance(u) for u in teams.get(team, {}).get("members", []))
+
+
+
+    # ===== SUCCESS MODIFIER =====
+
+    def roll(self, base):
+
+        return random.randint(1, 100) <= base
+
+
+
     # =========================
-    # CREATE TEAM
+
+    # TEAM COMMANDS
+
     # =========================
+
+    @app_commands.command(name="createteam")
+
+    async def createteam(self, interaction: discord.Interaction, name: str):
+
+        if is_disabled("createteam"):
+
+            return await interaction.response.send_message("Disabled", ephemeral=True)
+
+
+
+        teams = load_json(HEIST_FILE, {})
+
+        if name in teams:
+
+            return await interaction.response.send_message("Exists", ephemeral=True)
+
+
+
+        teams[name] = {"members": [], "inventory": []}
+
+        save_json(HEIST_FILE, teams)
+
+        await interaction.response.send_message("Created")
+
+
+
+    # =========================
+
+    # HEIST
+
+    # =========================
+
+    @app_commands.command(name="heist")
+
+    async def heist(self, interaction: discord.Interaction, target: str):
+
+        if is_disabled("heist"):
+
+            return await interaction.response.send_message("Disabled", ephemeral=True)
+
+
+
+        user_team = self.get_team(interaction.user.id)
+
+        teams = load_json(HEIST_FILE, {})
+
+
+
+        if not user_team or target not in teams:
+
+            return await interaction.response.send_message("Invalid")
+
+
+
+        base_success = 55
+
+        modifier = 0
+
+
+
+        if self.team_total(user_team) > self.team_total(target):
+
+            modifier += 10
+
+
+
+        success = self.roll(base_success + modifier)
+
+
+
+        if success:
+
+            stolen = int(self.team_total(target) * 0.2)
+
+            self.add_balance(interaction.user.id, stolen)
+
+            await interaction.response.send_message("Heist success")
+
+        else:
+
+            loss = int(self.team_total(user_team) * 0.1)
+
+            self.add_balance(interaction.user.id, -loss)
+
+            await interaction.response.send_message("Failed")
+
+
+
+    # =========================
+
+    # RANDOM EVENTS LOOP
+
+    # =========================
+
+    @tasks.loop(minutes=45)
+
+    async def random_events(self):
+
+        pass
+
+
+
+    @tasks.loop(minutes=60)
+
+    async def money_trucks(self):
+
+        pass
+
+
+
+    @tasks.loop(minutes=90)
+
+    async def world_events(self):
+
+        pass
+
+
+
+
+
+async def setup(bot):
+
+    await bot.add_cog(Heist(bot))
 
     @app_commands.command(name="createteam", description="Create a heist team")
     @app_commands.checks.has_permissions(administrator=True)

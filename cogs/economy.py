@@ -246,12 +246,19 @@ class Economy(commands.Cog):
         embed.set_footer(text="Come back in 24 hours for your next reward.")
         await interaction.response.send_message(embed=embed)
 
+    # FIX: Changed choice parameter from Choice[str] to plain str,
+    # and added @app_commands.choices() decorator instead.
+    # Also removed the broken autocomplete method below.
     @app_commands.command(name="coinflip", description="Bet your currency on a coin flip.")
     @app_commands.guild_only()
+    @app_commands.choices(choice=[
+        app_commands.Choice(name="Heads", value="heads"),
+        app_commands.Choice(name="Tails", value="tails"),
+    ])
     async def coinflip(
         self,
         interaction: discord.Interaction,
-        choice: discord.app_commands.Choice[str],
+        choice: str,  # FIX: was Choice[str], must be plain str
         bet: app_commands.Range[int, 1],
     ) -> None:
         assert interaction.guild_id is not None
@@ -265,7 +272,7 @@ class Economy(commands.Cog):
             return
 
         result = random.choice(["heads", "tails"])
-        won = choice.value == result
+        won = choice == result  # FIX: was choice.value == result
 
         if won:
             new_bal = bal + bet
@@ -290,21 +297,10 @@ class Economy(commands.Cog):
                 color=discord.Color.red(),
             )
 
-        embed.set_footer(text=f"Your pick: {choice.value}")
+        embed.set_footer(text=f"Your pick: {choice}")  # FIX: was choice.value
         await interaction.response.send_message(embed=embed)
-
-    @coinflip.autocomplete("choice")
-    async def coinflip_choice_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        options = [
-            app_commands.Choice(name="Heads", value="heads"),
-            app_commands.Choice(name="Tails", value="tails"),
-        ]
-        return [o for o in options if current.lower() in o.name.lower()]
 
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Economy(bot))
+        

@@ -64,6 +64,21 @@ TIMEOUT_DM_MESSAGES: list[str] = [
     "Your timeout is sponsored by Solace, Ghosty, and your own incredible nerve. 60 seconds 🌸✨",
 ]
 
+LOCKDOWN_PREFIXES: tuple[str, ...] = ("?area", "?c4")
+
+LOCKDOWN_DM_MESSAGES: list[str] = [
+    "🚨 AREA LOCKDOWN INITIATED — you triggered the protocol. 5 minutes. Do not move 👻",
+    "💥 C4 detonation detected. The area has been locked down and so have you. 5 mins 🔒",
+    "⚠️ Solace security has flagged your message. Area sealed. Timeout: 5 minutes 🌙",
+    "🔴 ALERT: unauthorized detonation attempt logged. Ghosty has secured the perimeter. Sit tight 👻💜",
+    "💣 Bold choice. The C4 did not go off. You did, however, receive a 5-minute timeout 😌",
+    "🚧 Area locked. Ghosty is sweeping the zone. Please remain timed out for 5 minutes 👻✨",
+    "📡 Solace Command has been notified. The area is sealed and you're in containment. 5 mins 🖤",
+    "🔐 Access denied. The zone is locked and Ghosty has your coordinates. 5-minute cooldown 💜",
+    "💥 Detonation sequence cancelled by Ghosty. You, however, are not cancelled — just timed out 😘",
+    "🚨 C4 in the zone? Not on Ghosty's watch. Area clear. You: timed out for 5 minutes 👻💅",
+]
+
 BLOCKED_PREFIXES: tuple[str, ...] = (
     "?send ghosty",
     "?give ghosty",
@@ -108,6 +123,7 @@ class Events(commands.Cog):
             return
 
         await self._check_blocked_prefixes(message)
+        await self._check_lockdown_phrases(message)
         await self.bot.process_commands(message)
 
     async def _check_blocked_prefixes(self, message: discord.Message) -> None:
@@ -139,6 +155,38 @@ class Events(commands.Cog):
 
         try:
             await message.author.send(random.choice(TIMEOUT_DM_MESSAGES))
+        except discord.Forbidden:
+            pass
+
+    async def _check_lockdown_phrases(self, message: discord.Message) -> None:
+        """Delete the message and timeout the author for 5 minutes if it starts with a lockdown phrase."""
+        if message.guild is None:
+            return
+        automod_channel_id = get_automod_channel(message.guild.id)
+        if automod_channel_id is None or message.channel.id != automod_channel_id:
+            return
+
+        if not message.content.lower().startswith(LOCKDOWN_PREFIXES):
+            return
+
+        if not isinstance(message.author, discord.Member):
+            return
+
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            return
+
+        try:
+            await message.author.timeout(
+                datetime.timedelta(minutes=5),
+                reason="Automatic: lockdown phrase used",
+            )
+        except discord.Forbidden:
+            pass
+
+        try:
+            await message.author.send(random.choice(LOCKDOWN_DM_MESSAGES))
         except discord.Forbidden:
             pass
 

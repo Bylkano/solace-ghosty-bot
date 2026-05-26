@@ -84,6 +84,8 @@ BLOCKED_PREFIXES: tuple[str, ...] = (
     "?give ghosty",
     "?send <@458302301187342336>",
     "?give <@458302301187342336>",
+    "?riddle",
+    "?daily",
 )
 
 

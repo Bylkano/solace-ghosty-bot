@@ -1,10 +1,12 @@
 import asyncio
+import logging
 import discord
 from discord import app_commands
 from discord.ext import commands
 import g4f
-# Import a highly reliable free provider backend
-from g4f.Provider import ChatGptEs 
+
+# Setup basic logging to see exact AI errors in Render logs
+logger = logging.getLogger('bot')
 
 _SYSTEM_PROMPT = (
     "You are a razor-sharp roast comedian who specialises in gaming burns. "
@@ -41,10 +43,9 @@ class Fun(commands.Cog):
         )
 
         def _call_g4f() -> str:
-            # Switched to gpt_4o and forced the ChatGptEs provider for stability
+            # Let g4f auto-select the best working provider dynamically
             response = g4f.ChatCompletion.create(
-                model=g4f.models.gpt_4o,
-                provider=ChatGptEs,
+                model=g4f.models.gpt_4, 
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_prompt},
@@ -56,7 +57,9 @@ class Fun(commands.Cog):
             text = await asyncio.to_thread(_call_g4f)
             text = text.strip() or "The roast generator blanked — must be too busy admiring you. 😏"
             await interaction.followup.send(f"🔥 {text}")
-        except Exception:
+        except Exception as e:
+            # This logs the exact hidden issue to your Render console
+            logger.error(f"Roast AI failed: {e}")
             await interaction.followup.send(
                 "❌ Roast machine jammed. Try again in a moment.", ephemeral=True
             )

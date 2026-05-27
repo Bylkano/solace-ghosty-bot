@@ -166,7 +166,7 @@ class Events(commands.Cog):
 
         try:
             await message.author.timeout(
-                datetime.timedelta(minutes=2),
+                datetime.timedelta(minutes=3),
                 reason="Automatic: blocked command used",
             )
         except discord.Forbidden:

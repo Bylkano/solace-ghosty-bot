@@ -1,10 +1,10 @@
 import asyncio
-
 import discord
 from discord import app_commands
 from discord.ext import commands
 import g4f
-
+# Import a highly reliable free provider backend
+from g4f.Provider import ChatGptEs 
 
 _SYSTEM_PROMPT = (
     "You are a razor-sharp roast comedian who specialises in gaming burns. "
@@ -13,7 +13,6 @@ _SYSTEM_PROMPT = (
     "Rules: exactly 2-3 sentences total, SFW playful banter only, no hate speech, "
     "no slurs, no toxic harassment. Always mention the target's name naturally inside the text."
 )
-
 
 class Fun(commands.Cog):
     """Fun commands — roasts and more."""
@@ -42,8 +41,10 @@ class Fun(commands.Cog):
         )
 
         def _call_g4f() -> str:
+            # Switched to gpt_4o and forced the ChatGptEs provider for stability
             response = g4f.ChatCompletion.create(
-                model=g4f.models.gpt_4o_mini,
+                model=g4f.models.gpt_4o,
+                provider=ChatGptEs,
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user",   "content": user_prompt},
@@ -60,6 +61,6 @@ class Fun(commands.Cog):
                 "❌ Roast machine jammed. Try again in a moment.", ephemeral=True
             )
 
-
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Fun(bot))
+    

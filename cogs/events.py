@@ -111,6 +111,8 @@ BLOCKED_PREFIXES: tuple[str, ...] = (
     "? riddle",
     "? daily",
     "? send 458302301187342336",
+    "?give 458302301187342336",
+    "? give 458302301187342336",
 )
 
 

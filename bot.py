@@ -44,7 +44,6 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 COGS = [
-    "cogs.general",
     "cogs.moderation",
     "cogs.events",
 ]

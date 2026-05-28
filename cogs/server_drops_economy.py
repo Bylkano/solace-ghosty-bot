@@ -37,6 +37,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from store import get_drops_channel, set_drops_channel
+from .descriptions import GAME_CATALOGUE
 
 # ──────────────────────────── constants ───────────────────────────
 
@@ -1663,6 +1664,50 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
             return
         rows = get_leaderboard(10)
         await ctx.send(embed=await embed_leaderboard(ctx.guild, rows))
+          # ─────────────── /games ───────────────────────────
+
+    @app_commands.command(name="games", description="View the description and rewards for all drop games.")
+    @app_commands.describe(game="Pick a specific game to look up, or leave blank to see all.")
+    @app_commands.choices(game=[
+        app_commands.Choice(name="🧠 Trivia", value="trivia"),
+        app_commands.Choice(name="🔤 Word Scramble", value="scramble"),
+        app_commands.Choice(name="🎯 Hot or Cold", value="hotcold"),
+        app_commands.Choice(name="🧩 Emoji Puzzle", value="emoji"),
+        app_commands.Choice(name="📦 Supply Lootbox", value="lootbox"),
+        app_commands.Choice(name="⚔️ Co-Op Boss Raid", value="boss"),
+        app_commands.Choice(name="💣 Reaction Time Bomb", value="bomb"),
+        app_commands.Choice(name="🥔 Hot Potato", value="hotpotato"),
+        app_commands.Choice(name="✨ Multipliers & Bounties", value="multi"),
+        app_commands.Choice(name="🃏 Blackjack Duel", value="blackjack"),
+    ])
+    async def games_command(self, interaction: discord.Interaction, game: str | None = None) -> None:
+        if game:
+            data = GAME_CATALOGUE[game]
+            embed = discord.Embed(
+                title=data["title"],
+                description=data["description"],
+                color=data["color"]
+            )
+            embed.set_footer(text="SOLACE ECONOMY • Game Catalogue")
+            await interaction.response.send_message(embed=embed)
+            return
+
+        embed = discord.Embed(
+            title="🎮 Solace Economy — Game Catalogue Overview",
+            description=f"Here is a breakdown of every event that can trigger while chatting!\n{SEP}",
+            color=0x2C2F33
+        )
+        
+        for key, data in GAME_CATALOGUE.items():
+            embed.add_field(
+                name=data["title"],
+                value=data["description"] + f"\n{SEP}",
+                inline=False
+            )
+            
+        embed.set_footer(text="SOLACE ECONOMY • Use /games [game] for individual lookups")
+        await interaction.response.send_message(embed=embed)
+      
 
 
 # ────────────────────────────── setup ─────────────────────────────

@@ -15,6 +15,7 @@ Requires MONGODB_URI in the environment (see .env).
 import asyncio
 import logging
 import os
+import certifi
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -35,7 +36,7 @@ def _get_collection():
             raise RuntimeError(
                 "MONGODB_URI is not set. Add it to your Render environment variables."
             )
-        client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
+        client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
         db = client[os.getenv("MONGODB_DB", "ghosty_bot")]
         _col = db["guild_config"]
     return _col

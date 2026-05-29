@@ -1664,6 +1664,43 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
         rows = get_leaderboard(10)
         await ctx.send(embed=await embed_leaderboard(ctx.guild, rows))
 
+    # ─────────────── /givepts ─────────────────────────
+
+    @app_commands.command(name="givepts", description="Give or deduct points from a member. Use negative values to deduct.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        member="The member to give or deduct points from.",
+        amount="Points to add (positive) or remove (negative).",
+    )
+    async def givepts(self, interaction: discord.Interaction, member: discord.Member, amount: int) -> None:
+        if amount == 0:
+            await interaction.response.send_message("Amount can't be zero.", ephemeral=True)
+            return
+
+        if amount > 0:
+            new_total = add_points(member.id, amount)
+            sign      = f"＋{amount}"
+            colour    = C_SET
+            action    = "awarded"
+        else:
+            new_total = deduct_points(member.id, abs(amount))
+            sign      = f"−{abs(amount)}"
+            colour    = 0xE74C3C
+            action    = "deducted"
+
+        e = discord.Embed(colour=colour)
+        e.description = (
+            f"```ansi\n\u001b[1;32m  ◈  POINTS {action.upper()}  ◈\u001b[0m\n```"
+            f"{SEP}\n"
+            f"**{member.display_name}**\n"
+            f"{sign} pts  ›  New balance: `{new_total:,} pts`\n"
+            f"{SEP}"
+        )
+        e.set_thumbnail(url=member.display_avatar.url)
+        e.set_footer(text=f"SOLACE ECONOMY  •  Adjusted by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=e)
+
 
 # ────────────────────────────── setup ─────────────────────────────
 

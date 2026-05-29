@@ -1,4 +1,5 @@
 import datetime
+import logging
 import sys
 import pathlib
 from collections import defaultdict
@@ -10,6 +11,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from store import get_automod_channel
+
+log = logging.getLogger("bot.events")
 
 LOCKDOWN_PREFIXES: tuple[str, ...] = ("?area", "?c4", "?checkers")
 
@@ -50,23 +53,17 @@ class Events(commands.Cog):
     # Internal warn helper
     # ------------------------------------------------------------------
 
-    async def _apply_warn(
-        self,
-        member: discord.Member,
-        reason: str,
-    ) -> None:
+    async def _apply_warn(self, member: discord.Member, reason: str) -> None:
         """Increment warn counter, mute the member, and DM them a report.
 
         * 1st / 2nd warn  → 3-minute timeout + DM with warns remaining
         * 3rd warn        → 30-minute timeout, warns reset to 0
-        No message is sent in the server channel.
         """
         guild_id = member.guild.id
         self._warns[guild_id][member.id] += 1
         warn_count = self._warns[guild_id][member.id]
 
         if warn_count >= MAX_WARNS:
-            # Long mute — reset warns
             self._warns[guild_id][member.id] = 0
             mute_duration = datetime.timedelta(minutes=LONG_MUTE_MINUTES)
             mute_reason = f"Automatic: reached {MAX_WARNS} warns ({reason})"
@@ -81,7 +78,6 @@ class Events(commands.Cog):
                 color=discord.Color.dark_red(),
             )
         else:
-            # Short mute
             warns_left = MAX_WARNS - warn_count
             mute_duration = datetime.timedelta(minutes=SHORT_MUTE_MINUTES)
             mute_reason = f"Automatic: warn {warn_count}/{MAX_WARNS} ({reason})"
@@ -99,13 +95,11 @@ class Events(commands.Cog):
 
         dm_embed.set_footer(text=f"Server: {member.guild.name}")
 
-        # Apply timeout
         try:
             await member.timeout(mute_duration, reason=mute_reason)
         except discord.Forbidden:
             pass
 
-        # DM the user — silently ignore if DMs are closed
         try:
             await member.send(embed=dm_embed)
         except (discord.Forbidden, discord.HTTPException):
@@ -117,7 +111,6 @@ class Events(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
-        """Fires when a new member joins the server."""
         system_channel = member.guild.system_channel
         if system_channel is not None:
             embed = discord.Embed(
@@ -131,59 +124,46 @@ class Events(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
-        """Fires when a member leaves the server."""
         pass
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        """Fires on every message. Avoid heavy logic here."""
         if message.author.bot:
             return
-
         await self._check_blocked_prefixes(message)
         await self._check_lockdown_phrases(message)
         await self.bot.process_commands(message)
 
     async def _check_blocked_prefixes(self, message: discord.Message) -> None:
-        """Delete the message and warn/timeout the author."""
         if message.guild is None:
             return
-        automod_channel_id = await get_automod_channel(message.guild.id)
+        automod_channel_id = get_automod_channel(message.guild.id)
         if automod_channel_id is None or message.channel.id != automod_channel_id:
             return
-
         if not message.content.lower().startswith(BLOCKED_PREFIXES):
             return
-
         if not isinstance(message.author, discord.Member):
             return
-
         try:
             await message.delete()
         except discord.Forbidden:
             return
-
         await self._apply_warn(message.author, reason="blocked command used")
 
     async def _check_lockdown_phrases(self, message: discord.Message) -> None:
-        """Delete the message and warn/timeout the author."""
         if message.guild is None:
             return
-        automod_channel_id = await get_automod_channel(message.guild.id)
+        automod_channel_id = get_automod_channel(message.guild.id)
         if automod_channel_id is None or message.channel.id != automod_channel_id:
             return
-
         if not message.content.lower().startswith(LOCKDOWN_PREFIXES):
             return
-
         if not isinstance(message.author, discord.Member):
             return
-
         try:
             await message.delete()
         except discord.Forbidden:
             return
-
         await self._apply_warn(message.author, reason="lockdown phrase used")
 
     # ------------------------------------------------------------------
@@ -194,7 +174,6 @@ class Events(commands.Cog):
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_messages=True)
     async def blocklist(self, interaction: discord.Interaction) -> None:
-        """Display the active blocked prefix list."""
         embed = discord.Embed(
             title="🚫 Blocked Prefixes",
             description=(
@@ -205,18 +184,15 @@ class Events(commands.Cog):
             ),
             color=discord.Color.red(),
         )
-
         entries = "\n".join(f"`{prefix}`" for prefix in BLOCKED_PREFIXES)
         embed.add_field(name=f"{len(BLOCKED_PREFIXES)} active rule(s)", value=entries, inline=False)
         embed.set_footer(text="Edit cogs/events.py → BLOCKED_PREFIXES to add or remove rules.")
-
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="warns", description="Check how many warns a member has.")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_messages=True)
     async def warns(self, interaction: discord.Interaction, member: discord.Member) -> None:
-        """Show the current warn count for a member."""
         count = self._warns[interaction.guild_id][member.id]
         remaining = MAX_WARNS - count
         embed = discord.Embed(
@@ -233,7 +209,6 @@ class Events(commands.Cog):
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def clearwarns(self, interaction: discord.Interaction, member: discord.Member) -> None:
-        """Clear all warns for a member."""
         self._warns[interaction.guild_id][member.id] = 0
         await interaction.response.send_message(
             f"✅ Warns for **{member.display_name}** have been reset to 0.",
@@ -246,7 +221,6 @@ class Events(commands.Cog):
 
     @commands.Cog.listener()
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
-        """Handles prefix command errors."""
         if isinstance(error, commands.CommandNotFound):
             return
         if isinstance(error, commands.MissingPermissions):

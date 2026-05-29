@@ -23,9 +23,14 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# Render free tier can hit the default 1000 recursion limit during imports
+# under load — raise it to give the bot headroom
+sys.setrecursionlimit(5000)
 
 import discord
 from discord.ext import commands
@@ -1086,12 +1091,11 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         Repeat until one player loses.
         """
 
-        p1, p2 = players[0], players[1]
-
+        # p1/p2 are refreshed each iteration from the live players list
         await ctx.send(embed=self._embed(
             title="☠️  SUDDEN DEATH!",
             description=(
-                f"We're down to **{p1.member.mention}** vs **{p2.member.mention}**!\n\n"
+                f"We're down to **{players[0].member.mention}** vs **{players[1].member.mention}**!\n\n"
                 "Same question. Same time. Whoever answers **SLOWER** explodes. 💀\n\n"
                 "May the fastest fingers win… 🏁"
             ),
@@ -1104,6 +1108,8 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         q_index = 0
 
         while len(players) == 2:
+            p1, p2 = players[0], players[1]  # always refresh from live list
+
             if cancel_event.is_set():
                 await ctx.send(embed=self._embed(
                     "🛑  Game Aborted", "Cancelled by an administrator.", COLOUR_BOOM
@@ -1137,11 +1143,11 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             results: list[tuple[_Player, float]] = []   # (player, elapsed)
             t_start = time.monotonic()
 
-            def sd_check(m: discord.Message) -> bool:
+            def sd_check(m: discord.Message, _ans: str = correct_answer) -> bool:
                 return (
                     m.channel == ctx.channel
                     and m.author in (p1.member, p2.member)
-                    and m.content.strip() == correct_answer
+                    and m.content.strip() == _ans
                 )
 
             # We wait twice (for both players) or until time is up
@@ -1218,9 +1224,17 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
     ) -> None:
         try:
             await self._safe_sudden_death(ctx, players, stats_data, round_number, cancel_event)
+        except RecursionError:
+            import logging
+            logging.getLogger("bot").error("RecursionError in sudden death — Render restarted mid-game")
+            await ctx.send(embed=self._embed(
+                "💥  Game Error",
+                "The server hiccupped mid-game (Render free tier restart). Use `!simonstart` to play again!",
+                COLOUR_BOOM,
+            ))
         except Exception as exc:
             import logging
-            logging.getLogger("bot").error("Sudden death crashed: %s", exc, exc_info=True)
+            logging.getLogger("bot").error("Sudden death crashed: %s", exc)
             await ctx.send(embed=self._embed(
                 "💥  Game Error",
                 "Something went wrong in Sudden Death and the game had to stop. Sorry! Use `!simonstart` to play again.",

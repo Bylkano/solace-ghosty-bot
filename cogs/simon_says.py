@@ -94,11 +94,26 @@ TRAP_QUESTION_PCT  =  0.12   # 12 % chance of a trap ("Simon Didn't Say") round
 TRAP_SAFETY_WORD   = "skip"  # players type this to survive a trap
 
 # ---------------------------------------------------------------------------
-# BRANDING  — replace with your own URLs
+# BRANDING  —  All URLs are public CDN links (Giphy / Twemoji)
 # ---------------------------------------------------------------------------
-THUMBNAIL_URL = "https://i.imgur.com/placeholder_thumb.png"
-LOBBY_BANNER  = "https://i.imgur.com/placeholder_lobby.png"
-WINNER_BANNER = "https://i.imgur.com/placeholder_winner.gif"
+
+# Bot pfp shown as thumbnail on every embed
+THUMBNAIL_URL       = "https://twemoji.maxcdn.com/v/latest/72x72/1f3ae.png"   # 🎮 controller
+
+# Full-width banners — shown as the large image inside the embed
+LOBBY_BANNER        = "https://media.giphy.com/media/LMcB8XospGZO8UQq87/giphy.gif"   # neon gaming hype
+WINNER_BANNER       = "https://media.giphy.com/media/l3V0xbo2qJK6Yxnra/giphy.gif"   # confetti celebration
+
+# Per-event GIFs
+GIF_GAME_START      = "https://media.giphy.com/media/3oEdva9BUHPIs2SkGk/giphy.gif"   # hype countdown
+GIF_BOOM            = "https://media.giphy.com/media/26BRBKqUiq586bRVm/giphy.gif"    # cartoon explosion
+GIF_SUDDEN_DEATH    = "https://media.giphy.com/media/3oKIPwzYFOaK1QG7Tu/giphy.gif"   # dramatic skull
+GIF_SHIELD          = "https://media.giphy.com/media/9EvzNG9HAVc64/giphy.gif"        # glowing blue shield
+GIF_TRAP            = "https://media.giphy.com/media/d2Z4rTi11c9LRita/giphy.gif"     # sneaky cat trap
+GIF_POWERUP         = "https://media.giphy.com/media/xT5LMHxhOfscxPfIfm/giphy.gif"  # lightning power surge
+GIF_DOUBLE_TROUBLE  = "https://media.giphy.com/media/26ufnwz3wDUli7GU0/giphy.gif"   # fire chaos
+GIF_LEADERBOARD     = "https://media.giphy.com/media/g9582DNuQppxC/giphy.gif"        # trophy podium party
+GIF_PAUSE           = "https://media.giphy.com/media/3o7TKMt1VVNkHV2PaE/giphy.gif"  # freeze/pause
 
 # ---------------------------------------------------------------------------
 # POSTGRESQL  —  robust helpers with full error handling
@@ -1053,6 +1068,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             "\n".join(lines),
             COLOUR_STATS,
             footer="Use !simonstats @user for a detailed breakdown",
+            banner=GIF_LEADERBOARD,
         ))
 
     # ───────────────────────────────────────────────────────────────────────
@@ -1095,9 +1111,9 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             f"⚡  **Fastest Correct Answer:** {fa_str}\n"
             f"🔥  **Longest Streak:** {streak} in a row\n"
         )
-        await ctx.send(embed=self._embed(
-            f"📈  Stats — {target.display_name}", desc, COLOUR_STATS
-        ))
+        em = self._embed(f"📈  Stats — {target.display_name}", desc, COLOUR_STATS, thumbnail=False)
+        em.set_thumbnail(url=target.display_avatar.url)
+        await ctx.send(embed=em)
 
     # ───────────────────────────────────────────────────────────────────────
     # COMMAND: !simoncatalogue
@@ -1181,6 +1197,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             inline=False,
         )
         embed.set_footer(text="Simon Says v1.0  •  !simonleaderboard  •  !simonstats")
+        embed.set_image(url=LOBBY_BANNER)
         await ctx.send(embed=embed)
 
     # ───────────────────────────────────────────────────────────────────────
@@ -1340,6 +1357,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             ),
             colour=COLOUR_ROUND,
             footer=f"Starting time limit: {STARTING_TIME:.0f}s | Minimum: {MINIMUM_TIME:.0f}s",
+            banner=GIF_GAME_START,
         ))
         await asyncio.sleep(3)
 
@@ -1427,6 +1445,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                 "Smart move — Simon Didn't Say!"
                             ),
                             COLOUR_WIN,
+                            banner=GIF_TRAP,
                         ))
                         target_state.streak += 1
                         target_state.rounds_survived += 1
@@ -1443,6 +1462,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                     "**Simon Didn't Say!** Shield is now gone. ⚠️"
                                 ),
                                 COLOUR_SHIELD,
+                                banner=GIF_SHIELD,
                             ))
                         else:
                             players.remove(target_state)
@@ -1460,6 +1480,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                     f"{'s' if len(players) != 1 else ''} remain…"
                                 ),
                                 COLOUR_TRAP,
+                                banner=GIF_TRAP,
                             ))
                             await asyncio.sleep(2)
 
@@ -1499,6 +1520,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                         f"{len(players)} players remaining  |  Round {round_number}  |  "
                         f"🔥 Streak: {target_state.streak}"
                     ),
+                    banner=GIF_DOUBLE_TROUBLE,
                 ))
 
                 def dt_check(m: discord.Message) -> bool:
@@ -1536,6 +1558,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                 f"Expected: **`{composite_answer}`**"
                             ),
                             COLOUR_SHIELD,
+                            banner=GIF_SHIELD,
                         ))
                     else:
                         players.remove(target_state)
@@ -1555,6 +1578,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                 f"{'s' if len(players) != 1 else ''} remain…"
                             ),
                             COLOUR_BOOM,
+                            banner=GIF_BOOM,
                         ))
                         await asyncio.sleep(2)
 
@@ -1618,6 +1642,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                 f"⏱  Time limit boosted to **{current_max_time:.0f}s**!"
                             ),
                             COLOUR_BONUS,
+                            banner=GIF_POWERUP,
                         ))
                     else:
                         await ctx.send(
@@ -1639,6 +1664,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                 "**Streak Shield** — one free life! 🔰"
                             ),
                             COLOUR_SHIELD,
+                            banner=GIF_SHIELD,
                         ))
 
                 except asyncio.TimeoutError:
@@ -1655,6 +1681,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                 "Shield is now gone — no more free passes! ⚠️"
                             ),
                             COLOUR_SHIELD,
+                            banner=GIF_SHIELD,
                         ))
                     else:
                         players.remove(target_state)
@@ -1675,6 +1702,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                                 f"{'s' if len(players) != 1 else ''} remain…"
                             ),
                             COLOUR_BOOM,
+                            banner=GIF_BOOM,
                         ))
                         await asyncio.sleep(2)
 
@@ -1720,6 +1748,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                 "May the fastest fingers win… 🏁"
             ),
             colour=COLOUR_SUDDEN,
+            banner=GIF_SUDDEN_DEATH,
         ))
         await asyncio.sleep(3)
 
@@ -1809,6 +1838,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                         "**Simon Didn't Say!** 👁️"
                     ),
                     COLOUR_TRAP,
+                    banner=GIF_TRAP,
                 ))
                 await asyncio.sleep(2)
 
@@ -1875,6 +1905,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                         f"Correct answer was: **`{correct_answer}`**"
                     ),
                     COLOUR_BOOM,
+                    banner=GIF_BOOM,
                 ))
                 await asyncio.sleep(2)
 

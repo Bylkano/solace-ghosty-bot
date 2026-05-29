@@ -46,8 +46,7 @@ log = logging.getLogger("bot")
 COGS = [
     "cogs.moderation",
     "cogs.events",
-    "cogs.server_drops_economy", 
-    "cogs.simon_says",     # ← Simon Says last-man-standing game cog
+    "cogs.simon_says",
 ]
 
 

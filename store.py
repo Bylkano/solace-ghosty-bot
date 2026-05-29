@@ -30,10 +30,10 @@ DB_TIMEOUT = 8  # seconds before a DB operation is considered hung
 def _get_collection():
     global _col
     if _col is None:
-        uri = os.getenv("MONGODB_URI")
+        uri = os.getenv("MONGODB_URI") or os.getenv("MONGODB_URL")
         if not uri:
             raise RuntimeError(
-                "MONGODB_URI is not set. Add it to your .env file."
+                "MONGODB_URI is not set. Add it to your Render environment variables."
             )
         client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
         db = client[os.getenv("MONGODB_DB", "ghosty_bot")]

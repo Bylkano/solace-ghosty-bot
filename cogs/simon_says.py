@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import certifi
 import pymongo
 
 # Render free tier can hit the default 1000 recursion limit during imports
@@ -74,7 +75,7 @@ COLOUR_STATS   = discord.Color.from_rgb(114, 137, 218)   # soft blurple
 # ---------------------------------------------------------------------------
 # MONGODB  — stats are stored in the cloud, survive redeploys
 # ---------------------------------------------------------------------------
-_mongo_client = pymongo.MongoClient(os.environ["MONGODB_URI"])
+_mongo_client = pymongo.MongoClient(os.environ["MONGODB_URI"], tlsCAFile=certifi.where())
 _mongo_db     = _mongo_client["simon_says"]
 _mongo_col    = _mongo_db["stats"]
 

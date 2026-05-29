@@ -111,16 +111,7 @@ class Events(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
-        system_channel = member.guild.system_channel
-        if system_channel is not None:
-            embed = discord.Embed(
-                title="Welcome!",
-                description=f"Welcome to **{member.guild.name}**, {member.mention}! 🎉",
-                color=discord.Color.green(),
-            )
-            embed.set_thumbnail(url=member.display_avatar.url)
-            embed.set_footer(text=f"Member #{member.guild.member_count}")
-            await system_channel.send(embed=embed)
+        pass
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
@@ -132,7 +123,6 @@ class Events(commands.Cog):
             return
         await self._check_blocked_prefixes(message)
         await self._check_lockdown_phrases(message)
-        await self.bot.process_commands(message)
 
     async def _check_blocked_prefixes(self, message: discord.Message) -> None:
         if message.guild is None:

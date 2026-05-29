@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import sys
 import pathlib
@@ -25,28 +24,13 @@ class Moderation(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     async def getchannel(self, interaction: discord.Interaction) -> None:
         assert interaction.guild_id is not None
-        await interaction.response.defer(ephemeral=True)
-        try:
-            channel_id = await get_automod_channel(interaction.guild_id)
-        except asyncio.TimeoutError:
-            log.error("getchannel: MongoDB timed out for guild %s", interaction.guild_id)
-            await interaction.followup.send(
-                "❌ Database timed out. Check that your MongoDB URI is correct and the cluster is reachable.", ephemeral=True
-            )
-            return
-        except Exception as exc:
-            log.error("getchannel: DB error for guild %s: %s", interaction.guild_id, exc)
-            await interaction.followup.send(
-                f"❌ Database error: `{exc}`", ephemeral=True
-            )
-            return
-
+        channel_id = get_automod_channel(interaction.guild_id)
         if channel_id is None:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "⚠️ No channel set yet. Use `/setchannel` to configure one.", ephemeral=True
             )
         else:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 f"👻 Ghosty protection is currently watching <#{channel_id}>.", ephemeral=True
             )
 
@@ -59,23 +43,15 @@ class Moderation(commands.Cog):
         channel: discord.TextChannel,
     ) -> None:
         assert interaction.guild_id is not None
-        await interaction.response.defer(ephemeral=True)
         try:
-            await set_automod_channel(interaction.guild_id, channel.id)
-        except asyncio.TimeoutError:
-            log.error("setchannel: MongoDB timed out for guild %s", interaction.guild_id)
-            await interaction.followup.send(
-                "❌ Database timed out. Check that your MongoDB URI is correct and the cluster is reachable.", ephemeral=True
-            )
-            return
+            set_automod_channel(interaction.guild_id, channel.id)
         except Exception as exc:
-            log.error("setchannel: DB error for guild %s: %s", interaction.guild_id, exc)
-            await interaction.followup.send(
-                f"❌ Database error: `{exc}`", ephemeral=True
+            log.error("setchannel: failed for guild %s: %s", interaction.guild_id, exc)
+            await interaction.response.send_message(
+                f"❌ Failed to save channel: `{exc}`", ephemeral=True
             )
             return
-
-        await interaction.followup.send(
+        await interaction.response.send_message(
             f"✅ Ghosty protection is now watching {channel.mention}.", ephemeral=True
         )
 

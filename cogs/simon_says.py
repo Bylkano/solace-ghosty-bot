@@ -78,7 +78,6 @@ COLOUR_SUDDEN  = discord.Color.from_rgb(180,   0, 255)   # purple
 COLOUR_STATS   = discord.Color.from_rgb(114, 137, 218)   # soft blurple
 COLOUR_TRAP    = discord.Color.from_rgb(255,  80,  80)   # bright red
 COLOUR_DOUBLE  = discord.Color.from_rgb(255, 140,   0)   # deep orange
-COLOUR_BET     = discord.Color.from_rgb( 46, 204, 113)   # emerald
 COLOUR_PAUSE   = discord.Color.from_rgb(149, 165, 166)   # grey
 
 # ---------------------------------------------------------------------------
@@ -93,7 +92,6 @@ STREAK_REQUIRED    =  3      # correct answers in a row for a shield
 DOUBLE_TROUBLE_PCT =  0.15   # 15 % chance of a double-task round
 TRAP_QUESTION_PCT  =  0.12   # 12 % chance of a trap ("Simon Didn't Say") round
 TRAP_SAFETY_WORD   = "skip"  # players type this to survive a trap
-BET_WINDOW_SECS    = 20      # seconds users can place bets after lobby closes
 
 # ---------------------------------------------------------------------------
 # BRANDING  — replace with your own URLs
@@ -735,8 +733,6 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         # channel_id → extra seconds remaining in open lobby (from !simonextend)
         self._lobby_extension: dict[int, int]          = {}
 
-        # channel_id → {user_id: (bet_amount, target_user_id)}
-        self._bets: dict[int, dict[int, tuple[int, int]]] = {}
 
     # ───────────────────────────────────────────────────────────────────────
     # UTILITY: embed factory
@@ -827,7 +823,6 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         self._pause_events[ctx.channel.id]    = asyncio.Event()
         self._resume_events[ctx.channel.id]   = asyncio.Event()
         self._lobby_extension[ctx.channel.id] = 0
-        self._bets[ctx.channel.id]            = {}
 
         try:
             await self._run_lobby(ctx, minutes)
@@ -838,7 +833,6 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             self._resume_events.pop(ctx.channel.id,   None)
             self._active_players.pop(ctx.channel.id,  None)
             self._lobby_extension.pop(ctx.channel.id, None)
-            self._bets.pop(ctx.channel.id,            None)
 
     # ───────────────────────────────────────────────────────────────────────
     # COMMAND: !simoncancel
@@ -1111,193 +1105,90 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
 
     @commands.command(name="simoncatalogue", aliases=["simonhelp", "simonmanual"])
     async def simon_catalogue(self, ctx: commands.Context) -> None:
-        """Display the full Simon Says v1.0 feature manual."""
+        """Display the Simon Says v1.0 game features."""
 
         embed = discord.Embed(
-            title="📖  Simon Says v1.0 — Complete Feature Catalogue",
+            title="📖  Simon Says v1.0 — How to Play",
             colour=COLOUR_LOBBY,
+            description=(
+                "Last-man-standing typing game. Players are challenged one by one — "
+                "miss your question and you're **eliminated**. 💥"
+            ),
         )
         embed.set_thumbnail(url=THUMBNAIL_URL)
 
         embed.add_field(
-            name="🎮  Lobby Mechanics",
+            name="⚔️  Rounds",
             value=(
-                "• Admin opens a lobby with `!simonstart [minutes]` (1–30 min).\n"
-                "• Any server member types **`join`** in the channel to enter.\n"
-                "• Blacklisted users are silently rejected at join time.\n"
-                "• Admin can add extra time mid-lobby with `!simonextend <minutes>`.\n"
-                "• A **betting window** opens after the lobby closes — anyone can bet "
-                "their economy points on a player using `!simonbet @player <amount>`."
+                "Type **`join`** when a lobby opens to enter.\n"
+                "Players are called one at a time in rotation.\n"
+                "Time limit starts at **15s**, drops by 1s each elimination (min 10s).\n"
+                "Wrong answer or timeout = **BOOM**. 💣"
             ),
             inline=False,
         )
         embed.add_field(
-            name="⚔️  Gameplay Rounds",
+            name="🛡️  Streak Shield",
             value=(
-                "• Players are challenged one at a time in a rotating order.\n"
-                "• Each round has a time limit (starts at 15 s, minimum 10 s).\n"
-                "• The timer ticks down by 1 s per elimination — pressure builds!\n"
-                "• **⚡ Power-Up (10%):** Correct answer gives **+3 s** bonus time.\n"
-                "• Answers are checked against the **clean** (un-poisoned) value."
+                "Answer **3 in a row** correctly → earn a **Streak Shield**.\n"
+                "The shield absorbs **one** timeout or wrong answer — then it's gone.\n"
+                "Streaks reset on any failure."
             ),
             inline=False,
         )
         embed.add_field(
-            name="🛡️  Streak Shields",
+            name="⚡  Power-Up Questions (10%)",
             value=(
-                "• Answer **3 consecutive questions** correctly to earn a **Streak Shield**.\n"
-                "• A shield absorbs **one** timeout or wrong answer without elimination.\n"
-                "• After a shield is used, it is gone — earn a new one to get it back.\n"
-                "• Streaks reset to 0 on any timeout or wrong answer."
+                "Marked in the challenge embed.\n"
+                "Correct answer restores **+3s** to the round timer (capped at 15s)."
             ),
             inline=False,
         )
         embed.add_field(
-            name="⚡  Power-Up Shards",
+            name="🔥  Double Trouble (15%)",
             value=(
-                "• Any question has a **10%** chance of being a Power-Up question.\n"
-                "• Correct answer on a Power-Up restores up to **3 seconds** of the "
-                "round timer (capped at starting time).\n"
-                "• Power-Up questions are announced in the challenge embed."
+                "Two tasks, one message.\n"
+                "Example: type a string **AND** a word backward, separated by a space.\n"
+                "Both must be correct — partial answers don't count."
             ),
             inline=False,
         )
         embed.add_field(
-            name="🔥  Double Trouble Rounds (15%)",
+            name=f"💣  Trap Questions — \"Simon Didn't Say\" (12%)",
             value=(
-                "• A round may require **two tasks** in a single message.\n"
-                "• Example: `Type exact string AND type a word backward`.\n"
-                "• Both answers must be in the **same message**, separated by a space.\n"
-                "• Announced clearly in the challenge embed."
+                "Some prompts never said **\"Simon says\"** — answering = instant elimination.\n"
+                f"Type **`{TRAP_SAFETY_WORD}`** or simply **ignore** the message to survive.\n"
+                "Stay sharp — traps look identical to normal questions."
             ),
             inline=False,
         )
         embed.add_field(
-            name="💣  Trap Questions — \"Simon Didn't Say\" (12%)",
+            name="🔒  Anti-Copy-Paste",
             value=(
-                "• Some prompts intentionally **omit** \"Simon says\".\n"
-                "• If a player **answers** a trap question, they are **instantly eliminated**.\n"
-                f"• To survive a trap, type **`{TRAP_SAFETY_WORD}`** or simply **ignore** it.\n"
-                "• Trap prompts are visually identical to normal ones — read carefully!"
+                "Question text shown in chat contains **invisible characters**.\n"
+                "Copying and pasting the prompt will **fail** the answer check.\n"
+                "Type the answer manually."
             ),
             inline=False,
         )
         embed.add_field(
-            name="🔒  Anti-Copy-Paste System",
+            name="☠️  Sudden Death (final 2)",
             value=(
-                "• Displayed question text is injected with **invisible zero-width characters**.\n"
-                "• The bot's answer check uses the **clean, original** answer string.\n"
-                "• Users who **copy-paste** the prompt get hidden chars that break the match.\n"
-                "• Users who **manually type** the answer pass seamlessly.\n"
-                "• The poisoning is random — it changes every time a question is shown."
+                "Both remaining players receive the **same question simultaneously**.\n"
+                "The **slower** correct answer is eliminated.\n"
+                "If both time out the round replays."
             ),
             inline=False,
         )
-        embed.add_field(
-            name="☠️  Sudden Death",
-            value=(
-                "• When exactly **2 players** remain, Sudden Death begins.\n"
-                "• Both players receive the **same question simultaneously**.\n"
-                "• The player who answers **slower** (or times out) is eliminated.\n"
-                "• If both time out, the round is replayed.\n"
-                "• Continues until one winner remains."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="💰  Betting System",
-            value=(
-                "• After the lobby closes, a **20-second betting window** opens.\n"
-                "• Any server user can use `!simonbet @player <amount>` to wager economy points.\n"
-                "• Points are deducted immediately from the `economy_users` table.\n"
-                "• Winners receive **2× their bet** back; losers forfeit their wager.\n"
-                "• Bets cannot exceed your current balance."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="👑  Administrative Suite",
-            value=(
-                "`!simonstart [min]`  — Open a lobby\n"
-                "`!simoncancel`        — Abort any active game\n"
-                "`!simonkick @user`    — Remove a player mid-game\n"
-                "`!simonpause`         — Freeze the round timer\n"
-                "`!simonresume`        — Resume a paused game\n"
-                "`!simonblacklist @user [reason]` — Permanently ban from joining\n"
-                "`!simonextend <min>`  — Add time to an open lobby\n\n"
-                "All admin commands require the **Administrator** permission."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="📊  Stats & Leaderboard",
-            value=(
-                "`!simonleaderboard` / `!simonlb` — Top-10 all-time winners\n"
-                "`!simonstats [@user]`             — Personal stats breakdown\n\n"
-                "Stats tracked: wins, games played, win rate, total rounds survived, "
-                "fastest answer, longest streak."
-            ),
-            inline=False,
-        )
-        embed.set_footer(text="Simon Says v1.0 — Solace Ghosty Bot")
+        embed.set_footer(text="Simon Says v1.0  •  !simonleaderboard  •  !simonstats")
         await ctx.send(embed=embed)
-
-    # ───────────────────────────────────────────────────────────────────────
-    # COMMAND: !simonbet  (called during the betting window only)
-    # ───────────────────────────────────────────────────────────────────────
-
-    @commands.command(name="simonbet")
-    async def simon_bet(
-        self,
-        ctx: commands.Context,
-        target: discord.Member,
-        amount: int,
-    ) -> None:
-        """Bet economy points on a Simon Says player. Usage: !simonbet @player <amount>"""
-
-        channel_bets = self._bets.get(ctx.channel.id)
-        if channel_bets is None:
-            await ctx.send("❌  There is no open betting window right now.")
-            return
-
-        if amount <= 0:
-            await ctx.send("⚠️  Bet amount must be a positive integer.")
-            return
-
-        # Import economy helpers lazily to avoid circular issues
-        try:
-            from cogs.server_drops_economy import get_points, deduct_points
-        except ImportError:
-            await ctx.send("❌  Economy system unavailable.")
-            return
-
-        balance = get_points(ctx.author.id)
-        if balance < amount:
-            await ctx.send(
-                f"❌  You only have **{balance} pts** — not enough to bet {amount}."
-            )
-            return
-
-        # Deduct immediately; reward or forfeit after game
-        deduct_points(ctx.author.id, amount)
-        channel_bets[ctx.author.id] = (amount, target.id)
-
-        await ctx.send(embed=self._embed(
-            "💰  Bet Placed!",
-            (
-                f"**{ctx.author.display_name}** bet **{amount} pts** on "
-                f"**{target.display_name}**!\n\n"
-                "If they win, you'll receive **2× your bet** back. Good luck! 🎰"
-            ),
-            COLOUR_BET,
-        ))
 
     # ───────────────────────────────────────────────────────────────────────
     # PHASE 1 — LOBBY
     # ───────────────────────────────────────────────────────────────────────
 
     async def _run_lobby(self, ctx: commands.Context, minutes: int) -> None:
-        """Open the lobby, collect players, run betting window, then start game."""
+        """Open the lobby, collect players, then start game."""
 
         lobby_seconds  = minutes * 60
         cancel_event   = self._cancel_events[ctx.channel.id]
@@ -1311,8 +1202,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                 "Type **`join`** in this channel to enter.\n\n"
                 "🛡️  Earn a **Streak Shield** by answering **3 in a row** correctly!\n"
                 "⚡  Watch for **Power-Up** questions — get +3 bonus seconds!\n"
-                "💣  Beware **Double Trouble** rounds and **Trap Questions**!\n"
-                "💰  Spectators can **bet** on players after the lobby closes!\n\n"
+                "💣  Beware **Double Trouble** rounds and **Trap Questions**!\n\n"
                 "The last player standing wins! 💥"
             ),
             colour=COLOUR_LOBBY,
@@ -1400,21 +1290,6 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                 COLOUR_BOOM,
             ))
             return
-
-        # ── Betting window ────────────────────────────────────────────────
-        names_list = ", ".join(f"**{m.display_name}**" for m in joined_members)
-        await ctx.send(embed=self._embed(
-            "💰  Betting Window Open!",
-            (
-                f"The lobby is locked! Players: {names_list}\n\n"
-                f"You have **{BET_WINDOW_SECS} seconds** to bet on a player!\n"
-                "Use: `!simonbet @player <amount>`\n\n"
-                "Winners receive **2× their bet** back!"
-            ),
-            COLOUR_BET,
-            footer=f"Betting closes in {BET_WINDOW_SECS}s",
-        ))
-        await asyncio.sleep(BET_WINDOW_SECS)
 
         # ── Hand off to game ──────────────────────────────────────────────
         players = [_Player(member=m) for m in joined_members]
@@ -2064,32 +1939,6 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         winner_row = _get_player(stats_data, winner_state.member.id)
         winner_row["wins"] += 1
         _save_stats(stats_data)
-
-        # ── Pay out bets ──────────────────────────────────────────────────
-        bets = self._bets.get(ctx.channel.id, {})
-        if bets:
-            try:
-                from cogs.server_drops_economy import add_points
-                payout_lines: list[str] = []
-                for bettor_id, (amount, target_id) in bets.items():
-                    if target_id == winner_state.member.id:
-                        # Winner — return 2× bet
-                        add_points(bettor_id, amount * 2)
-                        payout_lines.append(
-                            f"<@{bettor_id}> bet on the winner — "
-                            f"won **{amount * 2} pts**! 🎰"
-                        )
-                    # Losers already had their points deducted; nothing to do
-                if payout_lines:
-                    await ctx.send(embed=self._embed(
-                        "💰  Betting Payouts",
-                        "\n".join(payout_lines),
-                        COLOUR_BET,
-                    ))
-            except ImportError:
-                pass
-            except Exception as exc:
-                log.error("[SimonSays] Bet payout failed: %s", exc)
 
         # ── Winner announcement ───────────────────────────────────────────
         await ctx.send(embed=self._embed(

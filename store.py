@@ -111,3 +111,18 @@ def get_leave_channel(guild_id: int) -> int | None:
 def set_leave_channel(guild_id: int, channel_id: int) -> None:
     """Persist the leave channel ID for a guild."""
     _set_value(guild_id, "leave_channel_id", channel_id)
+
+
+# ── Drop trigger threshold ────────────────────────────────────────
+
+_DEFAULT_DROP_TRIGGER = 10
+
+def get_drop_trigger(guild_id: int) -> int:
+    """Return how many messages must be sent before a drop fires (default 10)."""
+    val = _get_value(guild_id, "drop_trigger")
+    return val if val is not None else _DEFAULT_DROP_TRIGGER
+
+
+def set_drop_trigger(guild_id: int, count: int) -> None:
+    """Persist the drop trigger message count for a guild."""
+    _set_value(guild_id, "drop_trigger", count)

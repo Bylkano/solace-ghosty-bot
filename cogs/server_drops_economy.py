@@ -38,7 +38,7 @@ from discord.ext import commands
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from store import get_drops_channel, set_drops_channel
+from store import get_drops_channel, set_drops_channel, get_drop_trigger, set_drop_trigger
 
 # ──────────────────────────── constants ───────────────────────────
 
@@ -63,22 +63,28 @@ C_SET      = 0x43B581   # green confirmation
 C_BOUNTY   = 0xFF4500   # deep orange
 C_BLACKJACK = 0x1A472A  # casino green
 C_POTATO   = 0xFFD700   # golden yellow
+C_FILL     = 0xE91E8C   # pink for fill in the blank
+C_MATH     = 0x00BCD4   # cyan for fast math
+C_TF       = 0x8BC34A   # green for true/false
 
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 SEP    = "▬" * 22
 
 # ── Weighted event pool ────────────────────────────────────────────
 EVENT_POOL = (
-    ["trivia"]     * 20 +
-    ["scramble"]   * 15 +
-    ["lootbox"]    * 10 +
-    ["boss"]       * 10 +
-    ["hotcold"]    * 15 +
-    ["emoji"]      * 15 +
-    ["bomb"]       * 10 +
+    ["trivia"]     * 18 +
+    ["scramble"]   * 12 +
+    ["lootbox"]    *  8 +
+    ["boss"]       *  8 +
+    ["hotcold"]    * 12 +
+    ["emoji"]      * 12 +
+    ["bomb"]       *  8 +
     ["multi"]      *  5 +
     ["blackjack"]  *  5 +
-    ["hotpotato"]  * 10
+    ["hotpotato"]  *  8 +
+    ["fillblank"]  * 12 +
+    ["fastmath"]   * 12 +
+    ["truefalse"]  *  8
 )
 
 # ──────────────────────── content banks ───────────────────────────
@@ -197,6 +203,51 @@ TRIVIA_BANK: dict[str, list[str]] = {
     "What is the largest planet in our solar system?":    ["jupiter"],
     "Who painted the Mona Lisa?":                          ["leonardo da vinci", "da vinci", "leonardo"],
     "What is the national animal of Australia?":          ["kangaroo"],
+
+    # Extra — Movies & TV
+    "Who directed the movie Inception?":                  ["christopher nolan", "nolan"],
+    "What is the name of Tony Stark's AI assistant?":     ["jarvis", "j.a.r.v.i.s"],
+    "In which film does the line 'I am your father' appear?": ["star wars", "empire strikes back", "the empire strikes back"],
+    "What streaming service produced Stranger Things?":   ["netflix"],
+    "How many episodes are in the first season of Breaking Bad?": ["7", "seven"],
+    "What is the highest-grossing movie of all time?":    ["avengers endgame", "endgame"],
+    "What movie features the song 'Let It Go'?":          ["frozen"],
+    "In Game of Thrones, what is the name of Jon Snow's direwolf?": ["ghost"],
+
+    # Extra — Sports
+    "How many players are on a basketball team on the court?": ["5", "five"],
+    "How many points is a touchdown worth in American football?": ["6", "six"],
+    "What country invented basketball?":                  ["usa", "united states", "america", "united states of america"],
+    "How many holes are in a standard round of golf?":   ["18", "eighteen"],
+    "What is the diameter of a basketball hoop in inches?": ["18", "eighteen"],
+    "In tennis, what is a score of zero called?":         ["love"],
+    "How many rings does the Olympic logo have?":         ["5", "five"],
+    "What sport is played at Wimbledon?":                 ["tennis"],
+    "How many players are on a soccer team on the field?": ["11", "eleven"],
+
+    # Extra — Science & Tech
+    "What does CPU stand for?":                           ["central processing unit"],
+    "What does RAM stand for?":                           ["random access memory"],
+    "What is the most abundant gas in Earth's atmosphere?": ["nitrogen"],
+    "What planet has the most moons?":                    ["saturn"],
+    "How many bytes are in a kilobyte?":                  ["1024"],
+    "What does HTML stand for?":                          ["hypertext markup language"],
+    "What language is primarily used for web styling?":   ["css"],
+    "Who invented the World Wide Web?":                   ["tim berners-lee", "berners-lee"],
+    "What element has the atomic number 1?":              ["hydrogen"],
+    "What is the unit of electrical resistance?":         ["ohm", "ohms"],
+
+    # Extra — General
+    "How many seconds are in one hour?":                  ["3600"],
+    "How many weeks are in a year?":                      ["52"],
+    "What is the most spoken language in the world?":     ["mandarin", "chinese", "mandarin chinese"],
+    "What shape has 8 sides?":                            ["octagon"],
+    "What is the square root of 256?":                    ["16", "sixteen"],
+    "How many zeros are in one million?":                 ["6", "six"],
+    "What is 17 × 17?":                                   ["289"],
+    "What is 25% of 400?":                                ["100"],
+    "How many days are in September?":                    ["30", "thirty"],
+    "What is the Roman numeral for 100?":                 ["c"],
 }
 
 SCRAMBLE_WORDS: list[str] = [
@@ -233,6 +284,17 @@ SCRAMBLE_WORDS: list[str] = [
     "mountain", "canyon", "waterfall", "savanna", "tundra",
     "tropical", "mirage", "horizon", "twilight", "solstice",
     "blossom", "thunder", "whisper", "silence", "eternal",
+    # Extra batch
+    "phantom", "specter", "wraith", "shadow", "eclipse",
+    "crimson", "scarlet", "cobalt", "amber", "violet",
+    "blizzard", "cyclone", "tsunami", "volcano", "meteor",
+    "labyrinth", "fortress", "sentinel", "vortex", "nexus",
+    "plasma", "photon", "neutron", "proton", "electron",
+    "compass", "lantern", "anchor", "beacon", "flare",
+    "capsule", "shuttle", "payload", "module", "probe",
+    "fractal", "cipher", "encrypt", "decode", "signal",
+    "pioneer", "venture", "odyssey", "conquest", "triumph",
+    "gladiator", "centurion", "legionary", "spartan", "samurai",
 ]
 
 EMOJI_PUZZLES: list[tuple[str, str]] = [
@@ -353,6 +415,123 @@ EMOJI_PUZZLES: list[tuple[str, str]] = [
     ("🏎️🌍🏆", "Formula One"),
     ("🧊🏒🥅", "Ice Hockey"),
     ("🎭🌹💌", "Romeo and Juliet"),
+    # Extra
+    ("🕶️🔫💊", "The Matrix"),
+    ("🦊🐰🏙️", "Zootopia"),
+    ("🧠💡🤯", "Limitless"),
+    ("🚂⏱️💣", "Speed"),
+    ("🧛🌙❤️", "Twilight"),
+    ("🐕👻😱", "Cujo"),
+    ("🌀🧑‍🚀🪐", "Interstellar"),
+    ("🦴🐕‍🦺🏠", "Lassie"),
+    ("🏋️‍♂️🥊🇵🇭", "Manny Pacquiao"),
+    ("🧬🦎🏝️", "Jurassic World"),
+    ("🌊🏄‍♂️🦈", "Jaws"),
+    ("👩‍🔬🧪💥", "Breaking Bad"),
+    ("🎸🌵🇲🇽", "Coco"),
+    ("🕵️‍♀️👠🔍", "Legally Blonde"),
+    ("🏠🔑🌻", "Diary of a Wimpy Kid"),
+]
+
+# ──────────────────────── new content banks ────────────────────────
+
+FILL_BLANK_BANK: list[dict] = [
+    {"prompt": "Fill in the blank: 'To be or not to be, that is the ___'",                    "answer": ["question"]},
+    {"prompt": "Fill in the blank: 'The early bird catches the ___'",                          "answer": ["worm"]},
+    {"prompt": "Fill in the blank: 'Rome wasn't built in a ___'",                              "answer": ["day"]},
+    {"prompt": "Fill in the blank: 'Actions speak louder than ___'",                           "answer": ["words"]},
+    {"prompt": "Fill in the blank: 'Every cloud has a silver ___'",                            "answer": ["lining"]},
+    {"prompt": "Fill in the blank: 'You can't judge a book by its ___'",                       "answer": ["cover"]},
+    {"prompt": "Fill in the blank: 'The pen is mightier than the ___'",                        "answer": ["sword"]},
+    {"prompt": "Fill in the blank: 'Practice makes ___'",                                      "answer": ["perfect"]},
+    {"prompt": "Fill in the blank: 'Better late than ___'",                                    "answer": ["never"]},
+    {"prompt": "Fill in the blank: 'Two wrongs don't make a ___'",                             "answer": ["right"]},
+    {"prompt": "Fill in the blank: 'Where there's smoke, there's ___'",                        "answer": ["fire"]},
+    {"prompt": "Fill in the blank: 'The squeaky wheel gets the ___'",                          "answer": ["grease"]},
+    {"prompt": "Fill in the blank: 'Don't count your chickens before they ___'",               "answer": ["hatch"]},
+    {"prompt": "Fill in the blank: 'A penny saved is a penny ___'",                            "answer": ["earned"]},
+    {"prompt": "Fill in the blank: 'The grass is always greener on the other ___'",            "answer": ["side"]},
+    {"prompt": "Fill in the blank: 'Curiosity killed the ___'",                                "answer": ["cat"]},
+    {"prompt": "Fill in the blank: 'A picture is worth a thousand ___'",                       "answer": ["words"]},
+    {"prompt": "Fill in the blank: 'Don't bite the hand that ___  you'",                       "answer": ["feeds"]},
+    {"prompt": "Fill in the blank: 'All that glitters is not ___'",                            "answer": ["gold"]},
+    {"prompt": "Fill in the blank: 'Beggars can't be ___'",                                    "answer": ["choosers"]},
+    {"prompt": "Fill in the blank: 'The best things in life are ___'",                         "answer": ["free"]},
+    {"prompt": "Fill in the blank: 'No pain, no ___'",                                         "answer": ["gain"]},
+    {"prompt": "Fill in the blank: 'You reap what you ___'",                                   "answer": ["sow"]},
+    {"prompt": "Fill in the blank: 'Keep your friends close, and your enemies ___'",           "answer": ["closer"]},
+    {"prompt": "Fill in the blank: 'There's no place like ___'",                               "answer": ["home"]},
+    {"prompt": "Fill in the blank: 'Slow and steady wins the ___'",                            "answer": ["race"]},
+    {"prompt": "Fill in the blank: 'When in Rome, do as the Romans ___'",                      "answer": ["do"]},
+    {"prompt": "Fill in the blank: 'You can lead a horse to water but you can't make it ___'","answer": ["drink"]},
+    {"prompt": "Fill in the blank: 'An apple a day keeps the ___ away'",                       "answer": ["doctor"]},
+    {"prompt": "Fill in the blank: 'The ___ always rings twice' (1946 film)",                  "answer": ["postman"]},
+    {"prompt": "Fill in the blank: 'May the ___ be with you' (Star Wars)",                     "answer": ["force"]},
+    {"prompt": "Fill in the blank: 'To infinity and ___' (Toy Story)",                         "answer": ["beyond"]},
+    {"prompt": "Fill in the blank: 'Just keep ___' (Finding Nemo)",                            "answer": ["swimming"]},
+    {"prompt": "Fill in the blank: 'With great power comes great ___'",                        "answer": ["responsibility"]},
+    {"prompt": "Fill in the blank: 'I'll be ___' (Terminator)",                               "answer": ["back"]},
+]
+
+MATH_BANK: list[dict] = [
+    {"prompt": "⚡ Fast Math: What is 13 × 13?",           "answer": ["169"]},
+    {"prompt": "⚡ Fast Math: What is 17 × 8?",            "answer": ["136"]},
+    {"prompt": "⚡ Fast Math: What is 225 ÷ 15?",          "answer": ["15"]},
+    {"prompt": "⚡ Fast Math: What is 12 × 14?",           "answer": ["168"]},
+    {"prompt": "⚡ Fast Math: What is 48 × 3?",            "answer": ["144"]},
+    {"prompt": "⚡ Fast Math: What is 19 × 7?",            "answer": ["133"]},
+    {"prompt": "⚡ Fast Math: What is 360 ÷ 12?",          "answer": ["30"]},
+    {"prompt": "⚡ Fast Math: What is 16 × 16?",           "answer": ["256"]},
+    {"prompt": "⚡ Fast Math: What is 3 + 7 × 4?",         "answer": ["31"]},
+    {"prompt": "⚡ Fast Math: What is (12 + 8) × 5?",      "answer": ["100"]},
+    {"prompt": "⚡ Fast Math: What is 100 − 37 + 12?",     "answer": ["75"]},
+    {"prompt": "⚡ Fast Math: What is 9² + 9?",            "answer": ["90"]},
+    {"prompt": "⚡ Fast Math: What is 500 ÷ 4?",           "answer": ["125"]},
+    {"prompt": "⚡ Fast Math: What is 25 × 8?",            "answer": ["200"]},
+    {"prompt": "⚡ Fast Math: What is 11 × 11 − 1?",       "answer": ["120"]},
+    {"prompt": "⚡ Fast Math: What is 72 ÷ 8 × 6?",        "answer": ["54"]},
+    {"prompt": "⚡ Fast Math: What is 15² − 100?",         "answer": ["125"]},
+    {"prompt": "⚡ Fast Math: What is 1000 − 237?",        "answer": ["763"]},
+    {"prompt": "⚡ Fast Math: What is 6 × 7 × 2?",         "answer": ["84"]},
+    {"prompt": "⚡ Fast Math: What is 144 ÷ 12 + 8?",      "answer": ["20"]},
+    {"prompt": "⚡ Fast Math: What is 50% of 360?",         "answer": ["180"]},
+    {"prompt": "⚡ Fast Math: What is 20% of 250?",         "answer": ["50"]},
+    {"prompt": "⚡ Fast Math: What is 3³?",                 "answer": ["27"]},
+    {"prompt": "⚡ Fast Math: What is 4⁴?",                 "answer": ["256"]},
+    {"prompt": "⚡ Fast Math: What is 7 × 7 × 7?",          "answer": ["343"]},
+    {"prompt": "⚡ Fast Math: What is (100 ÷ 5) × 7?",     "answer": ["140"]},
+    {"prompt": "⚡ Fast Math: What is 999 + 111?",          "answer": ["1110"]},
+    {"prompt": "⚡ Fast Math: What is 18 × 18?",            "answer": ["324"]},
+    {"prompt": "⚡ Fast Math: What is 2⁸?",                 "answer": ["256"]},
+    {"prompt": "⚡ Fast Math: What is 1000 ÷ 8?",           "answer": ["125"]},
+]
+
+TRUE_FALSE_BANK: list[dict] = [
+    {"statement": "The Great Wall of China is visible from space with the naked eye.",          "answer": False,  "fact": "This is a myth — it's too narrow to be seen from orbit."},
+    {"statement": "Humans share about 60% of their DNA with bananas.",                          "answer": True,   "fact": "We share roughly 60% of our DNA with bananas."},
+    {"statement": "Lightning never strikes the same place twice.",                              "answer": False,  "fact": "Lightning can and does strike the same place multiple times."},
+    {"statement": "Goldfish have a memory span of only 3 seconds.",                             "answer": False,  "fact": "Goldfish can remember things for months."},
+    {"statement": "The Eiffel Tower grows taller in summer due to heat expansion.",             "answer": True,   "fact": "It can grow up to 15 cm taller in hot weather."},
+    {"statement": "Bats are blind.",                                                            "answer": False,  "fact": "Bats have functional eyes and can see — they also use echolocation."},
+    {"statement": "An octopus has three hearts.",                                               "answer": True,   "fact": "Octopuses have two branchial hearts and one systemic heart."},
+    {"statement": "Water boils at 100°C at sea level.",                                        "answer": True,   "fact": "Water boils at 100°C (212°F) at standard sea-level pressure."},
+    {"statement": "The Amazon River is the longest river in the world.",                        "answer": False,  "fact": "The Nile is generally considered the longest river."},
+    {"statement": "Venus is the hottest planet in our solar system.",                           "answer": True,   "fact": "Venus is hotter than Mercury due to its thick greenhouse atmosphere."},
+    {"statement": "A group of flamingos is called a flamboyance.",                              "answer": True,   "fact": "Yes — a flamboyance of flamingos!"},
+    {"statement": "Diamonds are made of carbon.",                                               "answer": True,   "fact": "Diamonds are pure crystallized carbon."},
+    {"statement": "Sharks are mammals.",                                                        "answer": False,  "fact": "Sharks are fish, not mammals."},
+    {"statement": "Sound travels faster than light.",                                           "answer": False,  "fact": "Light travels at ~300,000 km/s; sound at ~343 m/s."},
+    {"statement": "Napoleon Bonaparte was unusually short for his era.",                        "answer": False,  "fact": "He was about 5'7\" — average height for his time."},
+    {"statement": "Humans use only 10% of their brain.",                                       "answer": False,  "fact": "Brain scans show we use virtually all of our brain."},
+    {"statement": "A group of cats is called a clowder.",                                      "answer": True,   "fact": "A clowder is the correct term for a group of cats."},
+    {"statement": "The sun is a star.",                                                        "answer": True,   "fact": "The sun is a G-type main-sequence star."},
+    {"statement": "Snakes have eyelids.",                                                      "answer": False,  "fact": "Snakes have a clear scale over their eyes, not eyelids."},
+    {"statement": "The tongue is the strongest muscle in the human body.",                     "answer": False,  "fact": "The masseter (jaw muscle) is considered the strongest."},
+    {"statement": "Elephants are the only animals that can't jump.",                          "answer": False,  "fact": "Several other animals can't jump either (hippos, rhinos, etc.)."},
+    {"statement": "A duck's quack does not echo.",                                             "answer": False,  "fact": "A duck's quack does echo — this is a myth."},
+    {"statement": "The Pacific Ocean is larger than all land on Earth combined.",              "answer": True,   "fact": "The Pacific Ocean covers more area than all land masses combined."},
+    {"statement": "Honey never expires.",                                                      "answer": True,   "fact": "Honey found in ancient Egyptian tombs was still edible."},
+    {"statement": "A day on Venus is longer than a year on Venus.",                           "answer": True,   "fact": "Venus rotates so slowly its day is longer than its orbit around the Sun."},
 ]
 
 
@@ -615,9 +794,10 @@ def embed_bounty(target_name: str, bounty_amount: int, puzzle_emojis: str) -> di
 
 def embed_win_text(user: discord.Member | discord.User, payout: int, new_total: int, drop_type: str) -> discord.Embed:
     colour = {
-        "trivia": C_TRIVIA, "scramble": C_SCRAMBLE,
-        "emoji": C_EMOJI, "hotcold": C_HOT_COLD,
-        "bounty": C_BOUNTY,
+        "trivia":    C_TRIVIA,    "scramble": C_SCRAMBLE,
+        "emoji":     C_EMOJI,     "hotcold":  C_HOT_COLD,
+        "bounty":    C_BOUNTY,    "fillblank": C_FILL,
+        "fastmath":  C_MATH,
     }.get(drop_type, C_WIN)
     e = _base_embed(colour)
     e.description = (
@@ -711,6 +891,78 @@ def embed_get_channel(label: str, channel_id: int | None) -> discord.Embed:
         e = _base_embed(C_TIMEOUT)
         e.description = f"{SEP}\n**{label}** has not been configured yet.\n{SEP}"
     e.set_footer(text="SOLACE ECONOMY")
+    return e
+
+
+def embed_fillblank(prompt: str, payout: int) -> discord.Embed:
+    e = _base_embed(C_FILL)
+    e.description = (
+        f"```ansi\n\u001b[1;35m  ✏️  FILL IN THE BLANK  ✏️\u001b[0m\n```"
+        f"{SEP}\n"
+        f"**{prompt}**\n\n"
+        f"{SEP}\n"
+        f"⚡ First correct answer wins **`{payout} pts`**\n"
+        f"⏳ `{DROP_TIMEOUT}s` — type your answer below"
+    )
+    e.set_footer(text="SOLACE ECONOMY  •  Fill in the Blank")
+    return e
+
+
+def embed_fastmath(prompt: str, payout: int) -> discord.Embed:
+    e = _base_embed(C_MATH)
+    e.description = (
+        f"```ansi\n\u001b[1;36m  🔢  FAST MATH  🔢\u001b[0m\n```"
+        f"{SEP}\n"
+        f"**{prompt}**\n\n"
+        f"{SEP}\n"
+        f"⚡ First correct answer wins **`{payout} pts`**\n"
+        f"⏳ `{DROP_TIMEOUT}s` — type the number below"
+    )
+    e.set_footer(text="SOLACE ECONOMY  •  Fast Math")
+    return e
+
+
+def embed_truefalse(statement: str, payout: int) -> discord.Embed:
+    e = _base_embed(C_TF)
+    e.description = (
+        f"```ansi\n\u001b[1;32m  🟢  TRUE OR FALSE  🟢\u001b[0m\n```"
+        f"{SEP}\n"
+        f"**{statement}**\n\n"
+        f"{SEP}\n"
+        f"⚡ First correct click wins **`{payout} pts`**\n"
+        f"⏳ `{DROP_TIMEOUT}s` — click a button below"
+    )
+    e.set_footer(text="SOLACE ECONOMY  •  True or False")
+    return e
+
+
+def embed_truefalse_result(winner: discord.Member | discord.User | None,
+                           statement: str, correct: bool, fact: str,
+                           payout: int, new_total: int) -> discord.Embed:
+    e = _base_embed(C_WIN if winner else C_TIMEOUT)
+    answer_str = "✅ TRUE" if correct else "❌ FALSE"
+    if winner:
+        e.description = (
+            f"```ansi\n\u001b[1;33m  ✔  CORRECT  \u001b[0m\n```"
+            f"{SEP}\n"
+            f"{winner.mention} got it right!\n\n"
+            f"The answer was **{answer_str}**\n"
+            f"*{fact}*\n\n"
+            f"**＋{payout} pts** added  ›  Balance: `{new_total} pts`\n"
+            f"{SEP}"
+        )
+        if hasattr(winner, 'display_avatar'):
+            e.set_thumbnail(url=winner.display_avatar.url)
+    else:
+        e.description = (
+            f"```ansi\n\u001b[1;30m  ✖  TIME EXPIRED  \u001b[0m\n```"
+            f"{SEP}\n"
+            f"Nobody answered in time!\n\n"
+            f"The answer was **{answer_str}**\n"
+            f"*{fact}*\n"
+            f"{SEP}"
+        )
+    e.set_footer(text="SOLACE ECONOMY  •  True or False")
     return e
 
 
@@ -1084,6 +1336,69 @@ class BombView(discord.ui.View):
         self.stop()
 
 
+class TrueFalseView(discord.ui.View):
+    """Button-based True/False drop. First correct click wins."""
+
+    def __init__(self, cog: "ServerDropsEconomy", channel_id: int,
+                 correct: bool, fact: str, statement: str, payout: int):
+        super().__init__(timeout=None)
+        self.cog        = cog
+        self.channel_id = channel_id
+        self.correct    = correct
+        self.fact       = fact
+        self.statement  = statement
+        self.payout     = payout
+        self.resolved   = False
+
+    async def _attempt(self, interaction: discord.Interaction, chosen: bool):
+        if self.resolved:
+            await interaction.response.send_message("This round has already ended.", ephemeral=True)
+            return
+
+        drop = self.cog.active_drops.get(self.channel_id)
+        if drop is None or drop.get("type") != "truefalse":
+            await interaction.response.send_message("This drop has expired.", ephemeral=True)
+            return
+
+        if chosen != self.correct:
+            await interaction.response.send_message(
+                "❌ Wrong! Keep trying — someone else might still win.", ephemeral=True
+            )
+            return
+
+        self.resolved = True
+        del self.cog.active_drops[self.channel_id]
+
+        task: asyncio.Task | None = drop.get("task")
+        if task and not task.done():
+            task.cancel()
+
+        new_total = add_points(interaction.user.id, self.payout)
+
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            await interaction.response.defer()
+
+        await interaction.followup.send(
+            embed=embed_truefalse_result(
+                interaction.user, self.statement, self.correct, self.fact,
+                self.payout, new_total,
+            )
+        )
+        self.stop()
+
+    @discord.ui.button(label="  ✅  TRUE  ", style=discord.ButtonStyle.success)
+    async def btn_true(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._attempt(interaction, True)
+
+    @discord.ui.button(label="  ❌  FALSE  ", style=discord.ButtonStyle.danger)
+    async def btn_false(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._attempt(interaction, False)
+
+
 # ──────────────────────────── the Cog ─────────────────────────────
 
 class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
@@ -1130,7 +1445,7 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
         if cid in self.active_drops:
             drop = self.active_drops[cid]
             dtype = drop.get("type")
-            if dtype in ("trivia", "scramble", "emoji", "bounty"):
+            if dtype in ("trivia", "scramble", "emoji", "bounty", "fillblank", "fastmath"):
                 await self._check_text_answer(message, drop)
             elif dtype == "hotcold":
                 await self._check_number_guess(message, drop)
@@ -1138,11 +1453,13 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
                 await self._handle_boss_attack(message, drop)
             elif dtype == "hotpotato":
                 await self._handle_potato_pass(message, drop)
+            # truefalse is button-only; no text routing needed
             return
 
         # ── Increment counter ──
         self.msg_counters[cid] = self.msg_counters.get(cid, 0) + 1
-        if self.msg_counters[cid] >= MSG_TRIGGER:
+        trigger = get_drop_trigger(message.guild.id)
+        if self.msg_counters[cid] >= trigger:
             self.msg_counters[cid] = 0
             await self._trigger_drop(message.channel)
 
@@ -1161,6 +1478,9 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
             "multi":      self._start_multiplier,
             "blackjack":  self._start_blackjack,
             "hotpotato":  self._start_hotpotato,
+            "fillblank":  self._start_fillblank,
+            "fastmath":   self._start_fastmath,
+            "truefalse":  self._start_truefalse,
         }
         await dispatch[choice](channel)
 
@@ -1560,6 +1880,63 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
         await asyncio.sleep(3)
         self.active_drops.pop(channel.id, None)
 
+    # ─────────────── Fill in the Blank ────────────────
+
+    async def _start_fillblank(self, channel: discord.TextChannel):
+        entry  = random.choice(FILL_BLANK_BANK)
+        payout = self._effective_payout(random.randint(8, 18))
+        await channel.send(embed=embed_fillblank(entry["prompt"], payout))
+        state = {
+            "type":   "fillblank",
+            "answer": [a.lower().strip() for a in entry["answer"]],
+            "payout": payout,
+            "task":   None,
+        }
+        self.active_drops[channel.id] = state
+        state["task"] = asyncio.create_task(self._drop_timeout(channel))
+
+    # ─────────────── Fast Math ────────────────────────
+
+    async def _start_fastmath(self, channel: discord.TextChannel):
+        entry  = random.choice(MATH_BANK)
+        payout = self._effective_payout(random.randint(10, 20))
+        await channel.send(embed=embed_fastmath(entry["prompt"], payout))
+        state = {
+            "type":   "fastmath",
+            "answer": [a.lower().strip() for a in entry["answer"]],
+            "payout": payout,
+            "task":   None,
+        }
+        self.active_drops[channel.id] = state
+        state["task"] = asyncio.create_task(self._drop_timeout(channel))
+
+    # ─────────────── True or False ────────────────────
+
+    async def _start_truefalse(self, channel: discord.TextChannel):
+        entry   = random.choice(TRUE_FALSE_BANK)
+        payout  = self._effective_payout(random.randint(8, 18))
+        view    = TrueFalseView(
+            cog=self,
+            channel_id=channel.id,
+            correct=entry["answer"],
+            fact=entry["fact"],
+            statement=entry["statement"],
+            payout=payout,
+        )
+        msg = await channel.send(embed=embed_truefalse(entry["statement"], payout), view=view)
+        state = {
+            "type":      "truefalse",
+            "payout":    payout,
+            "view":      view,
+            "msg":       msg,
+            "task":      None,
+            "statement": entry["statement"],
+            "correct":   entry["answer"],
+            "fact":      entry["fact"],
+        }
+        self.active_drops[channel.id] = state
+        state["task"] = asyncio.create_task(self._drop_timeout(channel))
+
     # ─────────────── Text answer checker ──────────────
 
     async def _check_text_answer(self, message: discord.Message, drop: dict):
@@ -1627,6 +2004,29 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
                     pass
                 view_bj.stop()
 
+        elif dtype == "truefalse":
+            view_tf: TrueFalseView = drop["view"]
+            if not view_tf.resolved:
+                view_tf.resolved = True
+                for child in view_tf.children:
+                    child.disabled = True  # type: ignore[attr-defined]
+                try:
+                    await drop["msg"].edit(view=view_tf)
+                except discord.HTTPException:
+                    pass
+                view_tf.stop()
+            await channel.send(
+                embed=embed_truefalse_result(
+                    None,
+                    drop.get("statement", ""),
+                    drop.get("correct", False),
+                    drop.get("fact", ""),
+                    drop.get("payout", 0),
+                    0,
+                )
+            )
+            return  # skip generic embed_timeout() below
+
         # hotpotato has its own internal timer; nothing extra to clean up here
 
         await channel.send(embed=embed_timeout())
@@ -1672,6 +2072,81 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
             return
         rows = get_leaderboard(10)
         await ctx.send(embed=await embed_leaderboard(ctx.guild, rows))
+
+    # ─────────────── /setdroptrigger ──────────────────
+
+    @app_commands.command(name="setdroptrigger", description="Set how many messages trigger a drop (default: 10).")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(count="Number of messages before a drop fires (min 3, max 200).")
+    async def setdroptrigger(self, interaction: discord.Interaction, count: int) -> None:
+        assert interaction.guild_id is not None
+        if count < 3 or count > 200:
+            await interaction.response.send_message(
+                "Count must be between **3** and **200**.", ephemeral=True
+            )
+            return
+        set_drop_trigger(interaction.guild_id, count)
+        e = _base_embed(C_SET)
+        e.description = (
+            f"```ansi\n\u001b[1;32m  ✔  DROP TRIGGER SET  \u001b[0m\n```"
+            f"{SEP}\n"
+            f"A drop will now fire every **{count} messages**.\n"
+            f"{SEP}"
+        )
+        e.set_footer(text="SOLACE ECONOMY  •  Drop Settings")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    # ─────────────── /dropinfo ────────────────────────
+
+    @app_commands.command(name="dropinfo", description="Show current drop settings for this server.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def dropinfo(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        channel_id = get_drops_channel(interaction.guild_id)
+        trigger    = get_drop_trigger(interaction.guild_id)
+        channel_mention = f"<#{channel_id}>" if channel_id else "*not set*"
+        active = len(self.active_drops)
+        e = _base_embed(C_POINTS)
+        e.description = (
+            f"```ansi\n\u001b[1;33m  ◈  DROP SETTINGS  ◈\u001b[0m\n```"
+            f"{SEP}\n"
+            f"📢 **Drop Channel:** {channel_mention}\n"
+            f"💬 **Messages to trigger:** `{trigger}`\n"
+            f"🎯 **Active drops right now:** `{active}`\n"
+            f"✨ **Double points:** {'`ACTIVE`' if self.double_points else '`off`'}\n"
+            f"{SEP}"
+        )
+        e.set_footer(text="SOLACE ECONOMY  •  /setdrops | /setdroptrigger")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+    # ─────────────── /mystats ─────────────────────────
+
+    @commands.hybrid_command(name="mystats", description="Show your economy rank and point balance.")
+    async def mystats(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            await ctx.send("This command can only be used in a server.")
+            return
+        user    = ctx.author
+        balance = get_points(user.id)
+        rows    = get_leaderboard(200)
+        rank    = next((i + 1 for i, r in enumerate(rows) if r["user_id"] == user.id), None)
+        total_players = len(rows)
+
+        e = _base_embed(C_POINTS)
+        e.set_thumbnail(url=user.display_avatar.url)
+        rank_str = f"**#{rank}** of {total_players}" if rank else "*unranked*"
+        e.description = (
+            f"```ansi\n\u001b[1;33m  ◈  MY STATS  ◈\u001b[0m\n```"
+            f"{SEP}\n"
+            f"**{user.display_name}**\n\n"
+            f"💰 Balance:  `{balance:,} pts`\n"
+            f"🏆 Rank:     {rank_str}\n"
+            f"{SEP}"
+        )
+        e.set_footer(text="SOLACE ECONOMY  •  /leaderboard for full board")
+        await ctx.send(embed=e)
 
     # ─────────────── /givepts ─────────────────────────
 

@@ -74,7 +74,7 @@ COLOUR_STATS   = discord.Color.from_rgb(114, 137, 218)   # soft blurple
 # ---------------------------------------------------------------------------
 # MONGODB  — stats are stored in the cloud, survive redeploys
 # ---------------------------------------------------------------------------
-_mongo_client = pymongo.MongoClient(os.environ["MONGODB_URL"])
+_mongo_client = pymongo.MongoClient(os.environ["MONGODB_URI"])
 _mongo_db     = _mongo_client["simon_says"]
 _mongo_col    = _mongo_db["stats"]
 
@@ -1250,7 +1250,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         cancel_event: asyncio.Event,
     ) -> None:
         try:
-            await self._safe_sudden_death(ctx, players, stats_data, round_number, cancel_event)
+            await self._sudden_death(ctx, players, stats_data, round_number, cancel_event)
         except RecursionError:
             import logging
             logging.getLogger("bot").error("RecursionError in sudden death — Render restarted mid-game")

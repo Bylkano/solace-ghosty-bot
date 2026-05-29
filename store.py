@@ -18,20 +18,19 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 
-_client: AsyncIOMotorClient | None = None
 _col = None
 
 
 def _get_collection():
-    global _client, _col
+    global _col
     if _col is None:
         uri = os.getenv("MONGODB_URI")
         if not uri:
             raise RuntimeError(
                 "MONGODB_URI is not set. Add it to your .env file."
             )
-        _client = AsyncIOMotorClient(uri)
-        db = _client[os.getenv("MONGODB_DB", "ghosty_bot")]
+        client = AsyncIOMotorClient(uri)
+        db = client[os.getenv("MONGODB_DB", "ghosty_bot")]
         _col = db["guild_config"]
     return _col
 

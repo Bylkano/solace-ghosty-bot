@@ -69,9 +69,9 @@ STREAK_REQUIRED =  3     # correct answers in a row needed to earn a shield
 #                 ideal size: 1024x256 px  (use a flashy GIF here!)
 # Set any of these to None to disable that image.
 # ---------------------------------------------------------------------------
-THUMBNAIL_URL  = "https://i.imgur.com/placeholder_thumb.png"   # <- replace me
-LOBBY_BANNER   = "https://i.imgur.com/placeholder_lobby.png"   # <- replace me
-WINNER_BANNER  = "https://i.imgur.com/placeholder_winner.gif"  # <- replace me
+THUMBNAIL_URL  = "https://i.imgur.com/gsVlRbU.png"   # <- replace me
+LOBBY_BANNER   = "https://i.imgur.com/r7rM7K2.png"   # <- replace me
+WINNER_BANNER  = "https://i.imgur.com/l9u5s6R.png"  # <- replace me
 
 # ---------------------------------------------------------------------------
 # QUESTION BANK  (310 entries — Category A: mash, Category B: brain-fire)

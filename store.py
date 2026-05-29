@@ -89,3 +89,25 @@ def get_drops_channel(guild_id: int) -> int | None:
 def set_drops_channel(guild_id: int, channel_id: int) -> None:
     """Persist the drops channel ID for a guild."""
     _set_value(guild_id, "drops_channel_id", channel_id)
+
+
+# ── Welcome / leave channels ──────────────────────────────────────
+
+def get_welcome_channel(guild_id: int) -> int | None:
+    """Return the saved welcome channel ID for a guild, or None if not set."""
+    return _get_value(guild_id, "welcome_channel_id")
+
+
+def set_welcome_channel(guild_id: int, channel_id: int) -> None:
+    """Persist the welcome channel ID for a guild."""
+    _set_value(guild_id, "welcome_channel_id", channel_id)
+
+
+def get_leave_channel(guild_id: int) -> int | None:
+    """Return the saved leave channel ID for a guild, or None if not set."""
+    return _get_value(guild_id, "leave_channel_id")
+
+
+def set_leave_channel(guild_id: int, channel_id: int) -> None:
+    """Persist the leave channel ID for a guild."""
+    _set_value(guild_id, "leave_channel_id", channel_id)

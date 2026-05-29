@@ -2078,12 +2078,12 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
     @app_commands.command(name="setdroptrigger", description="Set how many messages trigger a drop (default: 10).")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(count="Number of messages before a drop fires (min 3, max 200).")
+    @app_commands.describe(count="Number of messages before a drop fires (min 3, max 1000).")
     async def setdroptrigger(self, interaction: discord.Interaction, count: int) -> None:
         assert interaction.guild_id is not None
-        if count < 3 or count > 200:
+        if count < 3 or count > 1000:
             await interaction.response.send_message(
-                "Count must be between **3** and **200**.", ephemeral=True
+                "Count must be between **3** and **1000**.", ephemeral=True
             )
             return
         set_drop_trigger(interaction.guild_id, count)

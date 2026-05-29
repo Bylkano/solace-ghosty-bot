@@ -29,8 +29,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import certifi
-import pymongo
 
 # Render free tier can hit the default 1000 recursion limit during imports
 # under load — raise it to give the bot headroom
@@ -71,13 +69,7 @@ COLOUR_STATS   = discord.Color.from_rgb(114, 137, 218)   # soft blurple
 # ---------------------------------------------------------------------------
 # PATHS
 # ---------------------------------------------------------------------------
-# Stats JSON lives next to this file; change the path if you prefer elsewhere.
-# ---------------------------------------------------------------------------
-# MONGODB  — stats are stored in the cloud, survive redeploys
-# ---------------------------------------------------------------------------
-_mongo_client = pymongo.MongoClient(os.environ["MONGODB_URI"], tlsCAFile=certifi.where())
-_mongo_db     = _mongo_client["simon_says"]
-_mongo_col    = _mongo_db["stats"]
+_STATS_PATH = Path(__file__).parent.parent / "simon_stats.json"
 
 # ---------------------------------------------------------------------------
 # TIMING CONSTANTS
@@ -486,25 +478,19 @@ class PlayerStats:
 
 
 def _load_stats() -> dict[str, dict]:
-    """Load all player stats from MongoDB; return empty dict on failure."""
-    try:
-        docs = _mongo_col.find({}, {"_id": 0})
-        return {doc["user_id"]: doc for doc in docs}
-    except Exception as exc:
-        print(f"[SimonSays] WARNING: Could not load stats: {exc}")
-        return {}
+    """Load all player stats from JSON file; return empty dict on failure."""
+    if _STATS_PATH.exists():
+        try:
+            return json.loads(_STATS_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[SimonSays] WARNING: Could not load stats: {exc}")
+    return {}
 
 
 def _save_stats(data: dict[str, dict]) -> None:
-    """Persist all player stats to MongoDB (upsert each player row)."""
+    """Persist all player stats to JSON file."""
     try:
-        for user_id, row in data.items():
-            row["user_id"] = user_id
-            _mongo_col.update_one(
-                {"user_id": user_id},
-                {"$set": row},
-                upsert=True,
-            )
+        _STATS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception as exc:
         print(f"[SimonSays] WARNING: Could not save stats: {exc}")
 

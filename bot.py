@@ -47,6 +47,7 @@ COGS = [
     "cogs.moderation",
     "cogs.events",
     "cogs.simon_says",
+    "cogs.server_drops_economy",
 ]
 
 

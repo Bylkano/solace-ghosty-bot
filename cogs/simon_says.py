@@ -1,60 +1,69 @@
 """
-simon_says.py  —  v2.0
-======================
+cogs/simon_says.py  —  Simon Says v1.0
+=======================================
 A fully self-contained Discord.py Cog for a "Simon Says" Last-Man-Standing game.
 
-NEW IN v2.0
+NEW IN v1.0
 -----------
-  • Leaderboard & Stats  — JSON-backed persistence; !simonleaderboard / !simonstats
-  • Admin controls       — !simoncancel (abort mid-game), !simonkick @user
-  • Sudden Death         — 1-v-1 final round: same Q sent to both; slowest is out
-  • Streak Shield        — 3 correct answers in a row = one free life
-  • Power-ups            — 10 % chance of a +3 s bonus on a correct answer
-  • UX polish            — lobby countdown warnings, round counter, typing indicator
+  • Anti-copy-paste  — _poison() injects invisible zero-width chars into displayed prompts
+  • Betting system   — users can bet currency on a player before the game starts
+  • Double Trouble   — 15 % chance of a dual-task round (type string AND backward word)
+  • Trap Questions   — "Simon Didn't Say" rounds; answering = instant elimination
+  • !simonpause / !simonresume  — freeze/resume the round timer mid-game
+  • !simonblacklist @user       — permanently ban a user from joining (backed by DB)
+  • !simonextend <minutes>      — extend an open lobby
+  • !simoncatalogue             — full feature manual embed
+  • PostgreSQL stability        — all DB calls wrapped in try/except with rollback
+  • Strict Python 3.11.9 type hints throughout
 
-Drop into your cogs/ folder and load with:
-    await bot.load_extension("cogs.simon_says")
-
-Requirements:  discord.py >= 2.0  |  Python >= 3.10
+Requirements:  discord.py >= 2.0  |  Python >= 3.11
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import os
 import random
 import sys
 import time
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-
-# Render free tier can hit the default 1000 recursion limit during imports
-# under load — raise it to give the bot headroom
-sys.setrecursionlimit(5000)
-
-# ---------------------------------------------------------------------------
-# ANTI-COPY-PASTE  — inject invisible zero-width spaces into displayed text
-# The shown string LOOKS identical but copying it embeds hidden characters,
-# so it won't match the clean answer the bot expects.
-# ---------------------------------------------------------------------------
-_ZWS = "​"  # zero-width space (invisible, copy-pasteable, breaks match)
-
-def _poison(text: str) -> str:
-    """Return a visually identical string with zero-width spaces injected
-    after every 2nd character — copying it gives the wrong answer."""
-    out = []
-    for i, ch in enumerate(text):
-        out.append(ch)
-        if (i + 1) % 2 == 0:
-            out.append(_ZWS)
-    return "".join(out)
-
 import discord
 from discord.ext import commands
+
+# Render free tier can hit the default recursion limit — raise it for headroom
+sys.setrecursionlimit(5000)
+
+log = logging.getLogger("bot.simon_says")
+
+# ---------------------------------------------------------------------------
+# ANTI-COPY-PASTE
+# Inject invisible zero-width characters into displayed prompt text.
+# The clean answer stored in the dict is NEVER poisoned — only the embed display.
+# Users who copy-paste get hidden chars that break the match check.
+# ---------------------------------------------------------------------------
+_ZWS  = "\u200b"   # zero-width space
+_ZWNJ = "\u200c"   # zero-width non-joiner
+
+_POISONS: tuple[str, ...] = (_ZWS, _ZWNJ)
+
+
+def _poison(text: str) -> str:
+    """Return a visually identical string with invisible chars injected at
+    random positions (every 2–4 chars). Only call this on the DISPLAY string."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        out.append(text[i])
+        # inject after every 2nd–4th character, randomly
+        if (i + 1) % random.randint(2, 4) == 0:
+            out.append(random.choice(_POISONS))
+        i += 1
+    return "".join(out)
+
 
 # ---------------------------------------------------------------------------
 # COLOUR PALETTE
@@ -63,73 +72,219 @@ COLOUR_LOBBY   = discord.Color.from_rgb( 88, 101, 242)   # blurple
 COLOUR_ROUND   = discord.Color.from_rgb(255, 165,   0)   # orange
 COLOUR_BOOM    = discord.Color.from_rgb(237,  66,  69)   # red
 COLOUR_WIN     = discord.Color.from_rgb( 87, 242, 135)   # green
-COLOUR_SHIELD  = discord.Color.from_rgb(  0, 200, 255)   # cyan  (streak shield)
-COLOUR_BONUS   = discord.Color.from_rgb(255, 215,   0)   # gold  (power-up)
-COLOUR_SUDDEN  = discord.Color.from_rgb(180,   0, 255)   # purple (sudden death)
+COLOUR_SHIELD  = discord.Color.from_rgb(  0, 200, 255)   # cyan
+COLOUR_BONUS   = discord.Color.from_rgb(255, 215,   0)   # gold
+COLOUR_SUDDEN  = discord.Color.from_rgb(180,   0, 255)   # purple
 COLOUR_STATS   = discord.Color.from_rgb(114, 137, 218)   # soft blurple
+COLOUR_TRAP    = discord.Color.from_rgb(255,  80,  80)   # bright red
+COLOUR_DOUBLE  = discord.Color.from_rgb(255, 140,   0)   # deep orange
+COLOUR_BET     = discord.Color.from_rgb( 46, 204, 113)   # emerald
+COLOUR_PAUSE   = discord.Color.from_rgb(149, 165, 166)   # grey
 
 # ---------------------------------------------------------------------------
-# PostgreSQL stats persistence
+# TIMING CONSTANTS
 # ---------------------------------------------------------------------------
-_STATS_DB_URL = os.environ.get("DATABASE_URL", "")
+STARTING_TIME      = 15.0    # seconds for round 1
+MINIMUM_TIME       = 10.0    # floor — never drops below this
+TIME_REDUCTION     =  1.0    # seconds shaved off per elimination
+POWERUP_BONUS      =  3.0    # extra seconds from a power-up
+POWERUP_CHANCE     =  0.10   # 10 % probability of a power-up question
+STREAK_REQUIRED    =  3      # correct answers in a row for a shield
+DOUBLE_TROUBLE_PCT =  0.15   # 15 % chance of a double-task round
+TRAP_QUESTION_PCT  =  0.12   # 12 % chance of a trap ("Simon Didn't Say") round
+TRAP_SAFETY_WORD   = "skip"  # players type this to survive a trap
+BET_WINDOW_SECS    = 20      # seconds users can place bets after lobby closes
+
+# ---------------------------------------------------------------------------
+# BRANDING  — replace with your own URLs
+# ---------------------------------------------------------------------------
+THUMBNAIL_URL = "https://i.imgur.com/placeholder_thumb.png"
+LOBBY_BANNER  = "https://i.imgur.com/placeholder_lobby.png"
+WINNER_BANNER = "https://i.imgur.com/placeholder_winner.gif"
+
+# ---------------------------------------------------------------------------
+# POSTGRESQL  —  robust helpers with full error handling
+# ---------------------------------------------------------------------------
+_DB_URL: str = os.environ.get("DATABASE_URL", "")
+
 
 def _pg_connect():
-    if not _STATS_DB_URL:
+    """Open a psycopg2 connection to Render's internal PostgreSQL."""
+    if not _DB_URL:
         raise RuntimeError("DATABASE_URL not set in environment")
-    return psycopg2.connect(_STATS_DB_URL, sslmode="require")
+    return psycopg2.connect(_DB_URL, sslmode="require")
 
 
-def _init_stats_db() -> None:
-    with _pg_connect() as con:
+def _init_db() -> None:
+    """Create all required tables if they don't exist. Safe to call on every boot."""
+    con = None
+    try:
+        con = _pg_connect()
         with con.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS simon_stats (
                     user_id        BIGINT PRIMARY KEY,
                     wins           INTEGER NOT NULL DEFAULT 0,
                     games_played   INTEGER NOT NULL DEFAULT 0,
                     total_survived INTEGER NOT NULL DEFAULT 0,
-                    fastest_answer REAL NOT NULL DEFAULT 999.0,
+                    fastest_answer REAL    NOT NULL DEFAULT 999.0,
                     longest_streak INTEGER NOT NULL DEFAULT 0,
-                    display_name   TEXT NOT NULL DEFAULT ''
+                    display_name   TEXT    NOT NULL DEFAULT ''
                 )
-                """
-            )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS simon_blacklist (
+                    guild_id BIGINT NOT NULL,
+                    user_id  BIGINT NOT NULL,
+                    added_by BIGINT NOT NULL,
+                    reason   TEXT   NOT NULL DEFAULT '',
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
         con.commit()
+        log.info("[SimonSays] DB initialised successfully.")
+    except psycopg2.Error as exc:
+        log.error("[SimonSays] DB init failed: %s", exc)
+        if con:
+            con.rollback()
+    finally:
+        if con:
+            con.close()
 
 
 # Run once on import
-_init_stats_db()
+_init_db()
 
-# ---------------------------------------------------------------------------
-# TIMING CONSTANTS
-# ---------------------------------------------------------------------------
-STARTING_TIME   = 15.0   # seconds for round 1
-MINIMUM_TIME    = 10.0   # floor — never drops below this
-TIME_REDUCTION  =  1.0   # seconds shaved off per elimination
-POWERUP_BONUS   =  3.0   # extra seconds awarded by a power-up
-POWERUP_CHANCE  =  0.10  # 10 % probability any given question is a power-up
-STREAK_REQUIRED =  3     # correct answers in a row needed to earn a shield
 
-# ---------------------------------------------------------------------------
-# BRANDING  — swap these URLs for your own images
-# ---------------------------------------------------------------------------
-# THUMBNAIL_URL : small image shown in the top-right corner of every embed
-#                 ideal size: 128x128 px  (square logo / server icon)
-# LOBBY_BANNER  : wide image shown at the bottom of the lobby-open embed
-#                 ideal size: 1024x256 px
-# WINNER_BANNER : wide GIF/image shown on the winner announcement embed
-#                 ideal size: 1024x256 px  (use a flashy GIF here!)
-# Set any of these to None to disable that image.
-# ---------------------------------------------------------------------------
-THUMBNAIL_URL  = "https://i.imgur.com/placeholder_thumb.png"   # <- replace me
-LOBBY_BANNER   = "https://i.imgur.com/placeholder_lobby.png"   # <- replace me
-WINNER_BANNER  = "https://i.imgur.com/placeholder_winner.gif"  # <- replace me
+# ── Stats helpers ────────────────────────────────────────────────────────────
+
+def _load_stats() -> dict[str, dict]:
+    """Load all player stats from PostgreSQL. Returns empty dict on failure."""
+    con = None
+    try:
+        con = _pg_connect()
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT user_id, wins, games_played, total_survived, "
+                "fastest_answer, longest_streak, display_name FROM simon_stats"
+            )
+            rows = cur.fetchall()
+        return {str(row["user_id"]): dict(row) for row in rows}
+    except psycopg2.Error as exc:
+        log.error("[SimonSays] _load_stats failed: %s", exc)
+        if con:
+            con.rollback()
+        return {}
+    finally:
+        if con:
+            con.close()
+
+
+def _save_stats(data: dict[str, dict]) -> None:
+    """Persist all player stats to PostgreSQL (upsert). Rolls back on error."""
+    con = None
+    try:
+        con = _pg_connect()
+        with con.cursor() as cur:
+            for user_id, row in data.items():
+                cur.execute(
+                    """
+                    INSERT INTO simon_stats
+                        (user_id, wins, games_played, total_survived,
+                         fastest_answer, longest_streak, display_name)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        wins           = EXCLUDED.wins,
+                        games_played   = EXCLUDED.games_played,
+                        total_survived = EXCLUDED.total_survived,
+                        fastest_answer = EXCLUDED.fastest_answer,
+                        longest_streak = EXCLUDED.longest_streak,
+                        display_name   = EXCLUDED.display_name
+                    """,
+                    (
+                        int(user_id),
+                        row.get("wins", 0),
+                        row.get("games_played", 0),
+                        row.get("total_survived", 0),
+                        row.get("fastest_answer", 999.0),
+                        row.get("longest_streak", 0),
+                        row.get("display_name", ""),
+                    ),
+                )
+        con.commit()
+    except psycopg2.Error as exc:
+        log.error("[SimonSays] _save_stats failed: %s", exc)
+        if con:
+            con.rollback()
+    finally:
+        if con:
+            con.close()
+
+
+def _get_player(data: dict[str, dict], user_id: int) -> dict:
+    """Return (and auto-create) the stats sub-dict for a user ID."""
+    key = str(user_id)
+    if key not in data:
+        data[key] = {
+            "wins": 0, "games_played": 0, "total_survived": 0,
+            "fastest_answer": 999.0, "longest_streak": 0, "display_name": "",
+        }
+    return data[key]
+
+
+# ── Blacklist helpers ────────────────────────────────────────────────────────
+
+def _is_blacklisted(guild_id: int, user_id: int) -> bool:
+    """Return True if the user is blacklisted from Simon Says in this guild."""
+    con = None
+    try:
+        con = _pg_connect()
+        with con.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM simon_blacklist WHERE guild_id=%s AND user_id=%s",
+                (guild_id, user_id),
+            )
+            return cur.fetchone() is not None
+    except psycopg2.Error as exc:
+        log.error("[SimonSays] _is_blacklisted failed: %s", exc)
+        if con:
+            con.rollback()
+        return False
+    finally:
+        if con:
+            con.close()
+
+
+def _add_blacklist(guild_id: int, user_id: int, added_by: int, reason: str) -> None:
+    """Add a user to the Simon Says blacklist for this guild."""
+    con = None
+    try:
+        con = _pg_connect()
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO simon_blacklist (guild_id, user_id, added_by, reason)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                    added_by = EXCLUDED.added_by,
+                    reason   = EXCLUDED.reason
+                """,
+                (guild_id, user_id, added_by, reason),
+            )
+        con.commit()
+    except psycopg2.Error as exc:
+        log.error("[SimonSays] _add_blacklist failed: %s", exc)
+        if con:
+            con.rollback()
+    finally:
+        if con:
+            con.close()
+
 
 # ---------------------------------------------------------------------------
 # QUESTION BANK  (310 entries — Category A: mash, Category B: brain-fire)
 # ---------------------------------------------------------------------------
-QUESTIONS: list[dict] = [
+QUESTIONS: list[dict[str, str]] = [
 
     # ===================================================================
     # CATEGORY A  —  Keyboard Mash / Simon Says  (150 entries)
@@ -314,7 +469,7 @@ QUESTIONS: list[dict] = [
     {"prompt": "Type exactly: `BOOM_goes_99`",       "answer": "BOOM_goes_99"},
 
     # ===================================================================
-    # CATEGORY B  —  Quick Brain Fire  (150 entries)
+    # CATEGORY B  —  Quick Brain Fire  (160 entries)
     # ===================================================================
 
     # Math (25)
@@ -401,7 +556,7 @@ QUESTIONS: list[dict] = [
     {"prompt": "Capital of Egypt? (one word)",               "answer": "Cairo"},
     {"prompt": "Capital of South Korea? (one word)",         "answer": "Seoul"},
     {"prompt": "Capital of China? (one word)",               "answer": "Beijing"},
-    {"prompt": "Capital of India? (one word)",               "answer": "New Delhi"},
+    {"prompt": "Capital of India? (two words)",              "answer": "New Delhi"},
     {"prompt": "Capital of Mexico? (two words)",             "answer": "Mexico City"},
     {"prompt": "Capital of Argentina? (two words)",          "answer": "Buenos Aires"},
 
@@ -492,83 +647,36 @@ assert all("prompt" in q and "answer" in q for q in QUESTIONS), (
     "Every QUESTIONS entry must have 'prompt' and 'answer' keys!"
 )
 
+# ---------------------------------------------------------------------------
+# TRAP QUESTIONS  ("Simon Didn't Say" — answer = instant boom)
+# Players must type the TRAP_SAFETY_WORD ("skip") to survive, or ignore it.
+# ---------------------------------------------------------------------------
+TRAP_PROMPTS: list[str] = [
+    "Type the word 'explode' right now.",
+    "Quickly type 'surrender' to continue.",
+    "Type your username here.",
+    "Type 'I give up' to stay in.",
+    "Type 'boom' to prove you're paying attention.",
+    "Type 'forfeit' right now.",
+    "Type 'quit' to keep playing.",
+    "Type 'abort' immediately.",
+    "Type 'exit' to advance to the next round.",
+    "Type 'stop' to survive.",
+    "Type 'hello' in the chat.",
+    "Type 'yes' to confirm your entry.",
+    "Write your answer here now.",
+    "Type 'ready' to proceed.",
+    "Respond with 'ok' to move on.",
+]
 
 # ---------------------------------------------------------------------------
-# STATS  —  thin persistence layer (JSON)
+# DOUBLE TROUBLE WORDS  (used for the second task in double-trouble rounds)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class PlayerStats:
-    """Per-player lifetime stats stored in JSON."""
-    wins:            int = 0
-    games_played:    int = 0
-    total_survived:  int = 0   # rounds survived across all games
-    fastest_answer:  float = 999.0   # seconds (lower = better)
-    longest_streak:  int = 0
-
-
-def _load_stats() -> dict[str, dict]:
-    """Load all player stats from PostgreSQL; return empty dict on failure."""
-    try:
-        with _pg_connect() as con:
-            with con.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT user_id, wins, games_played, total_survived, fastest_answer, longest_streak, display_name FROM simon_stats"
-                )
-                rows = cur.fetchall()
-                return {str(row["user_id"]): dict(row) for row in rows}
-    except Exception as exc:
-        print(f"[SimonSays] WARNING: Could not load stats: {exc}")
-        return {}
-
-
-def _save_stats(data: dict[str, dict]) -> None:
-    """Persist all player stats to PostgreSQL (upsert each row)."""
-    try:
-        with _pg_connect() as con:
-            with con.cursor() as cur:
-                for user_id, row in data.items():
-                    cur.execute(
-                        """
-                        INSERT INTO simon_stats (user_id, wins, games_played, total_survived, fastest_answer, longest_streak, display_name)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            wins = EXCLUDED.wins,
-                            games_played = EXCLUDED.games_played,
-                            total_survived = EXCLUDED.total_survived,
-                            fastest_answer = EXCLUDED.fastest_answer,
-                            longest_streak = EXCLUDED.longest_streak,
-                            display_name = EXCLUDED.display_name
-                        """,
-                        (
-                            int(user_id),
-                            row.get("wins", 0),
-                            row.get("games_played", 0),
-                            row.get("total_survived", 0),
-                            row.get("fastest_answer", 999.0),
-                            row.get("longest_streak", 0),
-                            row.get("display_name", ""),
-                        ),
-                    )
-            con.commit()
-    except Exception as exc:
-        print(f"[SimonSays] WARNING: Could not save stats: {exc}")
-
-
-def _get_player(data: dict, user_id: int) -> dict:
-    """Return (and auto-create) the stats sub-dict for a user ID."""
-    key = str(user_id)
-    if key not in data:
-        data[key] = {
-            "wins": 0,
-            "games_played": 0,
-            "total_survived": 0,
-            "fastest_answer": 999.0,
-            "longest_streak": 0,
-            "display_name": "",
-        }
-    return data[key]
-
+DOUBLE_TROUBLE_WORDS: list[str] = [
+    "chaos", "blaze", "storm", "flame", "ghost",
+    "sharp", "quick", "frost", "spark", "gloom",
+    "blast", "surge", "venom", "swift", "flare",
+]
 
 # ---------------------------------------------------------------------------
 # PER-GAME PLAYER STATE
@@ -577,11 +685,11 @@ def _get_player(data: dict, user_id: int) -> dict:
 @dataclass
 class _Player:
     """Transient state for a single player during one game."""
-    member:         discord.Member
-    streak:         int   = 0      # consecutive correct answers
-    has_shield:     bool  = False  # True = one free life available
-    rounds_survived: int  = 0
-    fastest_answer: float = 999.0
+    member:          discord.Member
+    streak:          int   = 0
+    has_shield:      bool  = False
+    rounds_survived: int   = 0
+    fastest_answer:  float = 999.0
 
 
 # ---------------------------------------------------------------------------
@@ -590,28 +698,45 @@ class _Player:
 
 class SimonSaysGame(commands.Cog, name="Simon Says"):
     """
-    Simon Says — Last Man Standing  (v2.0)
+    Simon Says — Last Man Standing  (v1.0)
 
-    Commands
-    --------
-    !simonstart [minutes]   — Admin: open lobby
-    !simoncancel            — Admin: abort the running game
-    !simonkick @user        — Admin: eliminate a player mid-game
-    !simonleaderboard       — Show the all-time top-10 winners
-    !simonstats [@user]     — Show stats for yourself or another user
+    Commands (prefix-based)
+    -----------------------
+    !simonstart [minutes]       — Admin: open a lobby
+    !simoncancel                — Admin: abort the running game
+    !simonkick @user            — Admin: eliminate a player mid-game
+    !simonpause                 — Admin: freeze the round timer
+    !simonresume                — Admin: resume a paused round
+    !simonblacklist @user [reason] — Admin: permanently ban from joining
+    !simonextend <minutes>      — Admin: add minutes to open lobby
+    !simonleaderboard           — Show all-time top-10 winners
+    !simonstats [@user]         — Show per-player stats
+    !simoncatalogue             — Full feature manual embed
     """
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
         # channel_id → True when a game (lobby or match) is in progress
-        self._active_games: dict[int, bool] = {}
+        self._active_games:  dict[int, bool]           = {}
 
-        # channel_id → asyncio.Event — set to True to signal cancellation
-        self._cancel_events: dict[int, asyncio.Event] = {}
+        # channel_id → asyncio.Event — set to signal cancellation
+        self._cancel_events: dict[int, asyncio.Event]  = {}
 
-        # channel_id → set of user IDs mid-game (for !simonkick)
+        # channel_id → list of live _Player objects
         self._active_players: dict[int, list[_Player]] = {}
+
+        # channel_id → asyncio.Event — set when admin calls !simonpause
+        self._pause_events:  dict[int, asyncio.Event]  = {}
+
+        # channel_id → asyncio.Event — set when admin calls !simonresume
+        self._resume_events: dict[int, asyncio.Event]  = {}
+
+        # channel_id → extra seconds remaining in open lobby (from !simonextend)
+        self._lobby_extension: dict[int, int]          = {}
+
+        # channel_id → {user_id: (bet_amount, target_user_id)}
+        self._bets: dict[int, dict[int, tuple[int, int]]] = {}
 
     # ───────────────────────────────────────────────────────────────────────
     # UTILITY: embed factory
@@ -619,13 +744,13 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
 
     @staticmethod
     def _embed(
-        title: str,
+        title:       str,
         description: str,
-        colour: discord.Color,
+        colour:      discord.Color,
         *,
-        footer: str | None = None,
-        banner: str | None = None,
-        thumbnail: bool = True,
+        footer:    str | None = None,
+        banner:    str | None = None,
+        thumbnail: bool       = True,
     ) -> discord.Embed:
         em = discord.Embed(title=title, description=description, colour=colour)
         if footer:
@@ -637,12 +762,55 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         return em
 
     # ───────────────────────────────────────────────────────────────────────
+    # PAUSE HELPER  — awaitable sleep that respects pause/resume/cancel
+    # ───────────────────────────────────────────────────────────────────────
+
+    async def _pausable_sleep(
+        self,
+        channel_id: int,
+        seconds:    float,
+    ) -> bool:
+        """
+        Sleep for `seconds` but yield to pause events.
+        Returns True if the cancel event was set during the sleep.
+        """
+        cancel_event = self._cancel_events.get(channel_id)
+        pause_event  = self._pause_events.get(channel_id)
+        resume_event = self._resume_events.get(channel_id)
+
+        deadline = time.monotonic() + seconds
+
+        while time.monotonic() < deadline:
+            if cancel_event and cancel_event.is_set():
+                return True
+
+            # If paused, block until resumed (or cancelled)
+            if pause_event and pause_event.is_set():
+                if resume_event:
+                    resume_event.clear()
+                    await asyncio.wait_for(
+                        resume_event.wait(), timeout=None  # type: ignore[arg-type]
+                    ) if False else None  # noqa — handled below
+                    try:
+                        await resume_event.wait()
+                    except Exception:
+                        pass
+                    pause_event.clear()
+
+            remaining = deadline - time.monotonic()
+            await asyncio.sleep(min(0.5, max(0.0, remaining)))
+
+        return False
+
+    # ───────────────────────────────────────────────────────────────────────
     # COMMAND: !simonstart
     # ───────────────────────────────────────────────────────────────────────
 
     @commands.command(name="simonstart")
     @commands.has_permissions(administrator=True)
-    async def simon_start(self, ctx: commands.Context, minutes: int = 1) -> None:
+    async def simon_start(
+        self, ctx: commands.Context, minutes: int = 1
+    ) -> None:
         """Open a Simon Says lobby. Usage: !simonstart [minutes]"""
 
         if self._active_games.get(ctx.channel.id):
@@ -654,15 +822,23 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             return
 
         minutes = max(1, min(minutes, 30))
-        self._active_games[ctx.channel.id]   = True
-        self._cancel_events[ctx.channel.id]  = asyncio.Event()
+        self._active_games[ctx.channel.id]    = True
+        self._cancel_events[ctx.channel.id]   = asyncio.Event()
+        self._pause_events[ctx.channel.id]    = asyncio.Event()
+        self._resume_events[ctx.channel.id]   = asyncio.Event()
+        self._lobby_extension[ctx.channel.id] = 0
+        self._bets[ctx.channel.id]            = {}
 
         try:
             await self._run_lobby(ctx, minutes)
         finally:
-            self._active_games.pop(ctx.channel.id,  None)
-            self._cancel_events.pop(ctx.channel.id, None)
-            self._active_players.pop(ctx.channel.id, None)
+            self._active_games.pop(ctx.channel.id,    None)
+            self._cancel_events.pop(ctx.channel.id,   None)
+            self._pause_events.pop(ctx.channel.id,    None)
+            self._resume_events.pop(ctx.channel.id,   None)
+            self._active_players.pop(ctx.channel.id,  None)
+            self._lobby_extension.pop(ctx.channel.id, None)
+            self._bets.pop(ctx.channel.id,            None)
 
     # ───────────────────────────────────────────────────────────────────────
     # COMMAND: !simoncancel
@@ -682,7 +858,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             ))
             return
 
-        event.set()   # signal the game loop to stop
+        event.set()
         await ctx.send(embed=self._embed(
             "🛑  Game Cancelled",
             f"**{ctx.author.display_name}** pulled the plug. Game over! 🔌",
@@ -711,20 +887,136 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
 
         target = next((p for p in players if p.member == member), None)
         if target is None:
-            await ctx.send(
-                f"⚠️  **{member.display_name}** is not in the current game."
-            )
+            await ctx.send(f"⚠️  **{member.display_name}** is not in the current game.")
             return
 
         players.remove(target)
         await ctx.send(embed=self._embed(
             "👢  Player Kicked",
             (
-                f"**{member.display_name}** has been forcibly removed from the game "
-                f"by **{ctx.author.display_name}**. 💀\n\n"
+                f"**{member.display_name}** has been forcibly removed by "
+                f"**{ctx.author.display_name}**. 💀\n\n"
                 f"**{len(players)}** player{'s' if len(players) != 1 else ''} remain."
             ),
             COLOUR_BOOM,
+        ))
+
+    # ───────────────────────────────────────────────────────────────────────
+    # COMMAND: !simonpause
+    # ───────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="simonpause")
+    @commands.has_permissions(administrator=True)
+    async def simon_pause(self, ctx: commands.Context) -> None:
+        """Freeze the current round timer. Usage: !simonpause"""
+
+        pause_event = self._pause_events.get(ctx.channel.id)
+        if not pause_event:
+            await ctx.send(embed=self._embed(
+                "❌  No Game Running",
+                "There is no active game to pause here.",
+                COLOUR_PAUSE,
+            ))
+            return
+
+        if pause_event.is_set():
+            await ctx.send("⏸️  The game is already paused. Use `!simonresume` to continue.")
+            return
+
+        pause_event.set()
+        await ctx.send(embed=self._embed(
+            "⏸️  Game Paused",
+            (
+                f"**{ctx.author.display_name}** has paused the game.\n\n"
+                "The round timer is frozen. Use `!simonresume` to continue."
+            ),
+            COLOUR_PAUSE,
+        ))
+
+    # ───────────────────────────────────────────────────────────────────────
+    # COMMAND: !simonresume
+    # ───────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="simonresume")
+    @commands.has_permissions(administrator=True)
+    async def simon_resume(self, ctx: commands.Context) -> None:
+        """Resume a paused Simon Says game. Usage: !simonresume"""
+
+        pause_event  = self._pause_events.get(ctx.channel.id)
+        resume_event = self._resume_events.get(ctx.channel.id)
+
+        if not pause_event or not pause_event.is_set():
+            await ctx.send("▶️  The game is not currently paused.")
+            return
+
+        if resume_event:
+            resume_event.set()
+
+        await ctx.send(embed=self._embed(
+            "▶️  Game Resumed",
+            f"**{ctx.author.display_name}** has resumed the game. Back to it! 🔥",
+            COLOUR_ROUND,
+        ))
+
+    # ───────────────────────────────────────────────────────────────────────
+    # COMMAND: !simonblacklist
+    # ───────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="simonblacklist")
+    @commands.has_permissions(administrator=True)
+    async def simon_blacklist(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        *,
+        reason: str = "No reason provided.",
+    ) -> None:
+        """Permanently ban a user from joining Simon Says. Usage: !simonblacklist @user [reason]"""
+
+        assert ctx.guild is not None
+        _add_blacklist(ctx.guild.id, member.id, ctx.author.id, reason)
+        await ctx.send(embed=self._embed(
+            "🚫  Blacklisted",
+            (
+                f"**{member.display_name}** has been permanently banned from joining "
+                f"Simon Says in this server.\n\n"
+                f"**Reason:** {reason}\n\n"
+                "They will not be able to use the `join` command in future lobbies."
+            ),
+            COLOUR_BOOM,
+        ))
+
+    # ───────────────────────────────────────────────────────────────────────
+    # COMMAND: !simonextend
+    # ───────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="simonextend")
+    @commands.has_permissions(administrator=True)
+    async def simon_extend(
+        self, ctx: commands.Context, minutes: int = 1
+    ) -> None:
+        """Add extra time to an open lobby. Usage: !simonextend <minutes>"""
+
+        if not self._active_games.get(ctx.channel.id):
+            await ctx.send(embed=self._embed(
+                "❌  No Active Lobby",
+                "There is no open lobby to extend.",
+                COLOUR_BOOM,
+            ))
+            return
+
+        minutes = max(1, min(minutes, 10))
+        self._lobby_extension[ctx.channel.id] = (
+            self._lobby_extension.get(ctx.channel.id, 0) + minutes * 60
+        )
+        await ctx.send(embed=self._embed(
+            "⏰  Lobby Extended",
+            (
+                f"**{ctx.author.display_name}** added **{minutes} minute"
+                f"{'s' if minutes != 1 else ''}** to the lobby! "
+                "More time to join! 🎉"
+            ),
+            COLOUR_LOBBY,
         ))
 
     # ───────────────────────────────────────────────────────────────────────
@@ -744,19 +1036,18 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             ))
             return
 
-        # Sort by wins desc, then games_played asc as tiebreaker
         ranked = sorted(
             data.items(),
             key=lambda kv: (-kv[1].get("wins", 0), kv[1].get("games_played", 0)),
         )[:10]
 
-        medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
-        lines  = []
+        medals: list[str] = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
+        lines:  list[str] = []
         for i, (uid, stats) in enumerate(ranked):
-            name    = stats.get("display_name", f"User#{uid}")
-            wins    = stats.get("wins", 0)
-            played  = stats.get("games_played", 0)
-            wr      = f"{wins/played*100:.0f}%" if played else "—"
+            name   = stats.get("display_name", f"User#{uid}")
+            wins   = stats.get("wins", 0)
+            played = stats.get("games_played", 0)
+            wr     = f"{wins/played*100:.0f}%" if played else "—"
             lines.append(
                 f"{medals[i]}  **{name}** — "
                 f"{wins} win{'s' if wins != 1 else ''} "
@@ -767,7 +1058,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             "🏆  Simon Says — All-Time Leaderboard",
             "\n".join(lines),
             COLOUR_STATS,
-            footer="Use !simonstats @user for detailed breakdown",
+            footer="Use !simonstats @user for a detailed breakdown",
         ))
 
     # ───────────────────────────────────────────────────────────────────────
@@ -810,11 +1101,195 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             f"⚡  **Fastest Correct Answer:** {fa_str}\n"
             f"🔥  **Longest Streak:** {streak} in a row\n"
         )
+        await ctx.send(embed=self._embed(
+            f"📈  Stats — {target.display_name}", desc, COLOUR_STATS
+        ))
+
+    # ───────────────────────────────────────────────────────────────────────
+    # COMMAND: !simoncatalogue
+    # ───────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="simoncatalogue", aliases=["simonhelp", "simonmanual"])
+    async def simon_catalogue(self, ctx: commands.Context) -> None:
+        """Display the full Simon Says v1.0 feature manual."""
+
+        embed = discord.Embed(
+            title="📖  Simon Says v1.0 — Complete Feature Catalogue",
+            colour=COLOUR_LOBBY,
+        )
+        embed.set_thumbnail(url=THUMBNAIL_URL)
+
+        embed.add_field(
+            name="🎮  Lobby Mechanics",
+            value=(
+                "• Admin opens a lobby with `!simonstart [minutes]` (1–30 min).\n"
+                "• Any server member types **`join`** in the channel to enter.\n"
+                "• Blacklisted users are silently rejected at join time.\n"
+                "• Admin can add extra time mid-lobby with `!simonextend <minutes>`.\n"
+                "• A **betting window** opens after the lobby closes — anyone can bet "
+                "their economy points on a player using `!simonbet @player <amount>`."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚔️  Gameplay Rounds",
+            value=(
+                "• Players are challenged one at a time in a rotating order.\n"
+                "• Each round has a time limit (starts at 15 s, minimum 10 s).\n"
+                "• The timer ticks down by 1 s per elimination — pressure builds!\n"
+                "• **⚡ Power-Up (10%):** Correct answer gives **+3 s** bonus time.\n"
+                "• Answers are checked against the **clean** (un-poisoned) value."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🛡️  Streak Shields",
+            value=(
+                "• Answer **3 consecutive questions** correctly to earn a **Streak Shield**.\n"
+                "• A shield absorbs **one** timeout or wrong answer without elimination.\n"
+                "• After a shield is used, it is gone — earn a new one to get it back.\n"
+                "• Streaks reset to 0 on any timeout or wrong answer."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚡  Power-Up Shards",
+            value=(
+                "• Any question has a **10%** chance of being a Power-Up question.\n"
+                "• Correct answer on a Power-Up restores up to **3 seconds** of the "
+                "round timer (capped at starting time).\n"
+                "• Power-Up questions are announced in the challenge embed."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔥  Double Trouble Rounds (15%)",
+            value=(
+                "• A round may require **two tasks** in a single message.\n"
+                "• Example: `Type exact string AND type a word backward`.\n"
+                "• Both answers must be in the **same message**, separated by a space.\n"
+                "• Announced clearly in the challenge embed."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="💣  Trap Questions — \"Simon Didn't Say\" (12%)",
+            value=(
+                "• Some prompts intentionally **omit** \"Simon says\".\n"
+                "• If a player **answers** a trap question, they are **instantly eliminated**.\n"
+                f"• To survive a trap, type **`{TRAP_SAFETY_WORD}`** or simply **ignore** it.\n"
+                "• Trap prompts are visually identical to normal ones — read carefully!"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔒  Anti-Copy-Paste System",
+            value=(
+                "• Displayed question text is injected with **invisible zero-width characters**.\n"
+                "• The bot's answer check uses the **clean, original** answer string.\n"
+                "• Users who **copy-paste** the prompt get hidden chars that break the match.\n"
+                "• Users who **manually type** the answer pass seamlessly.\n"
+                "• The poisoning is random — it changes every time a question is shown."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="☠️  Sudden Death",
+            value=(
+                "• When exactly **2 players** remain, Sudden Death begins.\n"
+                "• Both players receive the **same question simultaneously**.\n"
+                "• The player who answers **slower** (or times out) is eliminated.\n"
+                "• If both time out, the round is replayed.\n"
+                "• Continues until one winner remains."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="💰  Betting System",
+            value=(
+                "• After the lobby closes, a **20-second betting window** opens.\n"
+                "• Any server user can use `!simonbet @player <amount>` to wager economy points.\n"
+                "• Points are deducted immediately from the `economy_users` table.\n"
+                "• Winners receive **2× their bet** back; losers forfeit their wager.\n"
+                "• Bets cannot exceed your current balance."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="👑  Administrative Suite",
+            value=(
+                "`!simonstart [min]`  — Open a lobby\n"
+                "`!simoncancel`        — Abort any active game\n"
+                "`!simonkick @user`    — Remove a player mid-game\n"
+                "`!simonpause`         — Freeze the round timer\n"
+                "`!simonresume`        — Resume a paused game\n"
+                "`!simonblacklist @user [reason]` — Permanently ban from joining\n"
+                "`!simonextend <min>`  — Add time to an open lobby\n\n"
+                "All admin commands require the **Administrator** permission."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="📊  Stats & Leaderboard",
+            value=(
+                "`!simonleaderboard` / `!simonlb` — Top-10 all-time winners\n"
+                "`!simonstats [@user]`             — Personal stats breakdown\n\n"
+                "Stats tracked: wins, games played, win rate, total rounds survived, "
+                "fastest answer, longest streak."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Simon Says v1.0 — Solace Ghosty Bot")
+        await ctx.send(embed=embed)
+
+    # ───────────────────────────────────────────────────────────────────────
+    # COMMAND: !simonbet  (called during the betting window only)
+    # ───────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="simonbet")
+    async def simon_bet(
+        self,
+        ctx: commands.Context,
+        target: discord.Member,
+        amount: int,
+    ) -> None:
+        """Bet economy points on a Simon Says player. Usage: !simonbet @player <amount>"""
+
+        channel_bets = self._bets.get(ctx.channel.id)
+        if channel_bets is None:
+            await ctx.send("❌  There is no open betting window right now.")
+            return
+
+        if amount <= 0:
+            await ctx.send("⚠️  Bet amount must be a positive integer.")
+            return
+
+        # Import economy helpers lazily to avoid circular issues
+        try:
+            from cogs.server_drops_economy import get_points, deduct_points
+        except ImportError:
+            await ctx.send("❌  Economy system unavailable.")
+            return
+
+        balance = get_points(ctx.author.id)
+        if balance < amount:
+            await ctx.send(
+                f"❌  You only have **{balance} pts** — not enough to bet {amount}."
+            )
+            return
+
+        # Deduct immediately; reward or forfeit after game
+        deduct_points(ctx.author.id, amount)
+        channel_bets[ctx.author.id] = (amount, target.id)
 
         await ctx.send(embed=self._embed(
-            f"📈  Stats — {target.display_name}",
-            desc,
-            COLOUR_STATS,
+            "💰  Bet Placed!",
+            (
+                f"**{ctx.author.display_name}** bet **{amount} pts** on "
+                f"**{target.display_name}**!\n\n"
+                "If they win, you'll receive **2× your bet** back. Good luck! 🎰"
+            ),
+            COLOUR_BET,
         ))
 
     # ───────────────────────────────────────────────────────────────────────
@@ -822,65 +1297,66 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
     # ───────────────────────────────────────────────────────────────────────
 
     async def _run_lobby(self, ctx: commands.Context, minutes: int) -> None:
-        """
-        Open the lobby for `minutes`, send countdown warnings,
-        collect players, then hand off to _run_game().
-        """
+        """Open the lobby, collect players, run betting window, then start game."""
 
         lobby_seconds  = minutes * 60
         cancel_event   = self._cancel_events[ctx.channel.id]
         joined_members: list[discord.Member] = []
 
-        # ── Opening announcement ──────────────────────────────────────────
         await ctx.send(embed=self._embed(
-            title="🎮  Simon Says — Last Man Standing!",
+            title="🎮  Simon Says v1.0 — Last Man Standing!",
             description=(
                 f"A new game has been opened by **{ctx.author.display_name}**!\n\n"
                 f"⏳ **Lobby closes in {minutes} minute{'s' if minutes != 1 else ''}.**\n\n"
                 "Type **`join`** in this channel to enter.\n\n"
                 "🛡️  Earn a **Streak Shield** by answering **3 in a row** correctly!\n"
-                "⚡  Watch for **Power-Up** questions — get +3 bonus seconds!\n\n"
+                "⚡  Watch for **Power-Up** questions — get +3 bonus seconds!\n"
+                "💣  Beware **Double Trouble** rounds and **Trap Questions**!\n"
+                "💰  Spectators can **bet** on players after the lobby closes!\n\n"
                 "The last player standing wins! 💥"
             ),
             colour=COLOUR_LOBBY,
-            footer="Admins: !simoncancel to abort | !simonkick @user to remove a player",
+            footer=(
+                "Admins: !simoncancel | !simonkick @user | "
+                "!simonpause | !simonresume | !simonextend <min>"
+            ),
             banner=LOBBY_BANNER,
         ))
 
-        # ── Warning timestamps (send a reminder at 50 % and 10 % remaining) ──
         warning_times: list[int] = []
         if lobby_seconds >= 60:
-            warning_times.append(lobby_seconds // 2)   # halfway
+            warning_times.append(lobby_seconds // 2)
         if lobby_seconds >= 30:
-            warning_times.append(max(10, lobby_seconds // 10))  # near the end
+            warning_times.append(max(10, lobby_seconds // 10))
 
-        elapsed       = 0
-        warned_at     = set()
-
-        # ── Collect joins with non-blocking polling ───────────────────────
-        # We use a short-timeout wait_for inside a manual countdown so we
-        # can also check cancel_event and fire lobby warnings.
+        elapsed   = 0
+        warned_at: set[int] = set()
 
         async def collect_joins() -> None:
             nonlocal elapsed
 
-            while elapsed < lobby_seconds:
-                if cancel_event.is_set():
-                    return   # admin cancelled during lobby
+            while True:
+                # Respect extensions added by !simonextend
+                ext = self._lobby_extension.get(ctx.channel.id, 0)
+                effective_limit = lobby_seconds + ext
 
-                # Fire countdown warnings
-                remaining = lobby_seconds - elapsed
+                if elapsed >= effective_limit:
+                    break
+                if cancel_event.is_set():
+                    return
+
+                remaining = effective_limit - elapsed
                 for w in warning_times:
                     if remaining <= w and w not in warned_at:
                         warned_at.add(w)
                         await ctx.send(
-                            f"⏰  **{remaining} seconds** left to join the lobby! "
-                            f"({len(joined_members)} player{'s' if len(joined_members) != 1 else ''} so far)"
+                            f"⏰  **{remaining}s** left to join! "
+                            f"({len(joined_members)} player"
+                            f"{'s' if len(joined_members) != 1 else ''} so far)"
                         )
 
-                # Wait up to 2 s for a join message, then re-loop
                 try:
-                    def check(m: discord.Message) -> bool:
+                    def join_check(m: discord.Message) -> bool:
                         return (
                             m.channel == ctx.channel
                             and m.content.strip().lower() == "join"
@@ -888,45 +1364,70 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                             and m.author not in joined_members
                         )
                     msg: discord.Message = await asyncio.wait_for(
-                        self.bot.wait_for("message", check=check),
+                        self.bot.wait_for("message", check=join_check),
                         timeout=2.0,
                     )
+                    # Check blacklist
+                    assert ctx.guild is not None
+                    if _is_blacklisted(ctx.guild.id, msg.author.id):
+                        await ctx.send(
+                            f"🚫  **{msg.author.display_name}** is blacklisted "
+                            "from Simon Says."
+                        )
+                        continue
                     joined_members.append(msg.author)
                     await ctx.send(
                         f"✅  **{msg.author.display_name}** joined! "
-                        f"({len(joined_members)} player{'s' if len(joined_members) != 1 else ''} in lobby)"
+                        f"({len(joined_members)} player"
+                        f"{'s' if len(joined_members) != 1 else ''} in lobby)"
                     )
                 except asyncio.TimeoutError:
-                    elapsed += 2   # 2 s tick
+                    elapsed += 2
 
         await collect_joins()
 
-        # ── Cancelled during lobby? ───────────────────────────────────────
         if cancel_event.is_set():
             return
 
-        # ── Not enough players? ───────────────────────────────────────────
         if len(joined_members) < 2:
             await ctx.send(embed=self._embed(
-                "❌  Not Enough Players",
+                "😴  Not Enough Players",
                 (
-                    f"Only **{len(joined_members)}** player joined. "
-                    "Need at least **2** to start. Game cancelled! 😢"
+                    f"Only **{len(joined_members)}** player"
+                    f"{'s' if len(joined_members) != 1 else ''} joined — "
+                    "need at least **2** to start. Game cancelled."
                 ),
                 COLOUR_BOOM,
             ))
             return
 
-        player_list = "\n".join(
-            f"{i+1}. {m.display_name}" for i, m in enumerate(joined_members)
-        )
+        # ── Betting window ────────────────────────────────────────────────
+        names_list = ", ".join(f"**{m.display_name}**" for m in joined_members)
         await ctx.send(embed=self._embed(
-            f"✅  Lobby Closed — {len(joined_members)} Players",
-            f"{player_list}\n\n🎮  Starting the game...",
-            COLOUR_WIN,
+            "💰  Betting Window Open!",
+            (
+                f"The lobby is locked! Players: {names_list}\n\n"
+                f"You have **{BET_WINDOW_SECS} seconds** to bet on a player!\n"
+                "Use: `!simonbet @player <amount>`\n\n"
+                "Winners receive **2× their bet** back!"
+            ),
+            COLOUR_BET,
+            footer=f"Betting closes in {BET_WINDOW_SECS}s",
         ))
+        await asyncio.sleep(BET_WINDOW_SECS)
 
-        await self._run_game(ctx, joined_members)
+        # ── Hand off to game ──────────────────────────────────────────────
+        players = [_Player(member=m) for m in joined_members]
+        self._active_players[ctx.channel.id] = players
+        stats_data = _load_stats()
+
+        # Increment games_played for all participants
+        for ps_obj in players:
+            row = _get_player(stats_data, ps_obj.member.id)
+            row["display_name"]  = ps_obj.member.display_name
+            row["games_played"] += 1
+
+        await self._run_game(ctx, players, stats_data)
 
     # ───────────────────────────────────────────────────────────────────────
     # PHASE 2 — MAIN GAME LOOP
@@ -934,205 +1435,377 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
 
     async def _run_game(
         self,
-        ctx: commands.Context,
-        members: list[discord.Member],
+        ctx:        commands.Context,
+        players:    list[_Player],
+        stats_data: dict[str, dict],
     ) -> None:
         """
-        Core Last-Man-Standing loop with:
-          • Round counter
-          • Streak shield (3-in-a-row = free life)
-          • Power-up questions (+3 s bonus)
-          • Typing indicator before each challenge
-          • Sudden Death when 2 players remain
-          • Stats recording
+        Rotate through players, issue challenges, and eliminate them until
+        exactly 1 (or 2 for sudden death) remain.
         """
 
-        cancel_event = self._cancel_events[ctx.channel.id]
+        cancel_event     = self._cancel_events[ctx.channel.id]
+        pause_event      = self._pause_events[ctx.channel.id]
+        resume_event     = self._resume_events[ctx.channel.id]
+        current_max_time = STARTING_TIME
+        round_number     = 1
+        elimination_count = 0
 
-        # Build transient player objects
-        players: list[_Player] = [_Player(member=m) for m in members]
-        self._active_players[ctx.channel.id] = players
-
-        # Update games_played for everyone who entered
-        stats_data = _load_stats()
-        for p in players:
-            ps = _get_player(stats_data, p.member.id)
-            ps["games_played"] += 1
-            ps["display_name"]  = p.member.display_name
-        _save_stats(stats_data)
-
-        current_max_time: float = STARTING_TIME
-        round_number:     int   = 1
-        elimination_count: int  = 0
-
-        # Pre-shuffle the question pool
-        question_pool = list(QUESTIONS)
+        question_pool: list[dict[str, str]] = list(QUESTIONS)
         random.shuffle(question_pool)
         q_index = 0
 
-        # ── Opening announcement ──────────────────────────────────────────
-        player_list = "\n".join(f"• {p.member.display_name}" for p in players)
         await ctx.send(embed=self._embed(
-            title="🚀  Game Starting!",
+            title=f"💥  Game Start!  {len(players)} Players",
             description=(
-                f"**{len(players)} players** have entered the arena:\n\n"
-                f"{player_list}\n\n"
-                "Fingers on keyboards… **GO!** 💀"
+                "The lobby is locked and the game has begun!\n\n"
+                "Players will be called one by one.\n"
+                "Miss your question and you're **OUT**. 💣\n\n"
+                "Good luck — you'll need it. 🔥"
             ),
-            colour=COLOUR_LOBBY,
+            colour=COLOUR_ROUND,
+            footer=f"Starting time limit: {STARTING_TIME:.0f}s | Minimum: {MINIMUM_TIME:.0f}s",
         ))
         await asyncio.sleep(3)
 
-        # ── Main loop: run until 2 players left, then Sudden Death ────────
+        player_index = 0  # rotating index into `players`
+
         while len(players) > 2:
             if cancel_event.is_set():
                 await ctx.send(embed=self._embed(
-                    "🛑  Game Aborted",
-                    "The game was cancelled by an administrator.",
-                    COLOUR_BOOM,
+                    "🛑  Game Aborted", "Cancelled by an administrator.", COLOUR_BOOM
                 ))
                 return
 
-            # Pick a random active player
-            target_state: _Player = random.choice(players)
+            # ── Handle pause ─────────────────────────────────────────────
+            if pause_event.is_set():
+                resume_event.clear()
+                try:
+                    await resume_event.wait()
+                except Exception:
+                    pass
+                pause_event.clear()
 
-            # Pull next question (re-shuffle on exhaustion)
+            # Clamp index in case a player was kicked
+            player_index = player_index % len(players)
+            target_state = players[player_index]
+
+            # Rotate to next player
+            player_index = (player_index + 1) % len(players)
+
+            # Fetch next question
             if q_index >= len(question_pool):
                 random.shuffle(question_pool)
                 q_index = 0
-            question  = question_pool[q_index]
-            q_index  += 1
+            question = question_pool[q_index]
+            q_index += 1
 
-            # Decide if this is a Power-Up question
-            is_powerup = random.random() < POWERUP_CHANCE
-            time_limit = current_max_time
+            # Decide round type
+            is_powerup       = random.random() < POWERUP_CHANCE
+            is_double_trouble = random.random() < DOUBLE_TROUBLE_PCT
+            is_trap           = (not is_double_trouble) and random.random() < TRAP_QUESTION_PCT
+            time_limit        = current_max_time
 
-            # ── Typing indicator ──────────────────────────────────────────
             async with ctx.channel.typing():
-                await asyncio.sleep(1.2)   # brief dramatic pause
+                await asyncio.sleep(1.0)
 
-            # ── Build and send the challenge embed ────────────────────────
-            shield_note = (
-                "  🛡️ **SHIELD ACTIVE** — you have one free life!"
-                if target_state.has_shield else ""
-            )
-            powerup_note = (
-                f"\n\n⚡ **POWER-UP QUESTION!** Correct answer gives **+{POWERUP_BONUS:.0f}s** bonus!"
-                if is_powerup else ""
-            )
+            if is_trap:
+                # ── TRAP QUESTION  ("Simon Didn't Say") ──────────────────
+                trap_prompt = random.choice(TRAP_PROMPTS)
 
-            await ctx.send(embed=self._embed(
-                title=f"⚡  CHALLENGE! — Round {round_number}",
-                description=(
-                    f"{target_state.member.mention}, it's your turn!{shield_note}\n\n"
-                    f"**{_poison(question['prompt'])}**{powerup_note}\n\n"
-                    f"⏱  You have **{time_limit:.0f} seconds**!"
-                ),
-                colour=COLOUR_BONUS if is_powerup else COLOUR_ROUND,
-                footer=(
-                    f"{len(players)} players remaining  |  "
-                    f"Round {round_number}  |  "
-                    f"🔥 Streak: {target_state.streak}  |  "
-                    f"Time limit: {time_limit:.0f}s"
-                ),
-            ))
+                await ctx.send(embed=self._embed(
+                    title=f"❓  CHALLENGE! — Round {round_number}",
+                    description=(
+                        f"{target_state.member.mention}, it's your turn!\n\n"
+                        f"**{_poison(trap_prompt)}**\n\n"
+                        f"⏱  You have **{time_limit:.0f} seconds**!"
+                    ),
+                    colour=COLOUR_ROUND,
+                    footer=(
+                        f"{len(players)} players remaining  |  Round {round_number}  |  "
+                        f"🔥 Streak: {target_state.streak}"
+                    ),
+                ))
 
-            # ── Wait for a correct answer ─────────────────────────────────
-            correct_answer = question["answer"]
-
-            def answer_check(m: discord.Message) -> bool:
-                return (
-                    m.channel   == ctx.channel
-                    and m.author == target_state.member
-                    and m.content.strip() == correct_answer
-                )
-
-            t_start = time.monotonic()
-            try:
-                await self.bot.wait_for(
-                    "message",
-                    check=answer_check,
-                    timeout=time_limit,
-                )
-                answer_time = time.monotonic() - t_start
-
-                # ── Correct! ──────────────────────────────────────────────
-                target_state.streak         += 1
-                target_state.rounds_survived += 1
-                target_state.fastest_answer  = min(
-                    target_state.fastest_answer, answer_time
-                )
-
-                # Power-up bonus
-                if is_powerup:
-                    current_max_time = min(STARTING_TIME, current_max_time + POWERUP_BONUS)
-                    await ctx.send(embed=self._embed(
-                        "⚡  POWER-UP!",
-                        (
-                            f"**{target_state.member.display_name}** nailed it in "
-                            f"**{answer_time:.2f}s** and collected the power-up!\n\n"
-                            f"⏱  Time limit boosted to **{current_max_time:.0f}s**!"
-                        ),
-                        COLOUR_BONUS,
-                    ))
-                else:
-                    await ctx.send(
-                        f"✅  **{target_state.member.display_name}** answered correctly "
-                        f"in **{answer_time:.2f}s**! 🎉"
+                # Check: if the player answers ANYTHING (other than skip), they explode
+                def trap_check(m: discord.Message) -> bool:
+                    return (
+                        m.channel == ctx.channel
+                        and m.author == target_state.member
+                        and not m.author.bot
                     )
 
-                # Streak milestone — award shield
-                if target_state.streak >= STREAK_REQUIRED and not target_state.has_shield:
-                    target_state.has_shield = True
-                    await ctx.send(embed=self._embed(
-                        "🛡️  STREAK SHIELD EARNED!",
-                        (
-                            f"**{target_state.member.display_name}** has answered "
-                            f"**{target_state.streak} in a row** and earned a "
-                            f"**Streak Shield** — one free life! 🔰"
-                        ),
-                        COLOUR_SHIELD,
-                    ))
+                try:
+                    trap_msg: discord.Message = await asyncio.wait_for(
+                        self.bot.wait_for("message", check=trap_check),
+                        timeout=time_limit,
+                    )
+                    player_response = trap_msg.content.strip().lower()
 
-            except asyncio.TimeoutError:
-                # ── Time's up ─────────────────────────────────────────────
-                target_state.streak = 0   # streak broken on timeout
+                    if player_response == TRAP_SAFETY_WORD:
+                        # Survived by typing the safety word
+                        await ctx.send(embed=self._embed(
+                            "✅  Trap Survived!",
+                            (
+                                f"**{target_state.member.display_name}** recognized "
+                                f"the trap and typed `{TRAP_SAFETY_WORD}`! 🧠\n\n"
+                                "Smart move — Simon Didn't Say!"
+                            ),
+                            COLOUR_WIN,
+                        ))
+                        target_state.streak += 1
+                        target_state.rounds_survived += 1
+                    else:
+                        # Answered the trap — instant elimination
+                        if target_state.has_shield:
+                            target_state.has_shield = False
+                            target_state.streak = 0
+                            await ctx.send(embed=self._embed(
+                                "🛡️  Shield Used on Trap!",
+                                (
+                                    f"**{target_state.member.display_name}** fell for "
+                                    f"the trap, but their **Streak Shield** saved them! 💨\n\n"
+                                    "**Simon Didn't Say!** Shield is now gone. ⚠️"
+                                ),
+                                COLOUR_SHIELD,
+                            ))
+                        else:
+                            players.remove(target_state)
+                            elimination_count += 1
+                            round_number = elimination_count + 1
+                            current_max_time = max(
+                                MINIMUM_TIME, current_max_time - TIME_REDUCTION
+                            )
+                            await ctx.send(embed=self._embed(
+                                "💥  TRAP TRIGGERED!",
+                                (
+                                    f"**{target_state.member.display_name}** answered a trap!\n\n"
+                                    "**Simon Didn't Say!** You're ELIMINATED! 🔥\n\n"
+                                    f"**{len(players)}** player"
+                                    f"{'s' if len(players) != 1 else ''} remain…"
+                                ),
+                                COLOUR_TRAP,
+                            ))
+                            await asyncio.sleep(2)
 
-                if target_state.has_shield:
-                    # Shield absorbs the elimination
-                    target_state.has_shield = False
-                    await ctx.send(embed=self._embed(
-                        "🛡️  SHIELD USED!",
-                        (
-                            f"**{target_state.member.display_name}** ran out of time, "
-                            f"but their **Streak Shield** saved them! 💨\n\n"
-                            f"Correct answer was: **`{correct_answer}`**\n\n"
-                            f"Shield is now gone — no more free passes! ⚠️"
-                        ),
-                        COLOUR_SHIELD,
-                    ))
-                else:
-                    # No shield — eliminate the player
-                    players.remove(target_state)
-                    elimination_count += 1
-                    round_number = elimination_count + 1
-                    current_max_time = max(MINIMUM_TIME, current_max_time - TIME_REDUCTION)
+                except asyncio.TimeoutError:
+                    # Ignored the trap — also survives
+                    await ctx.send(
+                        f"✅  **{target_state.member.display_name}** wisely "
+                        "ignored the trap! Simon Didn't Say! 🧠"
+                    )
+                    target_state.streak += 1
+                    target_state.rounds_survived += 1
 
-                    await ctx.send(embed=self._embed(
-                        "💥  K A B O O M!",
-                        (
-                            f"**{target_state.member.display_name}** ran out of time "
-                            f"and has been **OBLITERATED**! 🔥\n\n"
-                            f"Correct answer was: **`{correct_answer}`**\n\n"
-                            f"⏱  Time limit is now **{current_max_time:.0f}s** — "
-                            f"getting spicy! 🌶️\n\n"
-                            f"**{len(players)}** player{'s' if len(players) != 1 else ''} remain…"
-                        ),
-                        COLOUR_BOOM,
-                    ))
-                    await asyncio.sleep(2)
+            elif is_double_trouble:
+                # ── DOUBLE TROUBLE ────────────────────────────────────────
+                dt_word    = random.choice(DOUBLE_TROUBLE_WORDS)
+                dt_reversed = dt_word[::-1]
 
-        # ── Check for cancel / game ending before sudden death ────────────
+                # Build a composite answer: exact string + space + reversed word
+                composite_answer = f"{question['answer']} {dt_reversed}"
+
+                displayed = (
+                    f"**DOUBLE TROUBLE!** 🔥🔥\n\n"
+                    f"Task 1 — {_poison(question['prompt'])}\n"
+                    f"Task 2 — Type the word **`{dt_word.upper()}`** **backward**\n\n"
+                    f"Answer format: `<task1_answer> <task2_answer>` in ONE message\n"
+                    f"⏱  You have **{time_limit:.0f} seconds** — GO!"
+                )
+
+                await ctx.send(embed=self._embed(
+                    title=f"🔥  DOUBLE TROUBLE! — Round {round_number}",
+                    description=(
+                        f"{target_state.member.mention}, it's your turn!\n\n"
+                        + displayed
+                    ),
+                    colour=COLOUR_DOUBLE,
+                    footer=(
+                        f"{len(players)} players remaining  |  Round {round_number}  |  "
+                        f"🔥 Streak: {target_state.streak}"
+                    ),
+                ))
+
+                def dt_check(m: discord.Message) -> bool:
+                    return (
+                        m.channel == ctx.channel
+                        and m.author == target_state.member
+                        and m.content.strip() == composite_answer
+                    )
+
+                t_start = time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        self.bot.wait_for("message", check=dt_check),
+                        timeout=time_limit,
+                    )
+                    answer_time = time.monotonic() - t_start
+                    target_state.streak += 1
+                    target_state.rounds_survived += 1
+                    target_state.fastest_answer = min(
+                        target_state.fastest_answer, answer_time
+                    )
+                    await ctx.send(
+                        f"✅  **{target_state.member.display_name}** smashed Double Trouble "
+                        f"in **{answer_time:.2f}s**! 🔥🎉"
+                    )
+                except asyncio.TimeoutError:
+                    target_state.streak = 0
+                    if target_state.has_shield:
+                        target_state.has_shield = False
+                        await ctx.send(embed=self._embed(
+                            "🛡️  Shield Used!",
+                            (
+                                f"**{target_state.member.display_name}** ran out of time "
+                                f"on Double Trouble, but their **Streak Shield** saved them!\n\n"
+                                f"Expected: **`{composite_answer}`**"
+                            ),
+                            COLOUR_SHIELD,
+                        ))
+                    else:
+                        players.remove(target_state)
+                        elimination_count += 1
+                        round_number = elimination_count + 1
+                        current_max_time = max(
+                            MINIMUM_TIME, current_max_time - TIME_REDUCTION
+                        )
+                        await ctx.send(embed=self._embed(
+                            "💥  K A B O O M!",
+                            (
+                                f"**{target_state.member.display_name}** failed Double Trouble "
+                                f"and has been **OBLITERATED**! 🔥\n\n"
+                                f"Expected: **`{composite_answer}`**\n\n"
+                                f"⏱  Time limit: **{current_max_time:.0f}s**\n"
+                                f"**{len(players)}** player"
+                                f"{'s' if len(players) != 1 else ''} remain…"
+                            ),
+                            COLOUR_BOOM,
+                        ))
+                        await asyncio.sleep(2)
+
+            else:
+                # ── STANDARD ROUND ────────────────────────────────────────
+                shield_note  = (
+                    "\n🛡️ **SHIELD ACTIVE** — you have one free life!"
+                    if target_state.has_shield else ""
+                )
+                powerup_note = (
+                    f"\n\n⚡ **POWER-UP QUESTION!** Correct answer gives "
+                    f"**+{POWERUP_BONUS:.0f}s** bonus!"
+                    if is_powerup else ""
+                )
+
+                await ctx.send(embed=self._embed(
+                    title=f"⚡  CHALLENGE! — Round {round_number}",
+                    description=(
+                        f"{target_state.member.mention}, it's your turn!{shield_note}\n\n"
+                        f"**{_poison(question['prompt'])}**{powerup_note}\n\n"
+                        f"⏱  You have **{time_limit:.0f} seconds**!"
+                    ),
+                    colour=COLOUR_BONUS if is_powerup else COLOUR_ROUND,
+                    footer=(
+                        f"{len(players)} players remaining  |  Round {round_number}  |  "
+                        f"🔥 Streak: {target_state.streak}  |  Time limit: {time_limit:.0f}s"
+                    ),
+                ))
+
+                correct_answer = question["answer"]
+
+                def answer_check(m: discord.Message) -> bool:
+                    return (
+                        m.channel == ctx.channel
+                        and m.author == target_state.member
+                        and m.content.strip() == correct_answer
+                    )
+
+                t_start = time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        self.bot.wait_for("message", check=answer_check),
+                        timeout=time_limit,
+                    )
+                    answer_time = time.monotonic() - t_start
+                    target_state.streak          += 1
+                    target_state.rounds_survived += 1
+                    target_state.fastest_answer   = min(
+                        target_state.fastest_answer, answer_time
+                    )
+
+                    if is_powerup:
+                        current_max_time = min(
+                            STARTING_TIME, current_max_time + POWERUP_BONUS
+                        )
+                        await ctx.send(embed=self._embed(
+                            "⚡  POWER-UP!",
+                            (
+                                f"**{target_state.member.display_name}** nailed it in "
+                                f"**{answer_time:.2f}s** and collected the power-up!\n\n"
+                                f"⏱  Time limit boosted to **{current_max_time:.0f}s**!"
+                            ),
+                            COLOUR_BONUS,
+                        ))
+                    else:
+                        await ctx.send(
+                            f"✅  **{target_state.member.display_name}** answered correctly "
+                            f"in **{answer_time:.2f}s**! 🎉"
+                        )
+
+                    # Streak shield milestone
+                    if (
+                        target_state.streak >= STREAK_REQUIRED
+                        and not target_state.has_shield
+                    ):
+                        target_state.has_shield = True
+                        await ctx.send(embed=self._embed(
+                            "🛡️  STREAK SHIELD EARNED!",
+                            (
+                                f"**{target_state.member.display_name}** answered "
+                                f"**{target_state.streak} in a row** and earned a "
+                                "**Streak Shield** — one free life! 🔰"
+                            ),
+                            COLOUR_SHIELD,
+                        ))
+
+                except asyncio.TimeoutError:
+                    target_state.streak = 0
+
+                    if target_state.has_shield:
+                        target_state.has_shield = False
+                        await ctx.send(embed=self._embed(
+                            "🛡️  SHIELD USED!",
+                            (
+                                f"**{target_state.member.display_name}** ran out of time, "
+                                "but their **Streak Shield** saved them! 💨\n\n"
+                                f"Correct answer was: **`{correct_answer}`**\n\n"
+                                "Shield is now gone — no more free passes! ⚠️"
+                            ),
+                            COLOUR_SHIELD,
+                        ))
+                    else:
+                        players.remove(target_state)
+                        elimination_count += 1
+                        round_number = elimination_count + 1
+                        current_max_time = max(
+                            MINIMUM_TIME, current_max_time - TIME_REDUCTION
+                        )
+                        await ctx.send(embed=self._embed(
+                            "💥  K A B O O M!",
+                            (
+                                f"**{target_state.member.display_name}** ran out of time "
+                                "and has been **OBLITERATED**! 🔥\n\n"
+                                f"Correct answer was: **`{correct_answer}`**\n\n"
+                                f"⏱  Time limit is now **{current_max_time:.0f}s** "
+                                "— getting spicy! 🌶️\n\n"
+                                f"**{len(players)}** player"
+                                f"{'s' if len(players) != 1 else ''} remain…"
+                            ),
+                            COLOUR_BOOM,
+                        ))
+                        await asyncio.sleep(2)
+
+            round_number += 1
+
+        # ── Post-loop: check cancel / edge cases ──────────────────────────
         if cancel_event.is_set():
             await ctx.send(embed=self._embed(
                 "🛑  Game Aborted", "Cancelled by an administrator.", COLOUR_BOOM
@@ -1140,11 +1813,10 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             return
 
         if len(players) == 1:
-            # Edge case: only 1 left (e.g., after a kick)
             await self._conclude_game(ctx, players[0], stats_data)
             return
 
-        # ── SUDDEN DEATH — exactly 2 players remain ───────────────────────
+        # Exactly 2 players left → Sudden Death
         await self._safe_sudden_death(ctx, players, stats_data, round_number, cancel_event)
 
     # ───────────────────────────────────────────────────────────────────────
@@ -1153,23 +1825,22 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
 
     async def _sudden_death(
         self,
-        ctx: commands.Context,
-        players: list[_Player],
-        stats_data: dict,
+        ctx:          commands.Context,
+        players:      list[_Player],
+        stats_data:   dict[str, dict],
         round_number: int,
         cancel_event: asyncio.Event,
     ) -> None:
         """
         1-v-1 finale: BOTH players receive the SAME question simultaneously.
         The one who answers SLOWER (or times out) is eliminated.
-        Repeat until one player loses.
         """
 
-        # p1/p2 are refreshed each iteration from the live players list
         await ctx.send(embed=self._embed(
             title="☠️  SUDDEN DEATH!",
             description=(
-                f"We're down to **{players[0].member.mention}** vs **{players[1].member.mention}**!\n\n"
+                f"We're down to **{players[0].member.mention}** vs "
+                f"**{players[1].member.mention}**!\n\n"
                 "Same question. Same time. Whoever answers **SLOWER** explodes. 💀\n\n"
                 "May the fastest fingers win… 🏁"
             ),
@@ -1177,12 +1848,12 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         ))
         await asyncio.sleep(3)
 
-        question_pool = list(QUESTIONS)
+        question_pool: list[dict[str, str]] = list(QUESTIONS)
         random.shuffle(question_pool)
         q_index = 0
 
         while len(players) == 2:
-            p1, p2 = players[0], players[1]  # always refresh from live list
+            p1, p2 = players[0], players[1]
 
             if cancel_event.is_set():
                 await ctx.send(embed=self._embed(
@@ -1195,139 +1866,191 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             if q_index >= len(question_pool):
                 random.shuffle(question_pool)
                 q_index = 0
-            question      = question_pool[q_index]
-            q_index      += 1
+            question       = question_pool[q_index]
+            q_index       += 1
             correct_answer = question["answer"]
 
+            # Decide if this sudden death round is a trap
+            is_sd_trap = random.random() < TRAP_QUESTION_PCT
+
             async with ctx.channel.typing():
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(0.8)
 
-            await ctx.send(embed=self._embed(
-                title=f"☠️  SUDDEN DEATH — Round {round_number}",
-                description=(
-                    f"{p1.member.mention} vs {p2.member.mention}\n\n"
-                    f"**{_poison(question['prompt'])}**\n\n"
-                    f"⏱  You have **{MINIMUM_TIME:.0f} seconds** — GO!"
-                ),
-                colour=COLOUR_SUDDEN,
-                footer="Slowest correct answer loses. Wrong answer = wait and retype.",
-            ))
+            if is_sd_trap:
+                # In sudden death, BOTH must ignore/skip the trap
+                trap_prompt = random.choice(TRAP_PROMPTS)
 
-            # Collect first and second correct answers with timestamps
-            results: list[tuple[_Player, float]] = []   # (player, elapsed)
-            t_start = time.monotonic()
+                await ctx.send(embed=self._embed(
+                    title=f"☠️  SUDDEN DEATH — Round {round_number}",
+                    description=(
+                        f"{p1.member.mention} vs {p2.member.mention}\n\n"
+                        f"**{_poison(trap_prompt)}**\n\n"
+                        f"⏱  **{MINIMUM_TIME:.0f}s** — GO! "
+                        f"(type `{TRAP_SAFETY_WORD}` to survive!)"
+                    ),
+                    colour=COLOUR_SUDDEN,
+                    footer="Simon Didn't Say — DO NOT answer. Type 'skip' to survive.",
+                ))
 
-            def sd_check(m: discord.Message, _ans: str = correct_answer) -> bool:
-                return (
-                    m.channel == ctx.channel
-                    and m.author in (p1.member, p2.member)
-                    and m.content.strip() == _ans
-                )
+                # Collect any responses from either player
+                t_start  = time.monotonic()
+                deadline = t_start + MINIMUM_TIME
+                losers:  list[_Player] = []
 
-            # We wait twice (for both players) or until time is up
-            deadline = time.monotonic() + MINIMUM_TIME
-
-            while len(results) < 2 and time.monotonic() < deadline:
-                remaining = max(0.0, deadline - time.monotonic())
-                try:
-                    msg: discord.Message = await asyncio.wait_for(
-                        self.bot.wait_for("message", check=sd_check),
-                        timeout=remaining,
+                def sd_trap_check(m: discord.Message) -> bool:
+                    return (
+                        m.channel == ctx.channel
+                        and m.author in (p1.member, p2.member)
+                        and not m.author.bot
                     )
-                    elapsed  = time.monotonic() - t_start
-                    responder = p1 if msg.author == p1.member else p2
 
-                    # Only record the FIRST correct message per player
-                    if not any(r[0] == responder for r in results):
-                        results.append((responder, elapsed))
+                while time.monotonic() < deadline and len(losers) < 2:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    try:
+                        msg: discord.Message = await asyncio.wait_for(
+                            self.bot.wait_for("message", check=sd_trap_check),
+                            timeout=remaining,
+                        )
+                        responder = p1 if msg.author == p1.member else p2
+                        response  = msg.content.strip().lower()
 
-                except asyncio.TimeoutError:
-                    break
+                        if response != TRAP_SAFETY_WORD and responder not in losers:
+                            losers.append(responder)
+                    except asyncio.TimeoutError:
+                        break
 
-            # ── Determine who loses ───────────────────────────────────────
-            answered_ids = {r[0] for r in results}
+                if not losers:
+                    await ctx.send("🧠  Both players survived the trap! Replaying round…")
+                    continue
 
-            if len(results) == 0:
-                # Both timed out — re-run this round
-                await ctx.send("💨  Both players timed out! Reshuffling the same round…")
-                continue
+                # Eliminate the one(s) who answered
+                loser_state = losers[0]
+                players.remove(loser_state)
+                await ctx.send(embed=self._embed(
+                    "💥  TRAP IN SUDDEN DEATH!",
+                    (
+                        f"**{loser_state.member.display_name}** answered the trap "
+                        "and was **VAPORISED**! 🔥\n\n"
+                        "**Simon Didn't Say!** 👁️"
+                    ),
+                    COLOUR_TRAP,
+                ))
+                await asyncio.sleep(2)
 
-            if len(results) == 1:
-                # Only one answered — the other is out
-                winner_state = results[0][0]
-                loser_state  = p2 if winner_state == p1 else p1
             else:
-                # Both answered — slowest is out
-                results.sort(key=lambda x: x[1])   # fastest first
-                winner_state = results[0][0]
-                loser_state  = results[1][0]
+                # Standard sudden death round with poisoned display
+                await ctx.send(embed=self._embed(
+                    title=f"☠️  SUDDEN DEATH — Round {round_number}",
+                    description=(
+                        f"{p1.member.mention} vs {p2.member.mention}\n\n"
+                        f"**{_poison(question['prompt'])}**\n\n"
+                        f"⏱  You have **{MINIMUM_TIME:.0f} seconds** — GO!"
+                    ),
+                    colour=COLOUR_SUDDEN,
+                    footer="Slowest correct answer loses. Wrong answer = retype.",
+                ))
 
-                await ctx.send(
-                    f"⚡  **{winner_state.member.display_name}** answered in "
-                    f"**{results[0][1]:.2f}s** vs "
-                    f"**{results[1][1]:.2f}s** — "
-                    f"**{loser_state.member.display_name}** was slower!"
-                )
+                results: list[tuple[_Player, float]] = []
+                t_start  = time.monotonic()
+                deadline = t_start + MINIMUM_TIME
 
-            players.remove(loser_state)
+                def sd_check(m: discord.Message, _ans: str = correct_answer) -> bool:
+                    return (
+                        m.channel == ctx.channel
+                        and m.author in (p1.member, p2.member)
+                        and m.content.strip() == _ans
+                    )
 
-            await ctx.send(embed=self._embed(
-                "💥  ELIMINATED IN SUDDEN DEATH!",
-                (
-                    f"**{loser_state.member.display_name}** has been vaporised! 🔥\n\n"
-                    f"Correct answer was: **`{correct_answer}`**"
-                ),
-                COLOUR_BOOM,
-            ))
-            await asyncio.sleep(2)
+                while len(results) < 2 and time.monotonic() < deadline:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    try:
+                        sd_msg: discord.Message = await asyncio.wait_for(
+                            self.bot.wait_for("message", check=sd_check),
+                            timeout=remaining,
+                        )
+                        elapsed   = time.monotonic() - t_start
+                        responder = p1 if sd_msg.author == p1.member else p2
+                        if not any(r[0] == responder for r in results):
+                            results.append((responder, elapsed))
+                    except asyncio.TimeoutError:
+                        break
+
+                if len(results) == 0:
+                    await ctx.send("💨  Both players timed out! Replaying the round…")
+                    continue
+
+                if len(results) == 1:
+                    winner_state = results[0][0]
+                    loser_state  = p2 if winner_state == p1 else p1
+                else:
+                    results.sort(key=lambda x: x[1])
+                    winner_state = results[0][0]
+                    loser_state  = results[1][0]
+                    await ctx.send(
+                        f"⚡  **{winner_state.member.display_name}** answered in "
+                        f"**{results[0][1]:.2f}s** vs **{results[1][1]:.2f}s** — "
+                        f"**{loser_state.member.display_name}** was slower!"
+                    )
+
+                players.remove(loser_state)
+                await ctx.send(embed=self._embed(
+                    "💥  ELIMINATED IN SUDDEN DEATH!",
+                    (
+                        f"**{loser_state.member.display_name}** has been vaporised! 🔥\n\n"
+                        f"Correct answer was: **`{correct_answer}`**"
+                    ),
+                    COLOUR_BOOM,
+                ))
+                await asyncio.sleep(2)
 
         if players:
             await self._conclude_game(ctx, players[0], stats_data)
 
     # ───────────────────────────────────────────────────────────────────────
-    # PHASE 2b ERROR HANDLER — catches silent crashes in sudden death
+    # PHASE 2b ERROR WRAPPER
     # ───────────────────────────────────────────────────────────────────────
 
     async def _safe_sudden_death(
         self,
-        ctx: commands.Context,
-        players: list,
-        stats_data: dict,
+        ctx:          commands.Context,
+        players:      list[_Player],
+        stats_data:   dict[str, dict],
         round_number: int,
         cancel_event: asyncio.Event,
     ) -> None:
         try:
-            await self._sudden_death(ctx, players, stats_data, round_number, cancel_event)
+            await self._sudden_death(
+                ctx, players, stats_data, round_number, cancel_event
+            )
         except RecursionError:
-            import logging
-            logging.getLogger("bot").error("RecursionError in sudden death — Render restarted mid-game")
+            log.error("[SimonSays] RecursionError in sudden death — Render restart?")
             await ctx.send(embed=self._embed(
                 "💥  Game Error",
-                "The server hiccupped mid-game (Render free tier restart). Use `!simonstart` to play again!",
+                "The server restarted mid-game (Render free tier). "
+                "Use `!simonstart` to play again!",
                 COLOUR_BOOM,
             ))
         except Exception as exc:
-            import logging
-            logging.getLogger("bot").error("Sudden death crashed: %s", exc)
+            log.error("[SimonSays] Sudden death crashed: %s", exc)
             await ctx.send(embed=self._embed(
                 "💥  Game Error",
-                "Something went wrong in Sudden Death and the game had to stop. Sorry! Use `!simonstart` to play again.",
+                "Something went wrong in Sudden Death. "
+                "Use `!simonstart` to play again.",
                 COLOUR_BOOM,
             ))
 
     # ───────────────────────────────────────────────────────────────────────
-    # PHASE 3 — CONCLUSION  (save stats + announce winner)
+    # PHASE 3 — CONCLUSION
     # ───────────────────────────────────────────────────────────────────────
 
     async def _conclude_game(
         self,
-        ctx: commands.Context,
+        ctx:          commands.Context,
         winner_state: _Player,
-        stats_data: dict,
+        stats_data:   dict[str, dict],
     ) -> None:
-        """Persist all per-player stats for this game, then announce the winner."""
+        """Persist stats, pay out bets, and announce the winner."""
 
-        # Grab the full active list (may have been modified by kicks)
         all_players = self._active_players.get(ctx.channel.id, [winner_state])
 
         for ps_obj in all_players:
@@ -1338,12 +2061,37 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             if ps_obj.fastest_answer < row["fastest_answer"]:
                 row["fastest_answer"] = ps_obj.fastest_answer
 
-        # Record the win
         winner_row = _get_player(stats_data, winner_state.member.id)
         winner_row["wins"] += 1
         _save_stats(stats_data)
 
-        # ── Winner embed ──────────────────────────────────────────────────
+        # ── Pay out bets ──────────────────────────────────────────────────
+        bets = self._bets.get(ctx.channel.id, {})
+        if bets:
+            try:
+                from cogs.server_drops_economy import add_points
+                payout_lines: list[str] = []
+                for bettor_id, (amount, target_id) in bets.items():
+                    if target_id == winner_state.member.id:
+                        # Winner — return 2× bet
+                        add_points(bettor_id, amount * 2)
+                        payout_lines.append(
+                            f"<@{bettor_id}> bet on the winner — "
+                            f"won **{amount * 2} pts**! 🎰"
+                        )
+                    # Losers already had their points deducted; nothing to do
+                if payout_lines:
+                    await ctx.send(embed=self._embed(
+                        "💰  Betting Payouts",
+                        "\n".join(payout_lines),
+                        COLOUR_BET,
+                    ))
+            except ImportError:
+                pass
+            except Exception as exc:
+                log.error("[SimonSays] Bet payout failed: %s", exc)
+
+        # ── Winner announcement ───────────────────────────────────────────
         await ctx.send(embed=self._embed(
             title="🏆  WE HAVE A WINNER!",
             description=(
@@ -1351,12 +2099,16 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
                 "Against all odds, through explosions, sudden death, and pure chaos…\n\n"
                 f"**{winner_state.member.display_name}** is the **LAST ONE STANDING!**\n\n"
                 f"🔥  Streak this game: **{winner_state.streak}** in a row\n"
-                f"⚡  Fastest answer: **{winner_state.fastest_answer:.2f}s**\n\n"
+                f"⚡  Fastest answer: "
+                f"**{winner_state.fastest_answer:.2f}s**\n\n"
                 "👑  **CHAMPION OF SIMON SAYS** 👑\n\n"
                 "All others have been reduced to smouldering craters. Bow! 🫡💥"
             ),
             colour=COLOUR_WIN,
-            footer="!simonleaderboard to see the all-time rankings | !simonstart to play again",
+            footer=(
+                "!simonleaderboard to see all-time rankings | "
+                "!simonstart to play again"
+            ),
             banner=WINNER_BANNER,
         ))
 
@@ -1365,7 +2117,9 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
     # ───────────────────────────────────────────────────────────────────────
 
     @simon_start.error
-    async def simon_start_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+    async def simon_start_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ) -> None:
         if isinstance(error, commands.MissingPermissions):
             await ctx.send(embed=self._embed(
                 "🚫  Permission Denied",
@@ -1383,7 +2137,13 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
 
     @simon_cancel.error
     @simon_kick.error
-    async def admin_cmd_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+    @simon_pause.error
+    @simon_resume.error
+    @simon_blacklist.error
+    @simon_extend.error
+    async def admin_cmd_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ) -> None:
         if isinstance(error, commands.MissingPermissions):
             await ctx.send(embed=self._embed(
                 "🚫  Permission Denied",

@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Render free tier can hit the default 1000 recursion limit during imports
 # under load — raise it to give the bot headroom
@@ -67,9 +69,37 @@ COLOUR_SUDDEN  = discord.Color.from_rgb(180,   0, 255)   # purple (sudden death)
 COLOUR_STATS   = discord.Color.from_rgb(114, 137, 218)   # soft blurple
 
 # ---------------------------------------------------------------------------
-# PATHS
+# PostgreSQL stats persistence
 # ---------------------------------------------------------------------------
-_STATS_PATH = Path(__file__).parent.parent / "simon_stats.json"
+_STATS_DB_URL = os.environ.get("DATABASE_URL", "")
+
+def _pg_connect():
+    if not _STATS_DB_URL:
+        raise RuntimeError("DATABASE_URL not set in environment")
+    return psycopg2.connect(_STATS_DB_URL, sslmode="require")
+
+
+def _init_stats_db() -> None:
+    with _pg_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS simon_stats (
+                    user_id        BIGINT PRIMARY KEY,
+                    wins           INTEGER NOT NULL DEFAULT 0,
+                    games_played   INTEGER NOT NULL DEFAULT 0,
+                    total_survived INTEGER NOT NULL DEFAULT 0,
+                    fastest_answer REAL NOT NULL DEFAULT 999.0,
+                    longest_streak INTEGER NOT NULL DEFAULT 0,
+                    display_name   TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+        con.commit()
+
+
+# Run once on import
+_init_stats_db()
 
 # ---------------------------------------------------------------------------
 # TIMING CONSTANTS
@@ -478,19 +508,49 @@ class PlayerStats:
 
 
 def _load_stats() -> dict[str, dict]:
-    """Load all player stats from JSON file; return empty dict on failure."""
-    if _STATS_PATH.exists():
-        try:
-            return json.loads(_STATS_PATH.read_text(encoding="utf-8"))
-        except Exception as exc:
-            print(f"[SimonSays] WARNING: Could not load stats: {exc}")
-    return {}
+    """Load all player stats from PostgreSQL; return empty dict on failure."""
+    try:
+        with _pg_connect() as con:
+            with con.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT user_id, wins, games_played, total_survived, fastest_answer, longest_streak, display_name FROM simon_stats"
+                )
+                rows = cur.fetchall()
+                return {str(row["user_id"]): dict(row) for row in rows}
+    except Exception as exc:
+        print(f"[SimonSays] WARNING: Could not load stats: {exc}")
+        return {}
 
 
 def _save_stats(data: dict[str, dict]) -> None:
-    """Persist all player stats to JSON file."""
+    """Persist all player stats to PostgreSQL (upsert each row)."""
     try:
-        _STATS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        with _pg_connect() as con:
+            with con.cursor() as cur:
+                for user_id, row in data.items():
+                    cur.execute(
+                        """
+                        INSERT INTO simon_stats (user_id, wins, games_played, total_survived, fastest_answer, longest_streak, display_name)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            wins = EXCLUDED.wins,
+                            games_played = EXCLUDED.games_played,
+                            total_survived = EXCLUDED.total_survived,
+                            fastest_answer = EXCLUDED.fastest_answer,
+                            longest_streak = EXCLUDED.longest_streak,
+                            display_name = EXCLUDED.display_name
+                        """,
+                        (
+                            int(user_id),
+                            row.get("wins", 0),
+                            row.get("games_played", 0),
+                            row.get("total_survived", 0),
+                            row.get("fastest_answer", 999.0),
+                            row.get("longest_streak", 0),
+                            row.get("display_name", ""),
+                        ),
+                    )
+            con.commit()
     except Exception as exc:
         print(f"[SimonSays] WARNING: Could not save stats: {exc}")
 

@@ -12,13 +12,19 @@ Document schema per guild:
 Requires MONGODB_URI in the environment (see .env).
 """
 
+import asyncio
+import logging
 import os
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 
 load_dotenv()
 
+log = logging.getLogger("bot.store")
+
 _col = None
+
+DB_TIMEOUT = 8  # seconds before a DB operation is considered hung
 
 
 def _get_collection():
@@ -29,7 +35,7 @@ def _get_collection():
             raise RuntimeError(
                 "MONGODB_URI is not set. Add it to your .env file."
             )
-        client = AsyncIOMotorClient(uri)
+        client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=5000)
         db = client[os.getenv("MONGODB_DB", "ghosty_bot")]
         _col = db["guild_config"]
     return _col
@@ -39,16 +45,22 @@ def _get_collection():
 
 async def get_automod_channel(guild_id: int) -> int | None:
     col = _get_collection()
-    doc = await col.find_one({"_id": guild_id}, {"automod_channel_id": 1})
+    doc = await asyncio.wait_for(
+        col.find_one({"_id": guild_id}, {"automod_channel_id": 1}),
+        timeout=DB_TIMEOUT,
+    )
     return doc.get("automod_channel_id") if doc else None
 
 
 async def set_automod_channel(guild_id: int, channel_id: int) -> None:
     col = _get_collection()
-    await col.update_one(
-        {"_id": guild_id},
-        {"$set": {"automod_channel_id": channel_id}},
-        upsert=True,
+    await asyncio.wait_for(
+        col.update_one(
+            {"_id": guild_id},
+            {"$set": {"automod_channel_id": channel_id}},
+            upsert=True,
+        ),
+        timeout=DB_TIMEOUT,
     )
 
 
@@ -56,14 +68,20 @@ async def set_automod_channel(guild_id: int, channel_id: int) -> None:
 
 async def get_drops_channel(guild_id: int) -> int | None:
     col = _get_collection()
-    doc = await col.find_one({"_id": guild_id}, {"drops_channel_id": 1})
+    doc = await asyncio.wait_for(
+        col.find_one({"_id": guild_id}, {"drops_channel_id": 1}),
+        timeout=DB_TIMEOUT,
+    )
     return doc.get("drops_channel_id") if doc else None
 
 
 async def set_drops_channel(guild_id: int, channel_id: int) -> None:
     col = _get_collection()
-    await col.update_one(
-        {"_id": guild_id},
-        {"$set": {"drops_channel_id": channel_id}},
-        upsert=True,
+    await asyncio.wait_for(
+        col.update_one(
+            {"_id": guild_id},
+            {"$set": {"drops_channel_id": channel_id}},
+            upsert=True,
+        ),
+        timeout=DB_TIMEOUT,
     )

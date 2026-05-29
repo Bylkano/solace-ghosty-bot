@@ -25,9 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import random
-import sqlite3
 import sys
 import pathlib
+import os
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -35,12 +35,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 import discord
 from discord import app_commands
 from discord.ext import commands
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from store import get_drops_channel, set_drops_channel
 
 # ──────────────────────────── constants ───────────────────────────
 
-DB_PATH      = pathlib.Path(__file__).parent.parent / "economy.db"
+_DB_URL = os.environ.get("DATABASE_URL", "")
 MSG_TRIGGER  = 10
 DROP_TIMEOUT = 30
 
@@ -354,85 +356,92 @@ EMOJI_PUZZLES: list[tuple[str, str]] = [
 ]
 
 
-# ─────────────────────── database helpers ─────────────────────────
+# ─────────────────────── PostgreSQL helpers ──────────────────────
 
-def _db_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+def _pg_connect():
+    if not _DB_URL:
+        raise RuntimeError("DATABASE_URL not set in environment")
+    return psycopg2.connect(_DB_URL, sslmode="require")
 
 
 def init_db() -> None:
-    with _db_connect() as con:
-        con.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                points  INTEGER NOT NULL DEFAULT 0
+    with _pg_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS economy_users (
+                    user_id BIGINT PRIMARY KEY,
+                    points  INTEGER NOT NULL DEFAULT 0
+                )
+                """
             )
-            """
-        )
         con.commit()
 
 
 def add_points(user_id: int, amount: int) -> int:
     """UPSERT points for a user and return their new total."""
-    with _db_connect() as con:
-        con.execute(
-            """
-            INSERT INTO users (user_id, points) VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET points = points + excluded.points
-            """,
-            (user_id, amount),
-        )
+    with _pg_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO economy_users (user_id, points) VALUES (%s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET points = economy_users.points + EXCLUDED.points
+                RETURNING points
+                """,
+                (user_id, amount),
+            )
+            row = cur.fetchone()
         con.commit()
-        row = con.execute(
-            "SELECT points FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        return row["points"] if row else amount
+        return row[0] if row else amount
 
 
 def deduct_points(user_id: int, amount: int) -> int:
     """Deduct points (floor at 0) and return new total."""
-    with _db_connect() as con:
-        con.execute(
-            """
-            INSERT INTO users (user_id, points) VALUES (?, 0)
-            ON CONFLICT(user_id) DO UPDATE
-                SET points = MAX(0, points - ?)
-            """,
-            (user_id, amount),
-        )
+    with _pg_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO economy_users (user_id, points) VALUES (%s, 0)
+                ON CONFLICT (user_id) DO UPDATE
+                    SET points = GREATEST(0, economy_users.points - %s)
+                RETURNING points
+                """,
+                (user_id, amount),
+            )
+            row = cur.fetchone()
         con.commit()
-        row = con.execute(
-            "SELECT points FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        return row["points"] if row else 0
+        return row[0] if row else 0
 
 
 def get_points(user_id: int) -> int:
-    with _db_connect() as con:
-        row = con.execute(
-            "SELECT points FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        return row["points"] if row else 0
+    with _pg_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "SELECT points FROM economy_users WHERE user_id = %s", (user_id,)
+            )
+            row = cur.fetchone()
+            return row[0] if row else 0
 
 
-def get_leaderboard(limit: int = 10) -> list[sqlite3.Row]:
-    with _db_connect() as con:
-        return con.execute(
-            "SELECT user_id, points FROM users ORDER BY points DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+def get_leaderboard(limit: int = 10) -> list[dict]:
+    with _pg_connect() as con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT user_id, points FROM economy_users ORDER BY points DESC LIMIT %s",
+                (limit,),
+            )
+            return cur.fetchall()
 
 
 def get_top_user() -> tuple[int, int] | None:
     """Return (user_id, points) of the user with the highest balance, or None."""
-    with _db_connect() as con:
-        row = con.execute(
-            "SELECT user_id, points FROM users ORDER BY points DESC LIMIT 1"
-        ).fetchone()
-        return (row["user_id"], row["points"]) if row else None
+    with _pg_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, points FROM economy_users ORDER BY points DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else None
 
 
 # ──────────────────────── embed builders ──────────────────────────

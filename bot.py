@@ -46,7 +46,8 @@ log = logging.getLogger("bot")
 COGS = [
     "cogs.moderation",
     "cogs.events",
-    "cogs.server_drops_economy",  # ← new economy/drops cog
+    "cogs.server_drops_economy", 
+    "cogs.simon_says",     # ← new economy/drops cog
 ]
 
 

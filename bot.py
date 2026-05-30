@@ -50,6 +50,7 @@ COGS = [
     "cogs.simon_says",
     "cogs.server_drops_economy",
     "cogs.auction",
+    "cogs.bank_breakthrough",
 ]
 
 

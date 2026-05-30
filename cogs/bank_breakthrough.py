@@ -36,6 +36,8 @@ from __future__ import annotations
 import asyncio
 import random
 import os
+import math
+from io import BytesIO
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -367,6 +369,7 @@ def _init_grid() -> set[tuple[int, int]]:
 
 
 def _render_grid(state: GameState) -> str:
+    """Fallback emoji grid (used if Pillow unavailable)."""
     grid = [[EMOJI_EMPTY for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
     vr, vc = VAULT_POS
     grid[vr][vc] = EMOJI_VAULT
@@ -375,6 +378,190 @@ def _render_grid(state: GameState) -> str:
     for slot, champ in state.champions.items():
         grid[champ.row][champ.col] = champ.emoji
     return "\n".join("".join(row) for row in grid)
+
+
+def _render_grid_image(state: GameState) -> Optional[BytesIO]:
+    """
+    Render the 7×7 game board as a styled PNG image.
+    Returns a BytesIO buffer, or None if Pillow is unavailable.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    # ── Layout constants ──────────────────────────────────────────────────────
+    CELL     = 82          # pixels per cell
+    PAD      = 48          # outer padding
+    LABEL    = 20          # axis-label strip width
+    W = PAD + LABEL + GRID_SIZE * CELL + PAD
+    H = PAD + LABEL + GRID_SIZE * CELL + PAD
+
+    # ── Palette ───────────────────────────────────────────────────────────────
+    BG          = (8,  10,  20)
+    BOARD_BG    = (14, 20,  38)
+    CELL_A      = (24, 32,  56)      # checkerboard tile A
+    CELL_B      = (20, 28,  50)      # checkerboard tile B
+    BORDER      = (45, 60, 105)
+    GRID_LINE   = (35, 48,  85)
+
+    LOOT_BG     = (85,  58,   5)
+    LOOT_RING   = (255, 195,  20)
+    LOOT_FG     = (255, 215,  50)
+
+    VAULT_BG    = (70,  50,   0)
+    VAULT_RING  = (255, 200,   0)
+    VAULT_GLOW  = (255, 235,  80)
+    VAULT_INNER = (255, 250, 130)
+
+    CHAMP_COLS = [
+        (220,  55,  55),   # slot 0 — red
+        ( 55, 120, 230),   # slot 1 — blue
+        ( 40, 195,  80),   # slot 2 — green
+        (220, 175,   0),   # slot 3 — yellow
+    ]
+    FROZEN_RING  = (100, 185, 255)
+    SHIELD_RING  = (200, 220, 255)
+    TEXT_BRIGHT  = (245, 248, 255)
+    TEXT_DIM     = ( 90, 110, 160)
+    TEXT_DARK    = ( 15,  20,  40)
+
+    # ── Image + draw ──────────────────────────────────────────────────────────
+    img  = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Fonts (Pillow 10 default scalable font)
+    try:
+        f_lg = ImageFont.load_default(size=18)
+        f_md = ImageFont.load_default(size=14)
+        f_sm = ImageFont.load_default(size=11)
+    except Exception:
+        f_lg = f_md = f_sm = ImageFont.load_default()
+
+    # ── Board background panel ────────────────────────────────────────────────
+    bx0 = PAD + LABEL
+    by0 = PAD + LABEL
+    bx1 = bx0 + GRID_SIZE * CELL
+    by1 = by0 + GRID_SIZE * CELL
+    draw.rectangle([bx0 - 5, by0 - 5, bx1 + 5, by1 + 5],
+                   fill=BOARD_BG, outline=BORDER, width=4)
+
+    # ── Axis coordinate labels ────────────────────────────────────────────────
+    for i in range(GRID_SIZE):
+        cx = bx0 + i * CELL + CELL // 2
+        cy = by0 + i * CELL + CELL // 2
+        draw.text((cx, by0 - 11), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
+        draw.text((bx0 - 11, cy), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
+
+    # ── Champion lookup ───────────────────────────────────────────────────────
+    champ_at: dict[tuple[int, int], int] = {
+        (c.row, c.col): slot for slot, c in state.champions.items()
+    }
+
+    # ── Draw cells ───────────────────────────────────────────────────────────
+    for row in range(GRID_SIZE):
+        for col in range(GRID_SIZE):
+            x0 = bx0 + col * CELL + 2
+            y0 = by0 + row * CELL + 2
+            x1 = x0 + CELL - 4
+            y1 = y0 + CELL - 4
+            cx = (x0 + x1) // 2
+            cy = (y0 + y1) // 2
+            pos = (row, col)
+
+            is_vault = (pos == VAULT_POS)
+            is_loot  = (pos in state.loot_tiles)
+            slot     = champ_at.get(pos)
+
+            # ── Base tile ────────────────────────────────────────────────────
+            base = CELL_A if (row + col) % 2 == 0 else CELL_B
+            draw.rounded_rectangle([x0, y0, x1, y1], radius=7,
+                                   fill=base, outline=GRID_LINE, width=1)
+
+            # ── Vault tile ───────────────────────────────────────────────────
+            if is_vault:
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=7,
+                                       fill=VAULT_BG, outline=VAULT_RING, width=3)
+                # outer glow ring
+                r = 27
+                draw.ellipse([cx - r - 4, cy - r - 4, cx + r + 4, cy + r + 4],
+                             fill=None, outline=(180, 130, 0), width=2)
+                # inner filled circle
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                             fill=VAULT_GLOW, outline=VAULT_RING, width=2)
+                # star / crown symbol
+                draw.text((cx, cy - 3), "★", fill=VAULT_INNER, font=f_lg, anchor="mm")
+                draw.text((cx, y1 - 9), "VAULT", fill=VAULT_RING, font=f_sm, anchor="mm")
+
+            # ── Loot tile ────────────────────────────────────────────────────
+            elif is_loot:
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=7,
+                                       fill=LOOT_BG, outline=LOOT_RING, width=2)
+                r = 22
+                draw.ellipse([cx - r, cy - r - 4, cx + r, cy + r - 4],
+                             fill=(140, 95, 10), outline=LOOT_RING, width=2)
+                draw.text((cx, cy - 4), "$", fill=LOOT_FG, font=f_lg, anchor="mm")
+                draw.text((cx, y1 - 9), "LOOT", fill=LOOT_RING, font=f_sm, anchor="mm")
+
+            # ── Champion token ───────────────────────────────────────────────
+            if slot is not None:
+                champ     = state.champions[slot]
+                col_rgb   = CHAMP_COLS[slot]
+                r = 27
+
+                # Drop shadow
+                draw.ellipse([cx - r + 3, cy - r + 3, cx + r + 3, cy + r + 3],
+                             fill=(0, 0, 0))
+                # Main circle
+                draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                             fill=col_rgb, outline=TEXT_BRIGHT, width=2)
+                # Highlight shimmer (small arc at top-left)
+                hi = 10
+                draw.ellipse([cx - r + 5, cy - r + 5,
+                              cx - r + 5 + hi, cy - r + 5 + hi],
+                             fill=(255, 255, 255, 80))
+
+                # Champion label  e.g. "C1"
+                draw.text((cx, cy - 6), f"C{slot + 1}",
+                          fill=TEXT_BRIGHT, font=f_md, anchor="mm")
+                # Team abbreviation (up to 5 chars)
+                draw.text((cx, cy + 8), champ.team[:5].upper(),
+                          fill=TEXT_BRIGHT, font=f_sm, anchor="mm")
+
+                # Frozen ring ❄
+                if champ.frozen_rounds > 0:
+                    draw.ellipse([cx - r - 5, cy - r - 5, cx + r + 5, cy + r + 5],
+                                 fill=None, outline=FROZEN_RING, width=3)
+                    draw.text((cx + r - 2, cy - r + 2), "❄",
+                              fill=FROZEN_RING, font=f_sm, anchor="mm")
+
+                # Shield ring
+                if champ.shield_rounds > 0:
+                    draw.ellipse([cx - r - 9, cy - r - 9, cx + r + 9, cy + r + 9],
+                                 fill=None, outline=SHIELD_RING, width=2)
+
+    # ── Legend bar at the bottom ──────────────────────────────────────────────
+    legend_y = by1 + 12
+    items = [
+        ((255, 200, 0),  "VAULT"),
+        ((255, 195, 20), "LOOT"),
+        ((220, 55, 55),  "C1"),
+        ((55, 120, 230), "C2"),
+        ((40, 195, 80),  "C3"),
+        ((220, 175, 0),  "C4"),
+    ]
+    lx = bx0
+    for colour, label in items:
+        draw.rectangle([lx, legend_y, lx + 12, legend_y + 12],
+                       fill=colour, outline=BORDER, width=1)
+        draw.text((lx + 16, legend_y + 6), label,
+                  fill=TEXT_DIM, font=f_sm, anchor="lm")
+        lx += 16 + draw.textlength(label, font=f_sm) + 14
+
+    buf = BytesIO()
+    img.save(buf, "PNG", optimize=True)
+    buf.seek(0)
+    return buf
 
 
 def _apply_direction(row: int, col: int, direction: str) -> tuple[int, int]:
@@ -923,9 +1110,18 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         for champ in state.champions.values():
             champ.reset_round_inputs()
 
-        grid_str = _render_grid(state)
-        em  = self._round_embed(state, grid_str)
-        msg = await channel.send(embed=em)
+        img_buf = _render_grid_image(state)
+        em      = self._round_embed(state, has_image=img_buf is not None)
+
+        if img_buf:
+            img_buf.seek(0)
+            file = discord.File(img_buf, filename="board.png")
+            msg  = await channel.send(file=file, embed=em)
+        else:
+            # Pillow unavailable — fall back to emoji grid in description
+            em.description = f"```\n{_render_grid(state)}\n```"
+            msg = await channel.send(embed=em)
+
         state.board_message = msg
 
         if state.timer_task:
@@ -1079,21 +1275,15 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                     winner_team = champ.team
 
         # 9. Post results
-        grid_str = _render_grid(state)
+        img_buf = _render_grid_image(state)
 
         if game_over and winner_team:
             state.active = False
             self._games.pop(guild_id, None)
-            await self._post_victory(channel, state, winner_team, log_lines, grid_str)
+            await self._post_victory(channel, state, winner_team, log_lines, img_buf)
             return
 
-        em = self._round_embed(state, grid_str)
-        if state.board_message:
-            try:
-                await state.board_message.edit(embed=em)
-            except discord.HTTPException:
-                pass
-
+        # Post action log first
         if log_lines:
             log_em = discord.Embed(
                 title=f"📋  Round {state.round_number} — Action Log",
@@ -1107,20 +1297,23 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
 
     # ─────────────────────────── Embeds ──────────────────────────────────────
 
-    def _round_embed(self, state: GameState, grid_str: str) -> discord.Embed:
+    def _round_embed(self, state: GameState, has_image: bool = False) -> discord.Embed:
         em = discord.Embed(
             title=f"🏦  Bank Breakthrough — Round {state.round_number}",
             colour=C_ROUND,
-            description=f"```\n{grid_str}\n```",
         )
+        if has_image:
+            em.set_image(url="attachment://board.png")
+
         lines = []
         for slot, champ in state.champions.items():
             tags = []
-            if champ.frozen_rounds > 0:  tags.append(f"❄️ Frozen ({champ.frozen_rounds}r)")
-            if champ.shield_rounds > 0:  tags.append(f"🛡️ Shielded ({champ.shield_rounds}r)")
+            if champ.frozen_rounds > 0: tags.append(f"❄️ Frozen ({champ.frozen_rounds}r)")
+            if champ.shield_rounds  > 0: tags.append(f"🛡️ Shielded ({champ.shield_rounds}r)")
             status = " | ".join(tags) if tags else "Active"
             lines.append(
-                f"{champ.emoji} **C{slot+1}** ({champ.team.title()}) `[{champ.row},{champ.col}]` — {status}"
+                f"{champ.emoji} **C{slot+1}** ({champ.team.title()}) "
+                f"`[{champ.row},{champ.col}]` — {status}"
             )
         em.add_field(name="Champions", value="\n".join(lines), inline=False)
         em.add_field(
@@ -1133,7 +1326,7 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             value=f"**{ROUND_TIMER}s** — `/submit-move` & `/use`",
             inline=True,
         )
-        em.set_footer(text=f"Bank Breakthrough  •  Loot Tiles: {len(state.loot_tiles)}")
+        em.set_footer(text=f"Bank Breakthrough  •  Loot Tiles remaining: {len(state.loot_tiles)}")
         return em
 
     async def _post_victory(
@@ -1142,7 +1335,7 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         state:       GameState,
         winner_team: str,
         log_lines:   list[str],
-        grid_str:    str,
+        img_buf:     Optional[BytesIO],
     ) -> None:
         if log_lines:
             log_em = discord.Embed(
@@ -1163,7 +1356,8 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                 f"{SEP}\n**{winner_team.title()}** has breached the Central Vault!\n{SEP}"
             ),
         )
-        em.add_field(name="🗺️  Final Board", value=f"```\n{grid_str}\n```", inline=False)
+        if img_buf:
+            em.set_image(url="attachment://board.png")
         if winner_champ:
             em.add_field(
                 name="🏆  Winning Team",
@@ -1176,7 +1370,12 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             inline=True,
         )
         em.set_footer(text="Bank Breakthrough  •  Champion Edition  •  Match Over")
-        await channel.send(embed=em)
+
+        if img_buf:
+            img_buf.seek(0)
+            await channel.send(file=discord.File(img_buf, filename="board.png"), embed=em)
+        else:
+            await channel.send(embed=em)
 
     # ─────────────────────── Admin utilities ─────────────────────────────────
 
@@ -1208,8 +1407,16 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         if not state or not state.active:
             await interaction.response.send_message("❌  No active match right now.", ephemeral=True)
             return
-        em = self._round_embed(state, _render_grid(state))
-        await interaction.response.send_message(embed=em, ephemeral=True)
+        img_buf = _render_grid_image(state)
+        em      = self._round_embed(state, has_image=img_buf is not None)
+        if img_buf:
+            img_buf.seek(0)
+            await interaction.response.send_message(
+                file=discord.File(img_buf, filename="board.png"), embed=em, ephemeral=True
+            )
+        else:
+            em.description = f"```\n{_render_grid(state)}\n```"
+            await interaction.response.send_message(embed=em, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

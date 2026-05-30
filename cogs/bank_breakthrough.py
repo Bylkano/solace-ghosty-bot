@@ -1,34 +1,40 @@
 """
 cogs/bank_breakthrough.py
 ─────────────────────────────────────────────────────────────────────────────
-The Great Bank Breakthrough: Champion Edition
+Breakthrough — Champion Edition  (v2 · 14×14 grid)
 ─────────────────────────────────────────────────────────────────────────────
 
-A turn-based multiplayer strategy game for Money Heist events.
-One Champion per team (4 total) competes on a shared 7×7 grid.
-
 Admin commands:
-  /team-add       [team_name] [@member]            — assign a member to a team
-  /team-remove    [@member]                        — remove a member from any team
-  /team-list      [team_name]                      — list members of a team
-  /inventory-give [team_name] [item_name] [qty]    — give items to a team
-  /inventory-remove [team_name] [item_name] [qty]  — remove items from a team
-  /inventory-set  [team_name] [item_name] [qty]    — hard-set item quantity
-  /breakthrough-setup [u1] [u2] [u3] [u4]          — start a match (teams auto-detected)
+  /team-add       [team_name] [@member]        — assign member to a team
+  /team-remove    [@member]                    — remove member from any team
+  /team-list      [team_name]                  — list team members
+  /breakthrough-setup [u1] [u2] [u3] [u4]     — start a match
+  /breakthrough-end                            — force-end an active match
 
 Player commands:
-  /inventory      — privately view YOUR team's inventory (only you can see it)
+  /submit-move [direction] [distance]          — queue move (1–3 tiles)
+  /use [gadget] [target_slot] [direction]      — activate gadget
+  /breakthrough-status                         — view current board (private)
+  /breakthrough-leaderboard                    — all-time heist coin rankings
 
-Champion commands (registered players only):
-  /submit-move [direction]  — up / down / left / right / hold / action
-  /use                      — use an item (smoke / c4 / adrenaline / shield / decrypter)
+Gadgets (Energy Pool: 100 EP max · +10 EP/round regen):
+  smoke  (30 EP) — hides your coordinates for 2 rounds
+  emp    (40 EP) — stuns an adjacent champion for 1 round (target_slot 1–4)
+  decoy  (50 EP) — places a fake clone on an adjacent tile (direction required)
 
-Game flow:
-  • 4 champions placed at corners of a 7×7 grid
-  • 4 random Loot Tiles (💰) and a Central Vault (🏆) at [3,3]
-  • 90-second planning phase; moves default to 'hold' if not submitted
-  • Simultaneous resolution: items → movement → looting → vault breaching
-  • 3 cumulative Breach Points open the vault and end the game
+Map (14×14):
+  • Champions spawn at corners: [0,0] [0,13] [13,0] [13,13]
+  • Central Vault: 2×2 block at [6,6]–[7,7] · needs 3 Breach Points to crack
+  • Security Walls (🧱): permanent obstacles
+  • Security Doors (🚪): 1-turn action to unlock (use 'action' adjacent to door)
+  • Common Loot (💵): +100 🪙 when landed on
+  • Diamond Briefcase (💎): spawns round 3 · +500 🪙 · carrying it costs −1 max movement
+  • Alarm Traps (⚠️): hidden until stepped on; stun for 1 round
+
+Round Flow:
+  1. Planning Phase — 30 s (skips instantly when all players submit)
+  2. Resolution — Gadgets → Movement → Traps
+  3. Ranking — Breach Points + Loot; tiebreaker = least tiles traveled
 """
 
 from __future__ import annotations
@@ -48,167 +54,104 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-# ──────────────────────────── Colours ────────────────────────────────────────
+# ─────────────────────────── Game constants ───────────────────────────────────
 
-C_SETUP    = 0xF1C40F   # gold
-C_ROUND    = 0x2C2F33   # near-black
-C_ACTION   = 0xFF4500   # orange-red
-C_LOOT     = 0x2ECC71   # emerald
-C_VAULT    = 0xE74C3C   # crimson
-C_WIN      = 0xFFD700   # bright gold
-C_ITEM     = 0x9B59B6   # purple
-C_INV      = 0x5865F2   # blurple
-C_ERROR    = 0x992D22   # dark red
-C_INFO     = 0x3498DB   # sky blue
-C_TEAM     = 0x1ABC9C   # teal
+GRID_SIZE           = 14
+VAULT_TILES         = frozenset({(6, 6), (6, 7), (7, 6), (7, 7)})
+VAULT_POINTS_REQ    = 3
+ROUND_TIMER         = 30          # seconds per planning phase
+MAX_EP              = 100
+EP_REGEN            = 10
+MAX_MOVEMENT        = 3
+DIAMOND_SPAWN_ROUND = 3
 
-# ──────────────────────────── Constants ──────────────────────────────────────
+LOOT_REWARD_COMMON  = 100
+LOOT_REWARD_DIAMOND = 500
+BREACH_COIN_REWARD  = 300
 
-GRID_SIZE        = 7
-VAULT_POS        = (3, 3)
-VAULT_POINTS_REQ = 3
-LOOT_REWARD      = 1500
-ROUND_TIMER      = 90   # seconds
+CHAMPION_STARTS = [(0, 0), (0, 13), (13, 0), (13, 13)]
 
-VALID_ITEMS = {
-    "smoke":      "Smoke Grenade",
-    "c4":         "C4 Charge",
-    "adrenaline": "Adrenaline",
-    "shield":     "Riot Shield",
-    "decrypter":  "Decrypter Card",
+# Fixed, symmetric bank-layout obstacles
+FIXED_WALLS: frozenset[tuple[int, int]] = frozenset({
+    # Corner room blockers
+    (1, 1),  (1, 2),  (2, 1),
+    (1, 11), (1, 12), (2, 12),
+    (11, 1), (12, 1), (12, 2),
+    (11, 12),(12, 11),(12, 12),
+    # Mid-map barriers (symmetric)
+    (3, 3),  (3, 4),  (4, 3),
+    (3, 9),  (3, 10), (4, 10),
+    (9, 3),  (10, 3), (10, 4),
+    (9, 10), (10, 9), (10, 10),
+    # Vault perimeter guard walls
+    (5, 5),  (5, 8),
+    (8, 5),  (8, 8),
+})
+
+# Locked doors guarding all 4 vault approaches
+FIXED_DOORS: frozenset[tuple[int, int]] = frozenset({
+    (5, 6), (5, 7),   # North vault approach
+    (8, 6), (8, 7),   # South vault approach
+    (6, 5), (7, 5),   # West vault approach
+    (6, 8), (7, 8),   # East vault approach
+})
+
+SEP = "─" * 36
+
+# ─────────────────────────── Display ──────────────────────────────────────────
+
+EMOJI_CHAMP = ["🟦", "🟨", "🟩", "🟥"]
+
+C_ROUND  = 0x4F46E5   # indigo
+C_ACTION = 0xF59E0B   # amber
+C_VAULT  = 0xFFD700   # gold
+C_WIN    = 0x22C55E   # green
+C_TEAM   = 0x818CF8   # lavender
+C_ERROR  = 0xEF4444   # red
+C_LB     = 0xA78BFA   # purple
+
+VALID_GADGETS: dict[str, tuple[str, int]] = {
+    "smoke": ("Smoke Grenade",  30),
+    "emp":   ("EMP Charge",     40),
+    "decoy": ("Decoy Hologram", 50),
 }
 
-CHAMPION_STARTS = [(0, 0), (0, 6), (6, 0), (6, 6)]
+VALID_DIRECTIONS = {"up", "down", "left", "right", "hold", "action"}
 
-EMOJI_EMPTY   = "⬛"
-EMOJI_LOOT    = "💰"
-EMOJI_VAULT   = "🏆"
-EMOJI_CHAMP   = ["🔴", "🔵", "🟢", "🟡"]
+_DIR_DELTA: dict[str, tuple[int, int]] = {
+    "up":     (-1,  0),
+    "down":   ( 1,  0),
+    "left":   ( 0, -1),
+    "right":  ( 0,  1),
+    "hold":   ( 0,  0),
+    "action": ( 0,  0),
+}
 
-SEP = "▬" * 22
-
-# ──────────────────────────── Database layer ─────────────────────────────────
-
-_DB_URL = os.environ.get("DATABASE_URL", "")
-
+# ─────────────────────────── DB layer ─────────────────────────────────────────
 
 def _db_connect():
-    if not _DB_URL:
-        raise RuntimeError("DATABASE_URL not set in environment")
-    return psycopg2.connect(_DB_URL, sslmode="require")
+    return psycopg2.connect(os.environ["DATABASE_URL"])
 
 
-def _db_init() -> None:
+def _db_ensure_tables() -> None:
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS breakthrough_inventory (
-                    team_name  TEXT    NOT NULL,
-                    item_key   TEXT    NOT NULL,
-                    quantity   INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (team_name, item_key)
-                )
-            """)
-            cur.execute("""
                 CREATE TABLE IF NOT EXISTS breakthrough_coins (
-                    team_name  TEXT    PRIMARY KEY,
+                    team_name  TEXT PRIMARY KEY,
                     coins      INTEGER NOT NULL DEFAULT 0
                 )
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS breakthrough_teams (
-                    guild_id   BIGINT  NOT NULL,
-                    user_id    BIGINT  NOT NULL,
-                    team_name  TEXT    NOT NULL,
+                    guild_id   BIGINT,
+                    user_id    BIGINT,
+                    team_name  TEXT,
                     PRIMARY KEY (guild_id, user_id)
                 )
             """)
         con.commit()
 
-
-# ── Inventory DB ──────────────────────────────────────────────────────────────
-
-def _db_give_item(team: str, item_key: str, qty: int) -> int:
-    with _db_connect() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                INSERT INTO breakthrough_inventory (team_name, item_key, quantity)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (team_name, item_key)
-                DO UPDATE SET quantity = breakthrough_inventory.quantity + EXCLUDED.quantity
-                RETURNING quantity
-            """, (team.lower(), item_key, qty))
-            row = cur.fetchone()
-        con.commit()
-        return row[0] if row else qty
-
-
-def _db_get_inventory(team: str) -> dict[str, int]:
-    with _db_connect() as con:
-        with con.cursor() as cur:
-            cur.execute(
-                "SELECT item_key, quantity FROM breakthrough_inventory "
-                "WHERE team_name = %s AND quantity > 0",
-                (team.lower(),),
-            )
-            return {row[0]: row[1] for row in cur.fetchall()}
-
-
-def _db_deduct_item(team: str, item_key: str, qty: int = 1) -> bool:
-    with _db_connect() as con:
-        with con.cursor() as cur:
-            cur.execute(
-                "SELECT quantity FROM breakthrough_inventory "
-                "WHERE team_name = %s AND item_key = %s",
-                (team.lower(), item_key),
-            )
-            row = cur.fetchone()
-            if not row or row[0] < qty:
-                return False
-            cur.execute("""
-                UPDATE breakthrough_inventory
-                SET quantity = quantity - %s
-                WHERE team_name = %s AND item_key = %s
-            """, (qty, team.lower(), item_key))
-        con.commit()
-        return True
-
-
-def _db_remove_item(team: str, item_key: str, qty: int) -> tuple[bool, int]:
-    with _db_connect() as con:
-        with con.cursor() as cur:
-            cur.execute(
-                "SELECT quantity FROM breakthrough_inventory "
-                "WHERE team_name = %s AND item_key = %s",
-                (team.lower(), item_key),
-            )
-            row = cur.fetchone()
-            current = row[0] if row else 0
-            had_enough = current >= qty
-            new_qty = max(0, current - qty)
-            cur.execute("""
-                INSERT INTO breakthrough_inventory (team_name, item_key, quantity)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (team_name, item_key)
-                DO UPDATE SET quantity = EXCLUDED.quantity
-            """, (team.lower(), item_key, new_qty))
-        con.commit()
-        return had_enough, new_qty
-
-
-def _db_set_item(team: str, item_key: str, qty: int) -> None:
-    with _db_connect() as con:
-        with con.cursor() as cur:
-            cur.execute("""
-                INSERT INTO breakthrough_inventory (team_name, item_key, quantity)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (team_name, item_key)
-                DO UPDATE SET quantity = EXCLUDED.quantity
-            """, (team.lower(), item_key, qty))
-        con.commit()
-
-
-# ── Coins DB ──────────────────────────────────────────────────────────────────
 
 def _db_add_coins(team: str, amount: int) -> int:
     with _db_connect() as con:
@@ -236,7 +179,6 @@ def _db_get_coins(team: str) -> int:
 
 
 def _db_get_all_coins() -> list[tuple[str, int]]:
-    """Return [(team_name, coins), ...] sorted highest first."""
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute(
@@ -245,36 +187,30 @@ def _db_get_all_coins() -> list[tuple[str, int]]:
             return [(row[0], row[1]) for row in cur.fetchall()]
 
 
-# ── Team membership DB ────────────────────────────────────────────────────────
-
 def _db_team_add(guild_id: int, user_id: int, team_name: str) -> None:
-    """Assign (or reassign) a user to a team in this guild."""
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute("""
                 INSERT INTO breakthrough_teams (guild_id, user_id, team_name)
                 VALUES (%s, %s, %s)
-                ON CONFLICT (guild_id, user_id)
-                DO UPDATE SET team_name = EXCLUDED.team_name
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET team_name = EXCLUDED.team_name
             """, (guild_id, user_id, team_name.lower()))
         con.commit()
 
 
 def _db_team_remove(guild_id: int, user_id: int) -> bool:
-    """Remove a user from their team. Returns True if they were in one."""
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute(
                 "DELETE FROM breakthrough_teams WHERE guild_id = %s AND user_id = %s",
                 (guild_id, user_id),
             )
-            deleted = cur.rowcount > 0
+            removed = cur.rowcount > 0
         con.commit()
-        return deleted
+        return removed
 
 
 def _db_get_user_team(guild_id: int, user_id: int) -> Optional[str]:
-    """Return the team name for a user, or None if not assigned."""
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute(
@@ -287,7 +223,6 @@ def _db_get_user_team(guild_id: int, user_id: int) -> Optional[str]:
 
 
 def _db_get_team_members(guild_id: int, team_name: str) -> list[int]:
-    """Return list of user_ids belonging to a team in this guild."""
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute(
@@ -299,7 +234,6 @@ def _db_get_team_members(guild_id: int, team_name: str) -> list[int]:
 
 
 def _db_get_all_teams(guild_id: int) -> dict[str, list[int]]:
-    """Return {team_name: [user_ids]} for all teams in this guild."""
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute(
@@ -311,262 +245,406 @@ def _db_get_all_teams(guild_id: int) -> dict[str, list[int]]:
                 result.setdefault(team, []).append(uid)
             return result
 
-
-# ──────────────────────────── Data models ────────────────────────────────────
+# ─────────────────────────── Data models ──────────────────────────────────────
 
 @dataclass
 class Champion:
-    user_id:    int
-    team:       str
-    slot:       int
-    row:        int
-    col:        int
+    user_id: int
+    team:    str
+    slot:    int
+    row:     int
+    col:     int
 
-    frozen_rounds:    int  = 0
-    shield_rounds:    int  = 0
-    smoke_this_round: bool = False
+    ep:                      int  = MAX_EP
+    tiles_traveled:          int  = 0
+    breach_points_contrib:   int  = 0
+    loot_claimed:            int  = 0
+    carrying_diamond:        bool = False
 
-    move:            Optional[str] = None
-    used_item:       Optional[str] = None
-    item_target:     Optional[int] = None
-    has_adrenaline:  bool = False
+    frozen_rounds: int  = 0   # cannot move; decrements start of resolution
+    smoked_rounds: int  = 0   # position hidden on board; decrements end of round
+
+    # Active decoy
+    has_decoy:  bool = False
+    decoy_row:  int  = -1
+    decoy_col:  int  = -1
+
+    # Round inputs (reset each planning phase)
+    move:              Optional[str] = None
+    move_distance:     int           = MAX_MOVEMENT
+    gadget:            Optional[str] = None
+    gadget_target_slot:Optional[int] = None
+    gadget_direction:  Optional[str] = None
+    submitted:         bool          = False
+
+    @property
+    def max_movement(self) -> int:
+        return max(1, MAX_MOVEMENT - (1 if self.carrying_diamond else 0))
+
+    @property
+    def display_name(self) -> str:
+        return f"C{self.slot + 1} ({self.team.title()})"
 
     @property
     def emoji(self) -> str:
         return EMOJI_CHAMP[self.slot]
 
-    @property
-    def display_name(self) -> str:
-        return f"Champion {self.slot + 1}"
-
-    def reset_round_inputs(self):
-        self.move            = None
-        self.used_item       = None
-        self.item_target     = None
-        self.has_adrenaline  = False
-        self.smoke_this_round = False
+    def reset_round(self) -> None:
+        self.move              = None
+        self.move_distance     = self.max_movement
+        self.gadget            = None
+        self.gadget_target_slot= None
+        self.gadget_direction  = None
+        self.submitted         = False
 
 
 @dataclass
 class GameState:
-    guild_id:      int
-    channel_id:    int
+    channel_id: int
+    guild_id:   int
+    champions:  dict[int, Champion]
 
-    champions:     dict[int, Champion]      = field(default_factory=dict)
-    user_to_slot:  dict[int, int]           = field(default_factory=dict)
-    loot_tiles:    set[tuple[int, int]]     = field(default_factory=set)
+    walls:         frozenset[tuple[int, int]] = field(default_factory=lambda: frozenset(FIXED_WALLS))
+    doors:         set[tuple[int, int]]       = field(default_factory=lambda: set(FIXED_DOORS))
+    opened_doors:  set[tuple[int, int]]       = field(default_factory=set)
+    loot_tiles:    dict[tuple[int, int], str] = field(default_factory=dict)   # pos → "common"|"diamond"
+    traps:         set[tuple[int, int]]       = field(default_factory=set)    # hidden traps
+    triggered_traps: set[tuple[int, int]]     = field(default_factory=set)    # revealed
 
-    breach_points: int   = 0
-    round_number:  int   = 0
-    active:        bool  = True
+    breach_points:   int  = 0
+    round_number:    int  = 0
+    active:          bool = True
+    diamond_spawned: bool = False
 
-    board_message: Optional[discord.Message] = None
-    pending_c4:    dict[int, int]            = field(default_factory=dict)
-    timer_task:    Optional[asyncio.Task]    = None
+    timer_task:    Optional[asyncio.Task]       = field(default=None, compare=False)
+    board_message: Optional[discord.Message]    = field(default=None, compare=False)
 
+# ─────────────────────────── Map generation ───────────────────────────────────
 
-# ──────────────────────────── Grid helpers ───────────────────────────────────
-
-def _init_grid() -> set[tuple[int, int]]:
-    taken = set(CHAMPION_STARTS) | {VAULT_POS}
+def _generate_map(state: GameState) -> None:
+    """Place 8 common loot tiles and 5 hidden alarm traps on the fresh board."""
+    taken: set[tuple[int, int]] = (
+        set(CHAMPION_STARTS)
+        | VAULT_TILES
+        | set(state.walls)
+        | set(state.doors)
+    )
     candidates = [
         (r, c)
         for r in range(GRID_SIZE)
         for c in range(GRID_SIZE)
         if (r, c) not in taken
     ]
-    return set(random.sample(candidates, 4))
+    random.shuffle(candidates)
+    for pos in candidates[:8]:
+        state.loot_tiles[pos] = "common"
+    state.traps = set(candidates[8:13])
 
 
-def _render_grid(state: GameState) -> str:
-    """Fallback emoji grid (used if Pillow unavailable)."""
-    grid = [[EMOJI_EMPTY for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-    vr, vc = VAULT_POS
-    grid[vr][vc] = EMOJI_VAULT
-    for (r, c) in state.loot_tiles:
-        grid[r][c] = EMOJI_LOOT
-    for slot, champ in state.champions.items():
-        grid[champ.row][champ.col] = champ.emoji
-    return "\n".join("".join(row) for row in grid)
+def _spawn_diamond(state: GameState) -> Optional[tuple[int, int]]:
+    """Spawn the Diamond Briefcase at a random unoccupied tile."""
+    occupied: set[tuple[int, int]] = (
+        {(c.row, c.col) for c in state.champions.values()}
+        | {(c.decoy_row, c.decoy_col) for c in state.champions.values() if c.has_decoy}
+        | VAULT_TILES
+        | set(state.walls)
+        | set(state.doors)
+        | set(state.loot_tiles)
+        | state.traps
+        | state.triggered_traps
+    )
+    pool = [
+        (r, c)
+        for r in range(GRID_SIZE)
+        for c in range(GRID_SIZE)
+        if (r, c) not in occupied
+    ]
+    if not pool:
+        return None
+    pos = random.choice(pool)
+    state.loot_tiles[pos] = "diamond"
+    return pos
 
+# ─────────────────────────── Movement helpers ─────────────────────────────────
+
+def _apply_direction(row: int, col: int, direction: str) -> tuple[int, int]:
+    dr, dc = _DIR_DELTA.get(direction, (0, 0))
+    return row + dr, col + dc
+
+
+def _is_adjacent(r1: int, c1: int, r2: int, c2: int) -> bool:
+    return abs(r1 - r2) <= 1 and abs(c1 - c2) <= 1 and (r1, c1) != (r2, c2)
+
+
+def _walk_champion(
+    champ: Champion,
+    state: GameState,
+    log:   list[str],
+) -> tuple[int, int]:
+    """
+    Step-by-step movement. Returns (old_row, old_col).
+    Stops at walls, closed doors, and grid boundary.
+    Loot / vault / trap effects are resolved AFTER all champions move.
+    """
+    direction = champ.move
+    if direction in (None, "hold", "action"):
+        return champ.row, champ.col
+
+    old_r, old_c = champ.row, champ.col
+    steps = min(champ.move_distance, champ.max_movement)
+    moved = 0
+
+    for _ in range(steps):
+        nr, nc = _apply_direction(champ.row, champ.col, direction)
+        if not (0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE):
+            break
+        if (nr, nc) in state.walls:
+            log.append(f"🧱 **{champ.display_name}** blocked by wall at `[{nr},{nc}]`.")
+            break
+        if (nr, nc) in state.doors and (nr, nc) not in state.opened_doors:
+            log.append(
+                f"🚪 **{champ.display_name}** blocked by a locked security door at `[{nr},{nc}]`. "
+                f"Use `action` while adjacent to unlock it."
+            )
+            break
+        champ.row, champ.col = nr, nc
+        moved += 1
+
+    champ.tiles_traveled += moved
+    return old_r, old_c
+
+# ─────────────────────────── Grid image renderer ──────────────────────────────
 
 def _render_grid_image(state: GameState) -> Optional[BytesIO]:
-    """
-    Render the 7×7 game board as a styled PNG image.
-    Returns a BytesIO buffer, or None if Pillow is unavailable.
-    """
+    """Render a styled 14×14 board PNG. Returns BytesIO or None if Pillow missing."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
         return None
 
-    # ── Layout constants ──────────────────────────────────────────────────────
-    CELL     = 82          # pixels per cell
-    PAD      = 48          # outer padding
-    LABEL    = 20          # axis-label strip width
-    W = PAD + LABEL + GRID_SIZE * CELL + PAD
-    H = PAD + LABEL + GRID_SIZE * CELL + PAD
+    CELL = 48
+    PAD  = 44
+    LAB  = 18
 
-    # ── Palette ───────────────────────────────────────────────────────────────
-    BG          = (8,  10,  20)
-    BOARD_BG    = (14, 20,  38)
-    CELL_A      = (24, 32,  56)      # checkerboard tile A
-    CELL_B      = (20, 28,  50)      # checkerboard tile B
-    BORDER      = (45, 60, 105)
-    GRID_LINE   = (35, 48,  85)
+    W = PAD + LAB + GRID_SIZE * CELL + PAD
+    H = PAD + LAB + GRID_SIZE * CELL + PAD
 
-    LOOT_BG     = (85,  58,   5)
-    LOOT_RING   = (255, 195,  20)
-    LOOT_FG     = (255, 215,  50)
+    # ── Palette ──────────────────────────────────────────────────────────────
+    BG          = (6,   8,  18)
+    BOARD_BG    = (12,  18,  36)
+    CELL_A      = (22,  30,  52)
+    CELL_B      = (18,  26,  46)
+    GRID_LINE   = (28,  40,  72)
+    PANEL_BORDER= (40,  55,  95)
 
-    VAULT_BG    = (70,  50,   0)
-    VAULT_RING  = (255, 200,   0)
-    VAULT_GLOW  = (255, 235,  80)
-    VAULT_INNER = (255, 250, 130)
+    WALL_BG     = (12,  12,  18)
+    WALL_MORTAR = (32,  32,  45)
 
-    CHAMP_COLS = [
-        (220,  55,  55),   # slot 0 — red
-        ( 55, 120, 230),   # slot 1 — blue
-        ( 40, 195,  80),   # slot 2 — green
-        (220, 175,   0),   # slot 3 — yellow
+    DOOR_C_BG   = (90,  55,  20)
+    DOOR_C_LINE = (155, 95,  35)
+    DOOR_C_LOCK = (220, 160, 55)
+    DOOR_O_BG   = (105, 80,  40)
+    DOOR_O_LINE = (165, 125, 65)
+
+    LOOT_BG     = (12,  55,  18)
+    LOOT_FG     = (45,  195, 75)
+
+    DIAM_BG     = (8,   25,  85)
+    DIAM_FG     = (75,  155, 255)
+
+    TRAP_BG     = (70,  8,   8)
+    TRAP_FG     = (255, 55,  55)
+
+    VAULT_BG    = (75,  50,  0)
+    VAULT_RING  = (255, 195, 0)
+    VAULT_GLOW  = (255, 230, 75)
+    VAULT_TXT   = (255, 248, 130)
+
+    CHAMP_COLS  = [
+        (55,  120, 230),   # C1 — blue
+        (220, 175,   0),   # C2 — yellow
+        (40,  195,  80),   # C3 — green
+        (220,  55,  55),   # C4 — red
     ]
-    FROZEN_RING  = (100, 185, 255)
-    SHIELD_RING  = (200, 220, 255)
-    TEXT_BRIGHT  = (245, 248, 255)
-    TEXT_DIM     = ( 90, 110, 160)
-    TEXT_DARK    = ( 15,  20,  40)
+    DECOY_COL   = (110, 110, 175)
+    ICE_RING    = (100, 185, 255)
+    TEXT_BRIGHT = (245, 248, 255)
+    TEXT_DIM    = (75,  100, 150)
 
-    # ── Image + draw ──────────────────────────────────────────────────────────
     img  = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(img)
 
-    # Fonts (Pillow 10 default scalable font)
     try:
-        f_lg = ImageFont.load_default(size=18)
-        f_md = ImageFont.load_default(size=14)
-        f_sm = ImageFont.load_default(size=11)
+        f_lg = ImageFont.load_default(size=13)
+        f_md = ImageFont.load_default(size=10)
+        f_sm = ImageFont.load_default(size=8)
     except Exception:
         f_lg = f_md = f_sm = ImageFont.load_default()
 
-    # ── Board background panel ────────────────────────────────────────────────
-    bx0 = PAD + LABEL
-    by0 = PAD + LABEL
+    bx0 = PAD + LAB
+    by0 = PAD + LAB
     bx1 = bx0 + GRID_SIZE * CELL
     by1 = by0 + GRID_SIZE * CELL
-    draw.rectangle([bx0 - 5, by0 - 5, bx1 + 5, by1 + 5],
-                   fill=BOARD_BG, outline=BORDER, width=4)
 
-    # ── Axis coordinate labels ────────────────────────────────────────────────
+    # Board panel background
+    draw.rectangle([bx0 - 4, by0 - 4, bx1 + 4, by1 + 4],
+                   fill=BOARD_BG, outline=PANEL_BORDER, width=3)
+
+    # Axis labels
     for i in range(GRID_SIZE):
         cx = bx0 + i * CELL + CELL // 2
         cy = by0 + i * CELL + CELL // 2
-        draw.text((cx, by0 - 11), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
-        draw.text((bx0 - 11, cy), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
+        draw.text((cx, by0 - 9), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
+        draw.text((bx0 - 9, cy), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
 
-    # ── Champion lookup ───────────────────────────────────────────────────────
+    # Champion & decoy position lookups
     champ_at: dict[tuple[int, int], int] = {
         (c.row, c.col): slot for slot, c in state.champions.items()
     }
+    decoy_at: set[tuple[int, int]] = {
+        (c.decoy_row, c.decoy_col) for c in state.champions.values() if c.has_decoy
+    }
+    smoked: set[int] = {
+        slot for slot, c in state.champions.items() if c.smoked_rounds > 0
+    }
 
-    # ── Draw cells ───────────────────────────────────────────────────────────
+    # Pre-calculate vault center for the 2×2 glow
+    vault_cx = bx0 + 6 * CELL + CELL   # center of [6,6]–[7,7] block
+    vault_cy = by0 + 6 * CELL + CELL
+
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
-            x0 = bx0 + col * CELL + 2
-            y0 = by0 + row * CELL + 2
-            x1 = x0 + CELL - 4
-            y1 = y0 + CELL - 4
+            x0 = bx0 + col * CELL + 1
+            y0 = by0 + row * CELL + 1
+            x1 = x0 + CELL - 2
+            y1 = y0 + CELL - 2
             cx = (x0 + x1) // 2
             cy = (y0 + y1) // 2
             pos = (row, col)
 
-            is_vault = (pos == VAULT_POS)
-            is_loot  = (pos in state.loot_tiles)
-            slot     = champ_at.get(pos)
+            is_vault        = pos in VAULT_TILES
+            is_wall         = pos in state.walls
+            is_door_closed  = pos in state.doors and pos not in state.opened_doors
+            is_door_open    = pos in state.opened_doors
+            loot_kind       = state.loot_tiles.get(pos)
+            is_trap_vis     = pos in state.triggered_traps
+            is_decoy        = pos in decoy_at
+            slot            = champ_at.get(pos)
+            if slot in smoked:
+                slot = None   # hide smoked champion's real position
 
-            # ── Base tile ────────────────────────────────────────────────────
-            base = CELL_A if (row + col) % 2 == 0 else CELL_B
-            draw.rounded_rectangle([x0, y0, x1, y1], radius=7,
-                                   fill=base, outline=GRID_LINE, width=1)
+            # ── Cell base ────────────────────────────────────────────────────
+            if is_wall:
+                draw.rectangle([x0, y0, x1, y1], fill=WALL_BG)
+                # Brick lines
+                for wy in range(y0 + 8, y1, 8):
+                    draw.line([(x0, wy), (x1, wy)], fill=WALL_MORTAR, width=1)
+                shift = 0
+                for wy in range(y0, y1, 16):
+                    draw.line([(x0 + shift, wy), (x0 + shift, wy + 8)],
+                              fill=WALL_MORTAR, width=1)
+                    draw.line([(x0 + 12 + shift, wy), (x0 + 12 + shift, wy + 8)],
+                              fill=WALL_MORTAR, width=1)
+                    shift = (shift + 6) % 12
+                continue   # skip overlays for walls
 
-            # ── Vault tile ───────────────────────────────────────────────────
-            if is_vault:
-                draw.rounded_rectangle([x0, y0, x1, y1], radius=7,
-                                       fill=VAULT_BG, outline=VAULT_RING, width=3)
-                # outer glow ring
-                r = 27
-                draw.ellipse([cx - r - 4, cy - r - 4, cx + r + 4, cy + r + 4],
-                             fill=None, outline=(180, 130, 0), width=2)
-                # inner filled circle
+            elif is_vault:
+                draw.rectangle([x0, y0, x1, y1],
+                               fill=VAULT_BG, outline=VAULT_RING, width=2)
+                # Full 2×2 glow drawn once at top-left vault tile
+                if pos == (6, 6):
+                    r = 30
+                    draw.ellipse(
+                        [vault_cx - r, vault_cy - r, vault_cx + r, vault_cy + r],
+                        fill=VAULT_GLOW, outline=VAULT_RING, width=2,
+                    )
+                    draw.text((vault_cx, vault_cy - 4), "★",
+                              fill=VAULT_TXT, font=f_lg, anchor="mm")
+                    draw.text((vault_cx, vault_cy + 11), "VAULT",
+                              fill=VAULT_RING, font=f_sm, anchor="mm")
+
+            elif is_door_closed:
+                draw.rectangle([x0, y0, x1, y1], fill=DOOR_C_BG)
+                draw.line([(cx, y0 + 3), (cx, y1 - 3)], fill=DOOR_C_LINE, width=2)
+                draw.line([(cx - 5, y0 + 3), (cx - 5, y1 - 3)], fill=DOOR_C_LINE, width=1)
+                draw.line([(cx + 5, y0 + 3), (cx + 5, y1 - 3)], fill=DOOR_C_LINE, width=1)
+                rr = 3
+                draw.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=DOOR_C_LOCK)
+
+            elif is_door_open:
+                draw.rectangle([x0, y0, x1, y1], fill=DOOR_O_BG)
+                draw.line([(x0 + 3, y0 + 3), (x0 + 3, y1 - 3)],
+                          fill=DOOR_O_LINE, width=2)
+
+            else:
+                base = CELL_A if (row + col) % 2 == 0 else CELL_B
+                draw.rectangle([x0, y0, x1, y1], fill=base, outline=GRID_LINE, width=1)
+
+            # ── Tile overlays ────────────────────────────────────────────────
+            if loot_kind == "common":
+                draw.rectangle([x0 + 3, y0 + 3, x1 - 3, y1 - 3],
+                               fill=LOOT_BG, outline=LOOT_FG, width=1)
+                draw.text((cx, cy), "$", fill=LOOT_FG, font=f_md, anchor="mm")
+
+            elif loot_kind == "diamond":
+                draw.rectangle([x0 + 3, y0 + 3, x1 - 3, y1 - 3],
+                               fill=DIAM_BG, outline=DIAM_FG, width=1)
+                draw.text((cx, cy), "◆", fill=DIAM_FG, font=f_md, anchor="mm")
+
+            if is_trap_vis:
+                draw.rectangle([x0 + 3, y0 + 3, x1 - 3, y1 - 3],
+                               fill=TRAP_BG, outline=TRAP_FG, width=1)
+                draw.text((cx, cy), "!", fill=TRAP_FG, font=f_md, anchor="mm")
+
+            # ── Decoy token ──────────────────────────────────────────────────
+            if is_decoy and slot is None:
+                r = 14
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r],
-                             fill=VAULT_GLOW, outline=VAULT_RING, width=2)
-                # star / crown symbol
-                draw.text((cx, cy - 3), "★", fill=VAULT_INNER, font=f_lg, anchor="mm")
-                draw.text((cx, y1 - 9), "VAULT", fill=VAULT_RING, font=f_sm, anchor="mm")
-
-            # ── Loot tile ────────────────────────────────────────────────────
-            elif is_loot:
-                draw.rounded_rectangle([x0, y0, x1, y1], radius=7,
-                                       fill=LOOT_BG, outline=LOOT_RING, width=2)
-                r = 22
-                draw.ellipse([cx - r, cy - r - 4, cx + r, cy + r - 4],
-                             fill=(140, 95, 10), outline=LOOT_RING, width=2)
-                draw.text((cx, cy - 4), "$", fill=LOOT_FG, font=f_lg, anchor="mm")
-                draw.text((cx, y1 - 9), "LOOT", fill=LOOT_RING, font=f_sm, anchor="mm")
+                             fill=None, outline=DECOY_COL, width=2)
+                draw.text((cx, cy), "?", fill=DECOY_COL, font=f_md, anchor="mm")
 
             # ── Champion token ───────────────────────────────────────────────
             if slot is not None:
-                champ     = state.champions[slot]
-                col_rgb   = CHAMP_COLS[slot]
-                r = 27
+                champ   = state.champions[slot]
+                c_rgb   = CHAMP_COLS[slot]
+                r       = 16
 
                 # Drop shadow
-                draw.ellipse([cx - r + 3, cy - r + 3, cx + r + 3, cy + r + 3],
+                draw.ellipse([cx - r + 2, cy - r + 2, cx + r + 2, cy + r + 2],
                              fill=(0, 0, 0))
                 # Main circle
                 draw.ellipse([cx - r, cy - r, cx + r, cy + r],
-                             fill=col_rgb, outline=TEXT_BRIGHT, width=2)
-                # Highlight shimmer (small arc at top-left)
-                hi = 10
-                draw.ellipse([cx - r + 5, cy - r + 5,
-                              cx - r + 5 + hi, cy - r + 5 + hi],
-                             fill=(255, 255, 255, 80))
-
-                # Champion label  e.g. "C1"
-                draw.text((cx, cy - 6), f"C{slot + 1}",
-                          fill=TEXT_BRIGHT, font=f_md, anchor="mm")
-                # Team abbreviation (up to 5 chars)
-                draw.text((cx, cy + 8), champ.team[:5].upper(),
+                             fill=c_rgb, outline=TEXT_BRIGHT, width=1)
+                draw.text((cx, cy - 4), f"C{slot + 1}",
+                          fill=TEXT_BRIGHT, font=f_sm, anchor="mm")
+                draw.text((cx, cy + 5), champ.team[:4].upper(),
                           fill=TEXT_BRIGHT, font=f_sm, anchor="mm")
 
-                # Frozen ring ❄
+                # Diamond indicator (small ◆ on token)
+                if champ.carrying_diamond:
+                    draw.text((cx + r - 4, cy - r + 4), "◆",
+                              fill=DIAM_FG, font=f_sm, anchor="mm")
+
+                # Frozen ring
                 if champ.frozen_rounds > 0:
-                    draw.ellipse([cx - r - 5, cy - r - 5, cx + r + 5, cy + r + 5],
-                                 fill=None, outline=FROZEN_RING, width=3)
-                    draw.text((cx + r - 2, cy - r + 2), "❄",
-                              fill=FROZEN_RING, font=f_sm, anchor="mm")
+                    draw.ellipse([cx - r - 4, cy - r - 4, cx + r + 4, cy + r + 4],
+                                 fill=None, outline=ICE_RING, width=2)
 
-                # Shield ring
-                if champ.shield_rounds > 0:
-                    draw.ellipse([cx - r - 9, cy - r - 9, cx + r + 9, cy + r + 9],
-                                 fill=None, outline=SHIELD_RING, width=2)
-
-    # ── Legend bar at the bottom ──────────────────────────────────────────────
-    legend_y = by1 + 12
-    items = [
-        ((255, 200, 0),  "VAULT"),
-        ((255, 195, 20), "LOOT"),
-        ((220, 55, 55),  "C1"),
-        ((55, 120, 230), "C2"),
-        ((40, 195, 80),  "C3"),
-        ((220, 175, 0),  "C4"),
-    ]
-    lx = bx0
-    for colour, label in items:
-        draw.rectangle([lx, legend_y, lx + 12, legend_y + 12],
-                       fill=colour, outline=BORDER, width=1)
-        draw.text((lx + 16, legend_y + 6), label,
-                  fill=TEXT_DIM, font=f_sm, anchor="lm")
-        lx += 16 + draw.textlength(label, font=f_sm) + 14
+    # ── Champion EP mini-legend (bottom strip) ────────────────────────────────
+    legend_y = by1 + 9
+    seg_w    = (bx1 - bx0) // 4
+    for slot, champ in state.champions.items():
+        lx      = bx0 + slot * seg_w
+        c_rgb   = CHAMP_COLS[slot]
+        draw.rectangle([lx, legend_y, lx + 8, legend_y + 8], fill=c_rgb)
+        ep_bar  = f"C{slot+1} · {champ.ep}EP"
+        if champ.carrying_diamond:
+            ep_bar += " · ◆"
+        if champ.frozen_rounds > 0:
+            ep_bar += f" · ❄{champ.frozen_rounds}"
+        if champ.smoked_rounds > 0:
+            ep_bar += f" · 💨{champ.smoked_rounds}"
+        draw.text((lx + 12, legend_y + 4), ep_bar, fill=TEXT_DIM, font=f_sm, anchor="lm")
 
     buf = BytesIO()
     img.save(buf, "PNG", optimize=True)
@@ -574,49 +652,65 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
     return buf
 
 
-def _apply_direction(row: int, col: int, direction: str) -> tuple[int, int]:
-    DIRECTIONS = {
-        "up":         (-1,  0),
-        "down":       ( 1,  0),
-        "left":       ( 0, -1),
-        "right":      ( 0,  1),
-        "hold":       ( 0,  0),
-        "action":     ( 0,  0),
-        "up-left":    (-1, -1),
-        "up-right":   (-1,  1),
-        "down-left":  ( 1, -1),
-        "down-right": ( 1,  1),
-    }
-    dr, dc = DIRECTIONS.get(direction, (0, 0))
-    return max(0, min(GRID_SIZE - 1, row + dr)), max(0, min(GRID_SIZE - 1, col + dc))
+def _render_grid_text(state: GameState) -> str:
+    """Fallback emoji grid if Pillow is unavailable."""
+    TILE_WALL    = "🧱"
+    TILE_VAULT   = "🏦"
+    TILE_LOOT    = "💵"
+    TILE_DIAMOND = "💎"
+    TILE_TRAP    = "⚠️"
+    TILE_DOOR_C  = "🚪"
+    TILE_DOOR_O  = "🔓"
+    TILE_EMPTY   = "⬛"
 
+    champ_at = {(c.row, c.col): slot for slot, c in state.champions.items()}
+    smoked   = {slot for slot, c in state.champions.items() if c.smoked_rounds > 0}
 
-def _is_adjacent(r1: int, c1: int, r2: int, c2: int) -> bool:
-    return abs(r1 - r2) <= 1 and abs(c1 - c2) <= 1 and (r1, c1) != (r2, c2)
+    rows = []
+    for r in range(GRID_SIZE):
+        row = []
+        for c in range(GRID_SIZE):
+            pos  = (r, c)
+            slot = champ_at.get(pos)
+            if slot is not None and slot not in smoked:
+                row.append(EMOJI_CHAMP[slot])
+            elif pos in VAULT_TILES:
+                row.append(TILE_VAULT)
+            elif pos in state.walls:
+                row.append(TILE_WALL)
+            elif pos in state.triggered_traps:
+                row.append(TILE_TRAP)
+            elif pos in state.doors and pos not in state.opened_doors:
+                row.append(TILE_DOOR_C)
+            elif pos in state.opened_doors:
+                row.append(TILE_DOOR_O)
+            elif state.loot_tiles.get(pos) == "diamond":
+                row.append(TILE_DIAMOND)
+            elif state.loot_tiles.get(pos) == "common":
+                row.append(TILE_LOOT)
+            else:
+                row.append(TILE_EMPTY)
+        rows.append("".join(row))
+    return "\n".join(rows)
 
-
-# ──────────────────────────── Cog ────────────────────────────────────────────
+# ─────────────────────────── Cog ──────────────────────────────────────────────
 
 class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
-    """The Great Bank Breakthrough: Champion Edition"""
+    """Breakthrough — 14×14 tactical heist game for Discord."""
 
     def __init__(self, bot: commands.Bot) -> None:
-        self.bot = bot
-        _db_init()
+        self.bot   = bot
         self._games: dict[int, GameState] = {}
 
-    # ═════════════════════════ TEAM MANAGEMENT ════════════════════════════════
+    async def cog_load(self) -> None:
+        _db_ensure_tables()
 
-    @app_commands.command(
-        name="team-add",
-        description="[Admin] Assign a member to a team.",
-    )
+    # ═══════════════════════════ ADMIN COMMANDS ════════════════════════════════
+
+    @app_commands.command(name="team-add", description="[Admin] Assign a member to a team.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(
-        team_name = "Team name (e.g. 'Blue', 'Red').",
-        member    = "The member to assign.",
-    )
+    @app_commands.describe(team_name="Team name.", member="Member to assign.")
     async def team_add(
         self,
         interaction: discord.Interaction,
@@ -624,24 +718,18 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         member:      discord.Member,
     ) -> None:
         assert interaction.guild_id is not None
-        team = team_name.strip()
-        _db_team_add(interaction.guild_id, member.id, team)
-
+        _db_team_add(interaction.guild_id, member.id, team_name.strip())
         em = discord.Embed(
-            title="✅  Team Updated",
-            colour=C_TEAM,
-            description=f"{member.mention} has been added to **{team.title()}**.",
+            title="✅  Team Updated", colour=C_TEAM,
+            description=f"{member.mention} → **{team_name.strip().title()}**",
         )
-        em.set_footer(text="Bank Breakthrough  •  Team System")
+        em.set_footer(text="Breakthrough · Team System")
         await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(
-        name="team-remove",
-        description="[Admin] Remove a member from their team.",
-    )
+    @app_commands.command(name="team-remove", description="[Admin] Remove a member from their team.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(member="The member to remove from their team.")
+    @app_commands.describe(member="Member to remove.")
     async def team_remove(
         self,
         interaction: discord.Interaction,
@@ -649,224 +737,45 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
     ) -> None:
         assert interaction.guild_id is not None
         removed = _db_team_remove(interaction.guild_id, member.id)
-
-        if removed:
-            desc = f"{member.mention} has been removed from their team."
-            colour = C_TEAM
-        else:
-            desc = f"{member.mention} wasn't assigned to any team."
-            colour = C_ERROR
-
-        em = discord.Embed(title="🗑️  Team Updated", colour=colour, description=desc)
-        em.set_footer(text="Bank Breakthrough  •  Team System")
+        em = discord.Embed(
+            title="✅  Team Updated" if removed else "ℹ️  Not in a Team",
+            colour=C_TEAM if removed else C_ERROR,
+            description=(
+                f"{member.mention} has been removed from their team."
+                if removed else
+                f"{member.mention} wasn't in any team."
+            ),
+        )
+        em.set_footer(text="Breakthrough · Team System")
         await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(
-        name="team-list",
-        description="List all members of a team (or all teams if no name given).",
-    )
+    @app_commands.command(name="team-list", description="[Admin] List members of a team.")
     @app_commands.guild_only()
-    @app_commands.describe(team_name="Team name to inspect, or leave blank for all teams.")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(team_name="Team to inspect.")
     async def team_list(
         self,
         interaction: discord.Interaction,
-        team_name:   Optional[str] = None,
+        team_name:   str,
     ) -> None:
         assert interaction.guild_id is not None
-
-        em = discord.Embed(title="👥  Team Roster", colour=C_TEAM)
-
-        if team_name:
-            members = _db_get_team_members(interaction.guild_id, team_name.strip())
-            if members:
-                lines = [f"<@{uid}>" for uid in members]
-                em.add_field(
-                    name=f"**{team_name.strip().title()}**",
-                    value="\n".join(lines),
-                    inline=False,
-                )
-            else:
-                em.description = f"_No members in **{team_name.strip().title()}**._"
-        else:
-            all_teams = _db_get_all_teams(interaction.guild_id)
-            if not all_teams:
-                em.description = "_No teams configured yet. Use `/team-add` to assign members._"
-            else:
-                for tname, uids in sorted(all_teams.items()):
-                    lines = [f"<@{uid}>" for uid in uids]
-                    em.add_field(
-                        name=f"**{tname.title()}** ({len(uids)} member{'s' if len(uids) != 1 else ''})",
-                        value="\n".join(lines),
-                        inline=True,
-                    )
-
-        em.set_footer(text="Bank Breakthrough  •  Team System")
-        await interaction.response.send_message(embed=em)
-
-    # ═════════════════════════ INVENTORY COMMANDS ═════════════════════════════
-
-    @app_commands.command(
-        name="inventory-give",
-        description="[Admin] Give items to a team's inventory.",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(
-        team_name = "Name of the team.",
-        item_name = "Item: smoke | c4 | adrenaline | shield | decrypter",
-        quantity  = "How many to give.",
-    )
-    async def inventory_give(
-        self,
-        interaction: discord.Interaction,
-        team_name:   str,
-        item_name:   str,
-        quantity:    app_commands.Range[int, 1, 99],
-    ) -> None:
-        key = item_name.strip().lower()
-        if key not in VALID_ITEMS:
-            await interaction.response.send_message(
-                f"❌  Unknown item **{item_name}**.\n"
-                "Valid: `smoke` `c4` `adrenaline` `shield` `decrypter`",
-                ephemeral=True,
-            )
-            return
-        new_qty = _db_give_item(team_name.strip(), key, quantity)
-        em = discord.Embed(
-            title="✅  Inventory Updated",
-            colour=C_ITEM,
-            description=f"**{team_name.strip().title()}** received **{quantity}× {VALID_ITEMS[key]}**.",
-        )
-        em.add_field(name="New Stock", value=f"**{new_qty}×**", inline=True)
-        em.set_footer(text="Bank Breakthrough  •  Inventory System")
+        uids = _db_get_team_members(interaction.guild_id, team_name.strip())
+        em   = discord.Embed(title=f"👥  {team_name.strip().title()} — Roster", colour=C_TEAM)
+        em.description = "\n".join(f"• <@{uid}>" for uid in uids) if uids else "_Empty team._"
+        em.set_footer(text="Breakthrough · Team System")
         await interaction.response.send_message(embed=em, ephemeral=True)
-
-    @app_commands.command(
-        name="inventory-remove",
-        description="[Admin] Remove items from a team's inventory.",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(
-        team_name = "Name of the team.",
-        item_name = "Item: smoke | c4 | adrenaline | shield | decrypter",
-        quantity  = "How many to remove.",
-    )
-    async def inventory_remove(
-        self,
-        interaction: discord.Interaction,
-        team_name:   str,
-        item_name:   str,
-        quantity:    app_commands.Range[int, 1, 99],
-    ) -> None:
-        key = item_name.strip().lower()
-        if key not in VALID_ITEMS:
-            await interaction.response.send_message(
-                f"❌  Unknown item **{item_name}**.\n"
-                "Valid: `smoke` `c4` `adrenaline` `shield` `decrypter`",
-                ephemeral=True,
-            )
-            return
-        had_enough, new_qty = _db_remove_item(team_name.strip(), key, quantity)
-        em = discord.Embed(
-            title="🗑️  Inventory Updated",
-            colour=C_ERROR if not had_enough else C_ITEM,
-        )
-        if had_enough:
-            em.description = f"Removed **{quantity}× {VALID_ITEMS[key]}** from **{team_name.strip().title()}**."
-        else:
-            em.description = (
-                f"⚠️  **{team_name.strip().title()}** didn't have enough — "
-                f"removed all they had. Stock is now **0**."
-            )
-        em.add_field(name="Remaining Stock", value=f"**{new_qty}×**", inline=True)
-        em.set_footer(text="Bank Breakthrough  •  Inventory System")
-        await interaction.response.send_message(embed=em, ephemeral=True)
-
-    @app_commands.command(
-        name="inventory-set",
-        description="[Admin] Set a team's item quantity to an exact number.",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(
-        team_name = "Name of the team.",
-        item_name = "Item: smoke | c4 | adrenaline | shield | decrypter",
-        quantity  = "Exact quantity to set (0 to clear).",
-    )
-    async def inventory_set(
-        self,
-        interaction: discord.Interaction,
-        team_name:   str,
-        item_name:   str,
-        quantity:    app_commands.Range[int, 0, 99],
-    ) -> None:
-        key = item_name.strip().lower()
-        if key not in VALID_ITEMS:
-            await interaction.response.send_message(
-                f"❌  Unknown item **{item_name}**.\n"
-                "Valid: `smoke` `c4` `adrenaline` `shield` `decrypter`",
-                ephemeral=True,
-            )
-            return
-        _db_set_item(team_name.strip(), key, quantity)
-        action = "cleared" if quantity == 0 else f"set to **{quantity}×**"
-        em = discord.Embed(
-            title="✏️  Inventory Set",
-            colour=C_ITEM,
-            description=f"**{VALID_ITEMS[key]}** for **{team_name.strip().title()}** {action}.",
-        )
-        em.add_field(name="New Stock", value=f"**{quantity}×**", inline=True)
-        em.set_footer(text="Bank Breakthrough  •  Inventory System")
-        await interaction.response.send_message(embed=em, ephemeral=True)
-
-    @app_commands.command(
-        name="inventory",
-        description="View your team's inventory (only visible to you).",
-    )
-    @app_commands.guild_only()
-    async def inventory(self, interaction: discord.Interaction) -> None:
-        assert interaction.guild_id is not None
-
-        team = _db_get_user_team(interaction.guild_id, interaction.user.id)
-        if not team:
-            await interaction.response.send_message(
-                "❌  You haven't been assigned to a team yet. Ask an admin to use `/team-add`.",
-                ephemeral=True,
-            )
-            return
-
-        inv   = _db_get_inventory(team)
-        coins = _db_get_coins(team)
-
-        em = discord.Embed(
-            title=f"🎒  {team.title()} — Your Team's Inventory",
-            colour=C_INV,
-        )
-        if not inv:
-            em.description = "_No items in stock._"
-        else:
-            lines = [f"• **{VALID_ITEMS.get(k, k.title())}** × {q}" for k, q in inv.items()]
-            em.description = "\n".join(lines)
-
-        em.add_field(name="🪙  Heist Coins", value=f"**{coins:,}**", inline=True)
-        em.set_footer(text="Bank Breakthrough  •  Only you can see this")
-        # ephemeral=True means ONLY the caller sees this response
-        await interaction.response.send_message(embed=em, ephemeral=True)
-
-    # ═════════════════════════ SETUP COMMAND ══════════════════════════════════
 
     @app_commands.command(
         name="breakthrough-setup",
-        description="[Admin] Register 4 Champions and start a match. Teams are auto-detected.",
+        description="[Admin] Register 4 Champions and start a Breakthrough match.",
     )
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
-        champion1 = "Champion for slot 1 (Top-Left 🔴)",
-        champion2 = "Champion for slot 2 (Top-Right 🔵)",
-        champion3 = "Champion for slot 3 (Bottom-Left 🟢)",
-        champion4 = "Champion for slot 4 (Bottom-Right 🟡)",
+        champion1="Champion for slot 1 — C1 (Blue) · spawns [0,0]",
+        champion2="Champion for slot 2 — C2 (Yellow) · spawns [0,13]",
+        champion3="Champion for slot 3 — C3 (Green) · spawns [13,0]",
+        champion4="Champion for slot 4 — C4 (Red) · spawns [13,13]",
     )
     async def breakthrough_setup(
         self,
@@ -877,235 +786,287 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         champion4:   discord.Member,
     ) -> None:
         assert interaction.guild_id is not None
+        await interaction.response.defer()
 
-        if interaction.guild_id in self._games:
-            await interaction.response.send_message(
-                "❌  A match is already running. End it first with `/breakthrough-end`.",
-                ephemeral=True,
+        guild_id = interaction.guild_id
+        if guild_id in self._games and self._games[guild_id].active:
+            await interaction.followup.send(
+                "❌  A match is already active. Use `/breakthrough-end` first.", ephemeral=True
             )
             return
 
-        players = [champion1, champion2, champion3, champion4]
-
-        # Auto-detect each champion's team from the membership table
+        members = [champion1, champion2, champion3, champion4]
         teams: list[str] = []
-        missing: list[discord.Member] = []
-        for member in players:
-            t = _db_get_user_team(interaction.guild_id, member.id)
-            if t is None:
-                missing.append(member)
-            else:
-                teams.append(t)
+        for m in members:
+            t = _db_get_user_team(guild_id, m.id)
+            if not t:
+                await interaction.followup.send(
+                    f"❌  {m.mention} isn't assigned to a team. Use `/team-add` first.",
+                    ephemeral=True,
+                )
+                return
+            teams.append(t)
 
-        if missing:
-            names = ", ".join(m.mention for m in missing)
-            await interaction.response.send_message(
-                f"❌  The following champions don't have a team assigned yet: {names}\n"
-                "Use `/team-add [team_name] [@member]` to assign them first.",
-                ephemeral=True,
+        champions = {
+            i: Champion(
+                user_id=members[i].id,
+                team=teams[i],
+                slot=i,
+                row=CHAMPION_STARTS[i][0],
+                col=CHAMPION_STARTS[i][1],
             )
-            return
+            for i in range(4)
+        }
 
-        # Build game state
-        champions:    dict[int, Champion] = {}
-        user_to_slot: dict[int, int]      = {}
-        for i, (member, team) in enumerate(zip(players, teams)):
-            r, c = CHAMPION_STARTS[i]
-            champ = Champion(user_id=member.id, team=team, slot=i, row=r, col=c)
-            champions[i]            = champ
-            user_to_slot[member.id] = i
-
+        assert isinstance(interaction.channel, discord.TextChannel)
         state = GameState(
-            guild_id=interaction.guild_id,
-            channel_id=interaction.channel_id,
+            channel_id=interaction.channel.id,
+            guild_id=guild_id,
             champions=champions,
-            user_to_slot=user_to_slot,
-            loot_tiles=_init_grid(),
         )
-        self._games[interaction.guild_id] = state
+        _generate_map(state)
+        self._games[guild_id] = state
 
-        em = discord.Embed(
-            title="🏦  THE GREAT BANK BREAKTHROUGH",
-            colour=C_SETUP,
+        roster = "\n".join(
+            f"{EMOJI_CHAMP[i]} **C{i+1}** — {members[i].mention} ({teams[i].title()})"
+            for i in range(4)
+        )
+        setup_em = discord.Embed(
+            title="🏦  Breakthrough — Match Starting!",
+            colour=C_VAULT,
             description=(
-                "```ansi\n\u001b[1;33m  ⚡  CHAMPION EDITION — MATCH BEGINS!  ⚡  \u001b[0m\n```\n"
-                f"{SEP}"
+                f"{SEP}\n"
+                "**Champions have entered the building.**\n"
+                "Crack the Central Vault — 3 Breach Points wins.\n"
+                f"{SEP}\n\n{roster}"
             ),
         )
-        for i, (member, team) in enumerate(zip(players, teams)):
-            r, c = CHAMPION_STARTS[i]
-            em.add_field(
-                name=f"{EMOJI_CHAMP[i]}  Champion {i+1} — {team.title()}",
-                value=f"{member.mention} → Start: `[{r},{c}]`",
-                inline=False,
-            )
-        em.add_field(
-            name="🏆  Central Vault",
-            value=f"Position `[3,3]` — Needs **{VAULT_POINTS_REQ} Breach Points**",
+        setup_em.add_field(name="🗺️ Grid", value="14×14 with walls, doors & hidden traps", inline=True)
+        setup_em.add_field(name="⚡ Energy", value="100 EP · +10/round regen", inline=True)
+        setup_em.add_field(
+            name="🎮 Gadgets",
+            value="💨 Smoke (30 EP) · ⚡ EMP (40 EP) · 👻 Decoy (50 EP)",
             inline=False,
         )
-        em.add_field(name="⏱️  Planning Timer", value=f"**{ROUND_TIMER}s** per round", inline=True)
-        em.add_field(name="📋  Commands", value="`/submit-move` · `/use`", inline=True)
-        em.set_footer(text=f"Bank Breakthrough  •  Champion Edition  •  {GRID_SIZE}×{GRID_SIZE} Grid")
-        await interaction.response.send_message(embed=em)
+        setup_em.set_footer(text="Breakthrough · Champion Edition v2")
+        await interaction.followup.send(embed=setup_em)
+        await self._post_round(guild_id)
 
-        await self._post_round(interaction.guild_id)
+    @app_commands.command(name="breakthrough-end", description="[Admin] Force-end an active match.")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def breakthrough_end(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        state = self._games.pop(interaction.guild_id, None)
+        if not state:
+            await interaction.response.send_message("❌  No active match.", ephemeral=True)
+            return
+        if state.timer_task:
+            state.timer_task.cancel()
+        state.active = False
+        await interaction.response.send_message("🛑  Match force-ended by admin.")
 
-    # ═════════════════════════ SUBMIT-MOVE COMMAND ════════════════════════════
+    # ═══════════════════════════ PLAYER COMMANDS ═══════════════════════════════
 
     @app_commands.command(
         name="submit-move",
-        description="Submit your move for this round (champions only).",
+        description="Queue your movement for this round.",
     )
     @app_commands.guild_only()
     @app_commands.describe(
-        direction=(
-            "up | down | left | right | hold | action | "
-            "up-left | up-right | down-left | down-right (diagonal needs Adrenaline)"
-        ),
+        direction="up · down · left · right · hold · action (unlock adjacent door / breach vault)",
+        distance="Tiles to move (1–3). Defaults to your current max movement.",
     )
     async def submit_move(
         self,
         interaction: discord.Interaction,
         direction:   str,
+        distance:    app_commands.Range[int, 1, 3] = 3,
     ) -> None:
         assert interaction.guild_id is not None
         state = self._games.get(interaction.guild_id)
         if not state or not state.active:
-            await interaction.response.send_message("❌  No active match right now.", ephemeral=True)
+            await interaction.response.send_message("❌  No active match.", ephemeral=True)
             return
 
-        slot = state.user_to_slot.get(interaction.user.id)
-        if slot is None:
+        d = direction.strip().lower()
+        if d not in VALID_DIRECTIONS:
             await interaction.response.send_message(
-                "❌  You are not a registered Champion in this match.", ephemeral=True
-            )
-            return
-
-        champ     = state.champions[slot]
-        direction = direction.strip().lower()
-        DIAGONALS = {"up-left", "up-right", "down-left", "down-right"}
-
-        if direction in DIAGONALS and not champ.has_adrenaline:
-            await interaction.response.send_message(
-                "❌  Diagonal moves require an active **Adrenaline** — use `/use item:adrenaline` first.",
+                f"❌  Invalid direction **{direction}**.\n"
+                "Valid: `up` `down` `left` `right` `hold` `action`",
                 ephemeral=True,
             )
             return
 
-        VALID_DIRS = {"up", "down", "left", "right", "hold", "action"} | DIAGONALS
-        if direction not in VALID_DIRS:
-            await interaction.response.send_message(
-                f"❌  Invalid direction `{direction}`.\n"
-                "Valid: `up` `down` `left` `right` `hold` `action` (or diagonal with Adrenaline)",
-                ephemeral=True,
-            )
-            return
-
-        champ.move = direction
-        await interaction.response.send_message(
-            f"✅  **{champ.display_name}** — move `{direction}` registered!",
-            ephemeral=True,
+        champ = next(
+            (c for c in state.champions.values() if c.user_id == interaction.user.id),
+            None,
         )
+        if not champ:
+            await interaction.response.send_message(
+                "❌  You're not a champion in this match.", ephemeral=True
+            )
+            return
+        if champ.frozen_rounds > 0:
+            await interaction.response.send_message(
+                f"❄️  You're **frozen** for {champ.frozen_rounds} more round(s) — move locked.",
+                ephemeral=True,
+            )
+            return
 
-    # ═════════════════════════ USE ITEM COMMAND ═══════════════════════════════
+        champ.move          = d
+        champ.move_distance = min(distance, champ.max_movement)
+        champ.submitted     = True
+
+        # Check time-skip
+        all_in = all(c.submitted for c in state.champions.values())
+        if all_in and state.timer_task and not state.timer_task.done():
+            state.timer_task.cancel()
+            state.timer_task = None
+            channel = self.bot.get_channel(state.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                asyncio.create_task(self._resolve_round(interaction.guild_id, channel))
+            await interaction.response.send_message(
+                f"✅  Move locked: **{d}** × {champ.move_distance} tile(s).\n"
+                "⚡ **All champions submitted — resolving immediately!**",
+                ephemeral=True,
+            )
+        else:
+            remaining = sum(1 for c in state.champions.values() if not c.submitted)
+            await interaction.response.send_message(
+                f"✅  Move locked: **{d}** × {champ.move_distance} tile(s).\n"
+                f"⏳  Waiting on **{remaining}** more champion(s).",
+                ephemeral=True,
+            )
 
     @app_commands.command(
         name="use",
-        description="Use an item from your team's inventory during the planning phase.",
+        description="Activate a Breakthrough gadget using your Energy Pool.",
     )
     @app_commands.guild_only()
     @app_commands.describe(
-        item   = "smoke | c4 | adrenaline | shield | decrypter",
-        target = "Target champion (required for smoke / c4)",
+        gadget      ="Gadget: smoke (30 EP) · emp (40 EP) · decoy (50 EP)",
+        target_slot ="(EMP only) Champion slot to stun: 1, 2, 3 or 4",
+        direction   ="(Decoy only) Direction to place clone: up · down · left · right",
     )
-    async def use_item(
+    async def use_gadget(
         self,
         interaction: discord.Interaction,
-        item:        str,
-        target:      Optional[discord.Member] = None,
+        gadget:      str,
+        target_slot: Optional[app_commands.Range[int, 1, 4]] = None,
+        direction:   Optional[str] = None,
     ) -> None:
         assert interaction.guild_id is not None
         state = self._games.get(interaction.guild_id)
         if not state or not state.active:
-            await interaction.response.send_message("❌  No active match right now.", ephemeral=True)
+            await interaction.response.send_message("❌  No active match.", ephemeral=True)
             return
 
-        slot = state.user_to_slot.get(interaction.user.id)
-        if slot is None:
+        key = gadget.strip().lower()
+        if key not in VALID_GADGETS:
             await interaction.response.send_message(
-                "❌  You are not a registered Champion in this match.", ephemeral=True
+                "❌  Unknown gadget. Use: `smoke` · `emp` · `decoy`", ephemeral=True
             )
             return
 
-        champ = state.champions[slot]
-        key   = item.strip().lower()
-
-        if key not in VALID_ITEMS:
+        champ = next(
+            (c for c in state.champions.values() if c.user_id == interaction.user.id),
+            None,
+        )
+        if not champ:
             await interaction.response.send_message(
-                f"❌  Unknown item `{item}`.\nValid: `smoke` `c4` `adrenaline` `shield` `decrypter`",
+                "❌  You're not a champion in this match.", ephemeral=True
+            )
+            return
+
+        g_name, g_cost = VALID_GADGETS[key]
+        if champ.ep < g_cost:
+            await interaction.response.send_message(
+                f"❌  Not enough EP for **{g_name}** (costs **{g_cost} EP**, you have **{champ.ep} EP**).",
                 ephemeral=True,
             )
             return
 
-        target_slot: Optional[int] = None
-        if key in {"smoke", "c4"}:
-            if target is None:
+        if key == "emp":
+            if target_slot is None:
                 await interaction.response.send_message(
-                    f"❌  `{VALID_ITEMS[key]}` requires a `target` Champion.", ephemeral=True
+                    "❌  **EMP Charge** requires `target_slot` (1–4).", ephemeral=True
                 )
                 return
-            target_slot = state.user_to_slot.get(target.id)
-            if target_slot is None or target_slot == slot:
+            ts = target_slot - 1
+            if ts == champ.slot:
                 await interaction.response.send_message(
-                    "❌  Invalid target — must be another registered Champion.", ephemeral=True
+                    "❌  You can't EMP yourself.", ephemeral=True
                 )
                 return
+            if ts not in state.champions:
+                await interaction.response.send_message(
+                    "❌  Invalid target slot.", ephemeral=True
+                )
+                return
+            champ.gadget_target_slot = ts
 
-        if key == "c4" and target_slot is not None:
-            tc = state.champions[target_slot]
-            if not _is_adjacent(champ.row, champ.col, tc.row, tc.col):
+        elif key == "decoy":
+            if direction is None or direction.strip().lower() not in {"up","down","left","right"}:
                 await interaction.response.send_message(
-                    "❌  **C4** can only be used on an **adjacent** Champion.", ephemeral=True
-                )
-                return
-
-        if key == "decrypter":
-            vr, vc = VAULT_POS
-            on_vault   = (champ.row, champ.col) == VAULT_POS
-            adj_vault  = _is_adjacent(champ.row, champ.col, vr, vc)
-            if not (on_vault or adj_vault):
-                await interaction.response.send_message(
-                    "❌  **Decrypter Card** must be used while on or adjacent to the Vault 🏆.",
+                    "❌  **Decoy Hologram** requires a `direction` (up/down/left/right).",
                     ephemeral=True,
                 )
                 return
+            champ.gadget_direction = direction.strip().lower()
 
-        if not _db_deduct_item(champ.team, key):
-            await interaction.response.send_message(
-                f"❌  **{champ.team.title()}** has no **{VALID_ITEMS[key]}** left.", ephemeral=True
-            )
+        champ.gadget = key
+        hint = ""
+        if key == "emp":
+            hint = f" → targeting **C{target_slot}**"
+        elif key == "decoy":
+            hint = f" → placing clone **{direction}**"
+        await interaction.response.send_message(
+            f"✅  **{g_name}** ({g_cost} EP) queued{hint}.\n"
+            f"Your EP this round: **{champ.ep}** → **{champ.ep - g_cost}** after resolution.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="breakthrough-status", description="View the current board (private).")
+    @app_commands.guild_only()
+    async def breakthrough_status(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        state = self._games.get(interaction.guild_id)
+        if not state or not state.active:
+            await interaction.response.send_message("❌  No active match.", ephemeral=True)
             return
-
-        champ.used_item   = key
-        champ.item_target = target_slot
-
-        if key == "adrenaline":
-            champ.has_adrenaline = True
-            msg = "🟠 **Adrenaline** activated! You may submit a diagonal move this round."
-        elif key == "shield":
-            champ.shield_rounds = 3
-            msg = "🛡️ **Riot Shield** activated! Protected for 3 rounds."
-        elif key == "smoke":
-            msg = f"💨 **Smoke Grenade** queued on {target.mention}! Their move will be randomised."
-        elif key == "c4":
-            msg = f"💣 **C4** queued on {target.mention}! They'll be blasted back on resolution."
+        img_buf = _render_grid_image(state)
+        em      = self._round_embed(state, has_image=img_buf is not None)
+        if img_buf:
+            img_buf.seek(0)
+            await interaction.response.send_message(
+                file=discord.File(img_buf, filename="board.png"), embed=em, ephemeral=True
+            )
         else:
-            msg = "💾 **Decrypter Card** queued! Counts as 2 Breach Points if you `action` the vault."
+            em.description = f"```\n{_render_grid_text(state)}\n```"
+            await interaction.response.send_message(embed=em, ephemeral=True)
 
-        await interaction.response.send_message(msg, ephemeral=True)
+    @app_commands.command(
+        name="breakthrough-leaderboard",
+        description="Show the all-time Heist Coin leaderboard.",
+    )
+    @app_commands.guild_only()
+    async def breakthrough_leaderboard(self, interaction: discord.Interaction) -> None:
+        rows = _db_get_all_coins()
+        em   = discord.Embed(title="🪙  Breakthrough — Heist Coin Leaderboard", colour=C_LB)
+        if not rows:
+            em.description = "_No coins earned yet. Start a match with `/breakthrough-setup`!_"
+        else:
+            medals = ["🥇", "🥈", "🥉"]
+            lines  = []
+            for i, (team, coins) in enumerate(rows):
+                medal = medals[i] if i < 3 else f"`#{i+1}`"
+                lines.append(f"{medal}  **{team.title()}** — **{coins:,}** 🪙")
+            em.description = "\n".join(lines)
+        em.set_footer(text="Breakthrough · Coins from loot tiles & vault breaches only")
+        await interaction.response.send_message(embed=em)
 
-    # ═════════════════════════ ROUND ENGINE ════════════════════════════════════
+    # ═══════════════════════════ ROUND ENGINE ══════════════════════════════════
 
     async def _post_round(self, guild_id: int) -> None:
         state = self._games.get(guild_id)
@@ -1113,23 +1074,41 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             return
 
         state.round_number += 1
+
+        # Spawn diamond briefcase in round 3
+        if state.round_number == DIAMOND_SPAWN_ROUND and not state.diamond_spawned:
+            pos = _spawn_diamond(state)
+            state.diamond_spawned = True
+            channel = self.bot.get_channel(state.channel_id)
+            if isinstance(channel, discord.TextChannel) and pos:
+                await channel.send(
+                    f"💎  **Round {state.round_number}!** The Diamond Briefcase has appeared at "
+                    f"`[{pos[0]},{pos[1]}]` — +500 🪙 but it slows you by 1 tile/turn!"
+                )
+
         channel = self.bot.get_channel(state.channel_id)
         if not channel or not isinstance(channel, discord.TextChannel):
             return
 
+        # Reset round inputs; auto-submit frozen champions
         for champ in state.champions.values():
-            champ.reset_round_inputs()
+            champ.reset_round()
+            if champ.frozen_rounds > 0:
+                champ.submitted = True   # frozen = auto-hold
+
+        # Skip countdown if everyone is already submitted (all frozen edge-case)
+        if all(c.submitted for c in state.champions.values()):
+            await self._resolve_round(guild_id, channel)
+            return
 
         img_buf = _render_grid_image(state)
         em      = self._round_embed(state, has_image=img_buf is not None)
 
         if img_buf:
             img_buf.seek(0)
-            file = discord.File(img_buf, filename="board.png")
-            msg  = await channel.send(file=file, embed=em)
+            msg = await channel.send(file=discord.File(img_buf, filename="board.png"), embed=em)
         else:
-            # Pillow unavailable — fall back to emoji grid in description
-            em.description = f"```\n{_render_grid(state)}\n```"
+            em.description = f"```\n{_render_grid_text(state)}\n```"
             msg = await channel.send(embed=em)
 
         state.board_message = msg
@@ -1143,192 +1122,257 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
     async def _round_countdown(self, guild_id: int, channel: discord.TextChannel) -> None:
         await asyncio.sleep(ROUND_TIMER)
         state = self._games.get(guild_id)
-        if not state or not state.active:
-            return
-        await self._resolve_round(guild_id, channel)
+        if state and state.active:
+            await self._resolve_round(guild_id, channel)
 
     async def _resolve_round(self, guild_id: int, channel: discord.TextChannel) -> None:
         state = self._games.get(guild_id)
         if not state:
             return
 
-        log_lines: list[str] = []
+        log: list[str] = []
 
-        # 1. Default missing moves
+        # ── Default missing moves ─────────────────────────────────────────────
         for champ in state.champions.values():
-            if champ.move is None:
+            if champ.move is None and champ.frozen_rounds == 0:
                 champ.move = "hold"
-                log_lines.append(
-                    f"⏰ **{champ.display_name}** ({champ.team.title()}) timed out — defaulting to **hold**."
+                log.append(
+                    f"⏰ **{champ.display_name}** didn't submit — defaulting to **hold**."
                 )
 
-        # 2. Smoke effects
+        # ════════════════════════════════════════════════════════════════════
+        # PHASE 1 — GADGETS
+        # ════════════════════════════════════════════════════════════════════
+
+        # Decrement frozen rounds NOW so the current round's stun still counts
         for champ in state.champions.values():
-            if champ.used_item == "smoke" and champ.item_target is not None:
-                target = state.champions.get(champ.item_target)
-                if target:
-                    target.smoke_this_round = True
-                    original   = target.move
-                    target.move = random.choice(["up", "down", "left", "right", "hold"])
-                    log_lines.append(
-                        f"💨 **{champ.display_name}** smoked **{target.display_name}**! "
-                        f"Move scrambled: `{original}` → `{target.move}`"
+            if champ.frozen_rounds > 0:
+                champ.frozen_rounds -= 1
+                if champ.frozen_rounds == 0:
+                    log.append(f"🌡️ **{champ.display_name}** is no longer frozen — free next round.")
+
+        for champ in state.champions.values():
+            if not champ.gadget:
+                continue
+            key         = champ.gadget
+            g_name, g_cost = VALID_GADGETS[key]
+
+            if champ.ep < g_cost:
+                log.append(f"⚡ **{champ.display_name}** tried **{g_name}** but has insufficient EP.")
+                continue
+
+            champ.ep -= g_cost
+
+            if key == "smoke":
+                champ.smoked_rounds = 2
+                log.append(
+                    f"💨 **{champ.display_name}** deployed a **Smoke Grenade**! "
+                    f"Position hidden for 2 rounds. (−{g_cost} EP)"
+                )
+
+            elif key == "emp":
+                ts     = champ.gadget_target_slot
+                target = state.champions.get(ts) if ts is not None else None
+                if target and _is_adjacent(champ.row, champ.col, target.row, target.col):
+                    target.frozen_rounds = max(target.frozen_rounds, 1)
+                    target.move          = "hold"
+                    target.submitted     = True
+                    log.append(
+                        f"⚡ **{champ.display_name}** hit **{target.display_name}** with EMP! "
+                        f"Stunned for 1 round. (−{g_cost} EP)"
+                    )
+                else:
+                    target_name = state.champions[ts].display_name if ts in state.champions else "?"
+                    log.append(
+                        f"⚡ **{champ.display_name}**'s EMP missed — "
+                        f"**{target_name}** is not adjacent."
                     )
 
-        # 3. C4 blasts
-        c4_blasts: dict[int, int] = {}
-        for champ in state.champions.values():
-            if champ.used_item == "c4" and champ.item_target is not None:
-                target = state.champions.get(champ.item_target)
-                if target:
-                    if target.shield_rounds > 0:
-                        log_lines.append(
-                            f"💣 **{champ.display_name}** detonated C4 on **{target.display_name}** "
-                            f"— Riot Shield blocked it! 🛡️"
-                        )
-                    else:
-                        c4_blasts[target.slot] = champ.slot
-                        dr = target.row - champ.row
-                        dc = target.col - champ.col
-                        if dr != 0: dr = dr // abs(dr)
-                        if dc != 0: dc = dc // abs(dc)
-                        target.row = max(0, min(GRID_SIZE - 1, target.row + dr * 2))
-                        target.col = max(0, min(GRID_SIZE - 1, target.col + dc * 2))
-                        target.frozen_rounds = 1
-                        target.move = "hold"
-                        log_lines.append(
-                            f"💣 **{champ.display_name}** C4'd **{target.display_name}**! "
-                            f"Blasted to `[{target.row},{target.col}]` — frozen next round ❄️"
-                        )
+            elif key == "decoy":
+                dr, dc = _DIR_DELTA.get(champ.gadget_direction or "hold", (0, 0))
+                nr, nc = champ.row + dr, champ.col + dc
+                if (0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE
+                        and (nr, nc) not in state.walls
+                        and (nr, nc) not in VAULT_TILES):
+                    # Remove old decoy if any
+                    champ.has_decoy  = True
+                    champ.decoy_row  = nr
+                    champ.decoy_col  = nc
+                    log.append(
+                        f"👻 **{champ.display_name}** placed a **Decoy Hologram** at "
+                        f"`[{nr},{nc}]`. (−{g_cost} EP)"
+                    )
+                else:
+                    log.append(
+                        f"👻 **{champ.display_name}**'s Decoy failed — "
+                        f"target tile `[{nr},{nc}]` is blocked."
+                    )
 
-        # 4. Calculate proposed positions
+        # ════════════════════════════════════════════════════════════════════
+        # PHASE 2 — MOVEMENT
+        # ════════════════════════════════════════════════════════════════════
+
+        # Handle door-unlock actions first
+        for champ in state.champions.values():
+            if champ.move == "action":
+                unlocked_any = False
+                for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    adj = (champ.row + dr, champ.col + dc)
+                    if adj in state.doors and adj not in state.opened_doors:
+                        state.opened_doors.add(adj)
+                        log.append(
+                            f"🔓 **{champ.display_name}** unlocked the security door at `{adj}`!"
+                        )
+                        unlocked_any = True
+                if not unlocked_any:
+                    log.append(
+                        f"🔑 **{champ.display_name}** used action — no adjacent locked door."
+                    )
+
+        # Capture starting positions for collision rollback
         old_pos: dict[int, tuple[int, int]] = {
             s: (c.row, c.col) for s, c in state.champions.items()
         }
-        proposed: dict[int, tuple[int, int]] = {}
+
+        # Walk champions
         for slot, champ in state.champions.items():
-            if slot in c4_blasts:
-                proposed[slot] = (champ.row, champ.col)
+            if champ.frozen_rounds > 0 or champ.move in (None, "hold", "action"):
                 continue
-            if champ.frozen_rounds > 0:
-                champ.frozen_rounds -= 1
-                proposed[slot] = (champ.row, champ.col)
-                if champ.frozen_rounds == 0:
-                    log_lines.append(f"❄️ **{champ.display_name}** has thawed — free next round.")
-                continue
-            proposed[slot] = _apply_direction(champ.row, champ.col, champ.move)
+            _walk_champion(champ, state, log)
 
-        # 5. Collision detection
+        # Collision detection — two champions on the same tile bounce back
         dest_map: dict[tuple[int, int], list[int]] = {}
-        for slot, pos in proposed.items():
-            dest_map.setdefault(pos, []).append(slot)
+        for slot, champ in state.champions.items():
+            dest_map.setdefault((champ.row, champ.col), []).append(slot)
 
-        final: dict[int, tuple[int, int]] = {}
         for pos, slots in dest_map.items():
-            if len(slots) == 1:
-                final[slots[0]] = pos
-            else:
-                shielded   = [s for s in slots if state.champions[s].shield_rounds > 0]
-                unshielded = [s for s in slots if state.champions[s].shield_rounds == 0]
-                if len(shielded) == 1:
-                    winner = shielded[0]
-                    final[winner] = pos
-                    log_lines.append(
-                        f"🛡️ **{state.champions[winner].display_name}** won collision at `{pos}` via Riot Shield!"
+            if len(slots) > 1:
+                for s in slots:
+                    champ = state.champions[s]
+                    or_, oc_ = old_pos[s]
+                    champ.row, champ.col = or_, oc_
+                    log.append(
+                        f"💥 **{champ.display_name}** collided at `{pos}` — bounced back to `[{or_},{oc_}]`!"
                     )
-                    for loser in unshielded:
-                        final[loser] = old_pos[loser]
-                        log_lines.append(
-                            f"💥 **{state.champions[loser].display_name}** bounced back to `{old_pos[loser]}`!"
-                        )
-                else:
-                    for s in slots:
-                        final[s] = old_pos[s]
-                        log_lines.append(
-                            f"💥 **{state.champions[s].display_name}** collided and bounced to `{old_pos[s]}`!"
-                        )
 
-        for slot, (r, c) in final.items():
-            state.champions[slot].row = r
-            state.champions[slot].col = c
+        # ════════════════════════════════════════════════════════════════════
+        # LOOT COLLECTION (at final positions)
+        # ════════════════════════════════════════════════════════════════════
+        game_over   = False
+        winner_team: Optional[str] = None
 
-        # 6. Decrement shields
-        for champ in state.champions.values():
-            if champ.shield_rounds > 0:
-                champ.shield_rounds -= 1
-
-        # 7. Looting
         for champ in state.champions.values():
             pos = (champ.row, champ.col)
-            if pos in state.loot_tiles:
-                state.loot_tiles.discard(pos)
-                new_bal = _db_add_coins(champ.team, LOOT_REWARD)
-                log_lines.append(
-                    f"💰 **{champ.display_name}** ({champ.team.title()}) looted a cache! "
-                    f"**+{LOOT_REWARD:,} coins** → total: **{new_bal:,}** 🪙"
+
+            # Loot
+            loot_kind = state.loot_tiles.get(pos)
+            if loot_kind == "common":
+                del state.loot_tiles[pos]
+                coins = LOOT_REWARD_COMMON
+                champ.loot_claimed += 1
+                new_bal = _db_add_coins(champ.team, coins)
+                log.append(
+                    f"💵 **{champ.display_name}** grabbed cash! +{coins:,} 🪙 "
+                    f"(team total: {new_bal:,})"
+                )
+            elif loot_kind == "diamond":
+                del state.loot_tiles[pos]
+                coins = LOOT_REWARD_DIAMOND
+                champ.carrying_diamond = True
+                champ.loot_claimed += 1
+                new_bal = _db_add_coins(champ.team, coins)
+                log.append(
+                    f"💎 **{champ.display_name}** seized the Diamond Briefcase! "
+                    f"+{coins:,} 🪙 — movement reduced to **{champ.max_movement}** tile(s)/round. "
+                    f"(team total: {new_bal:,})"
                 )
 
-        # 8. Vault breaching
-        game_over    = False
-        winner_team: Optional[str] = None
-        for champ in state.champions.values():
-            if (champ.row, champ.col) == VAULT_POS and champ.move == "action":
-                points = 2 if champ.used_item == "decrypter" else 1
-                state.breach_points += points
-                tag = " (Decrypter ×2!) 💾" if points == 2 else ""
-                log_lines.append(
-                    f"🏆 **{champ.display_name}** ({champ.team.title()}) breached the vault{tag}! "
-                    f"Points: **{state.breach_points}/{VAULT_POINTS_REQ}**"
+            # Vault breach
+            if pos in VAULT_TILES:
+                state.breach_points += 1
+                champ.breach_points_contrib += 1
+                new_bal = _db_add_coins(champ.team, BREACH_COIN_REWARD)
+                log.append(
+                    f"🏦 **{champ.display_name}** breached the vault! "
+                    f"+1 Breach Point (+{BREACH_COIN_REWARD:,} 🪙). "
+                    f"Total: **{state.breach_points}/{VAULT_POINTS_REQ}**"
                 )
                 if state.breach_points >= VAULT_POINTS_REQ:
                     game_over   = True
                     winner_team = champ.team
+                    break
 
-        # 9. Post results
-        img_buf = _render_grid_image(state)
+        # ════════════════════════════════════════════════════════════════════
+        # PHASE 3 — TRAPS (final positions, if not already game over)
+        # ════════════════════════════════════════════════════════════════════
+        if not game_over:
+            for champ in state.champions.values():
+                pos = (champ.row, champ.col)
+                if pos in state.traps:
+                    state.traps.discard(pos)
+                    state.triggered_traps.add(pos)
+                    champ.frozen_rounds += 1
+                    log.append(
+                        f"⚠️ **{champ.display_name}** triggered a hidden Alarm Trap at `{pos}`! "
+                        f"Stunned for **1 round**."
+                    )
 
+        # ────── End-of-round bookkeeping ──────────────────────────────────
+        for champ in state.champions.values():
+            # Smoke tick
+            if champ.smoked_rounds > 0:
+                champ.smoked_rounds -= 1
+            # EP regen
+            champ.ep = min(MAX_EP, champ.ep + EP_REGEN)
+
+        # ── Game over ─────────────────────────────────────────────────────
         if game_over and winner_team:
             state.active = False
             self._games.pop(guild_id, None)
-            await self._post_victory(channel, state, winner_team, log_lines, img_buf)
+            await self._post_victory(channel, state, winner_team, log)
             return
 
-        # Post action log first
-        if log_lines:
+        # ── Action log ────────────────────────────────────────────────────
+        if log:
             log_em = discord.Embed(
                 title=f"📋  Round {state.round_number} — Action Log",
                 colour=C_ACTION,
-                description="\n".join(log_lines),
+                description="\n".join(log),
             )
-            log_em.set_footer(text=f"Vault: {state.breach_points}/{VAULT_POINTS_REQ} Breach Points")
+            log_em.set_footer(
+                text=f"Vault: {state.breach_points}/{VAULT_POINTS_REQ} BP  ·  "
+                     f"Loot tiles left: {sum(1 for v in state.loot_tiles.values() if v == 'common')}"
+            )
             await channel.send(embed=log_em)
 
         await self._post_round(guild_id)
 
-    # ─────────────────────────── Embeds ──────────────────────────────────────
+    # ═══════════════════════════ EMBEDS ════════════════════════════════════════
 
-    def _round_embed(self, state: GameState, has_image: bool = False) -> discord.Embed:
+    def _round_embed(self, state: GameState, *, has_image: bool = False) -> discord.Embed:
         em = discord.Embed(
-            title=f"🏦  Bank Breakthrough — Round {state.round_number}",
+            title=f"🏦  Breakthrough — Round {state.round_number}",
             colour=C_ROUND,
         )
         if has_image:
             em.set_image(url="attachment://board.png")
 
-        lines = []
+        # Champion status table
+        lines: list[str] = []
         for slot, champ in state.champions.items():
-            tags = []
+            tags: list[str] = []
             if champ.frozen_rounds > 0: tags.append(f"❄️ Frozen ({champ.frozen_rounds}r)")
-            if champ.shield_rounds  > 0: tags.append(f"🛡️ Shielded ({champ.shield_rounds}r)")
-            status = " | ".join(tags) if tags else "Active"
+            if champ.smoked_rounds > 0: tags.append(f"💨 Smoked ({champ.smoked_rounds}r)")
+            if champ.carrying_diamond:  tags.append("💎 Carrying")
+            status = " · ".join(tags) if tags else "Active"
+            pos    = f"`[{champ.row},{champ.col}]`" if champ.smoked_rounds == 0 else "`[?,?]`"
             lines.append(
                 f"{champ.emoji} **C{slot+1}** ({champ.team.title()}) "
-                f"`[{champ.row},{champ.col}]` — {status}"
+                f"{pos} · **{champ.ep} EP** · {status}"
             )
         em.add_field(name="Champions", value="\n".join(lines), inline=False)
         em.add_field(
-            name="🏆 Vault Progress",
-            value=f"**{state.breach_points}/{VAULT_POINTS_REQ}** Breach Points",
+            name="🏦 Vault", value=f"**{state.breach_points}/{VAULT_POINTS_REQ}** Breach Points",
             inline=True,
         )
         em.add_field(
@@ -1336,7 +1380,15 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             value=f"**{ROUND_TIMER}s** — `/submit-move` & `/use`",
             inline=True,
         )
-        em.set_footer(text=f"Bank Breakthrough  •  Loot Tiles remaining: {len(state.loot_tiles)}")
+        em.add_field(
+            name="💵 Loot Remaining",
+            value=f"**{sum(1 for v in state.loot_tiles.values() if v == 'common')}** common "
+                  f"· {'**1** 💎 diamond' if 'diamond' in state.loot_tiles.values() else '_none_'}",
+            inline=True,
+        )
+        em.set_footer(
+            text=f"Breakthrough  ·  Doors unlocked: {len(state.opened_doors)}/{len(FIXED_DOORS)}"
+        )
         return em
 
     async def _post_victory(
@@ -1344,20 +1396,35 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         channel:     discord.TextChannel,
         state:       GameState,
         winner_team: str,
-        log_lines:   list[str],
-        img_buf:     Optional[BytesIO],
+        log:         list[str],
     ) -> None:
-        if log_lines:
+        if log:
             log_em = discord.Embed(
                 title=f"📋  Round {state.round_number} — Final Action Log",
                 colour=C_VAULT,
-                description="\n".join(log_lines),
+                description="\n".join(log),
             )
             await channel.send(embed=log_em)
+
+        # Build leaderboard from this match
+        ranking = sorted(
+            state.champions.values(),
+            key=lambda c: (-c.breach_points_contrib, -c.loot_claimed, c.tiles_traveled),
+        )
+        rank_lines = []
+        medals = ["🥇", "🥈", "🥉", "4️⃣"]
+        for i, c in enumerate(ranking):
+            rank_lines.append(
+                f"{medals[i]} **{c.team.title()}** — "
+                f"{c.breach_points_contrib} BP · {c.loot_claimed} loot · "
+                f"{c.tiles_traveled} tiles"
+            )
 
         winner_champ = next(
             (c for c in state.champions.values() if c.team == winner_team), None
         )
+
+        img_buf = _render_grid_image(state)
         em = discord.Embed(
             title="💥  THE VAULT HAS BEEN CRACKED!  💥",
             colour=C_WIN,
@@ -1375,85 +1442,22 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                 inline=False,
             )
         em.add_field(
-            name="📊  Breach Points",
-            value=f"**{state.breach_points}/{VAULT_POINTS_REQ}** — Vault Unlocked",
+            name="📊  Match Ranking",
+            value="\n".join(rank_lines),
+            inline=False,
+        )
+        em.add_field(
+            name="🏦 Breach Points",
+            value=f"**{state.breach_points}/{VAULT_POINTS_REQ}** — Vault Cracked",
             inline=True,
         )
-        em.set_footer(text="Bank Breakthrough  •  Champion Edition  •  Match Over")
+        em.set_footer(text="Breakthrough · Champion Edition v2 · Match Over")
 
         if img_buf:
             img_buf.seek(0)
             await channel.send(file=discord.File(img_buf, filename="board.png"), embed=em)
         else:
             await channel.send(embed=em)
-
-    # ─────────────────────── Admin utilities ─────────────────────────────────
-
-    @app_commands.command(
-        name="breakthrough-end",
-        description="[Admin] Force-end an active Bank Breakthrough match.",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    async def breakthrough_end(self, interaction: discord.Interaction) -> None:
-        assert interaction.guild_id is not None
-        state = self._games.pop(interaction.guild_id, None)
-        if not state:
-            await interaction.response.send_message("❌  No active match to end.", ephemeral=True)
-            return
-        if state.timer_task:
-            state.timer_task.cancel()
-        state.active = False
-        await interaction.response.send_message("🛑  Match forcefully ended by admin.")
-
-    @app_commands.command(
-        name="breakthrough-status",
-        description="Show the current match status and board.",
-    )
-    @app_commands.guild_only()
-    async def breakthrough_status(self, interaction: discord.Interaction) -> None:
-        assert interaction.guild_id is not None
-        state = self._games.get(interaction.guild_id)
-        if not state or not state.active:
-            await interaction.response.send_message("❌  No active match right now.", ephemeral=True)
-            return
-        img_buf = _render_grid_image(state)
-        em      = self._round_embed(state, has_image=img_buf is not None)
-        if img_buf:
-            img_buf.seek(0)
-            await interaction.response.send_message(
-                file=discord.File(img_buf, filename="board.png"), embed=em, ephemeral=True
-            )
-        else:
-            em.description = f"```\n{_render_grid(state)}\n```"
-            await interaction.response.send_message(embed=em, ephemeral=True)
-
-
-    @app_commands.command(
-        name="breakthrough-leaderboard",
-        description="Show the all-time Heist Coin leaderboard for Bank Breakthrough.",
-    )
-    @app_commands.guild_only()
-    async def breakthrough_leaderboard(self, interaction: discord.Interaction) -> None:
-        rows = _db_get_all_coins()
-
-        em = discord.Embed(
-            title="🪙  Bank Breakthrough — Heist Coin Leaderboard",
-            colour=C_ITEM,
-        )
-
-        if not rows:
-            em.description = "_No coins earned yet. Start a match with `/breakthrough-setup`!_"
-        else:
-            MEDALS = ["🥇", "🥈", "🥉"]
-            lines = []
-            for i, (team, coins) in enumerate(rows):
-                medal = MEDALS[i] if i < len(MEDALS) else f"`#{i+1}`"
-                lines.append(f"{medal}  **{team.title()}** — **{coins:,}** 🪙")
-            em.description = "\n".join(lines)
-
-        em.set_footer(text="Bank Breakthrough  •  Coins earned from loot tiles & vault breaches only")
-        await interaction.response.send_message(embed=em)
 
 
 async def setup(bot: commands.Bot) -> None:

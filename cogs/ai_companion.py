@@ -691,6 +691,12 @@ class AiCompanion(commands.Cog):
         # Only the LATEST message per user is kept — no spam flooding.
         self._pending: dict[int, discord.Message] = {}
 
+        # guild_id → message count for learning context injection throttle
+        self._learning_inject_counter: dict[int, int] = {}
+
+        # user_id → timestamp of last successful reply (30s cooldown)
+        self._user_cooldowns: dict[int, float] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -713,8 +719,8 @@ class AiCompanion(commands.Cog):
     def _append_history(self, user_id: int, role: str, content: str) -> None:
         history = self.conversations.setdefault(user_id, [])
         history.append({"role": role, "content": content})
-        if len(history) > 200:
-            self.conversations[user_id] = history[-200:]
+        if len(history) > 20:
+            self.conversations[user_id] = history[-20:]
 
     def _is_dismiss(self, text: str) -> bool:
         lower = text.lower()
@@ -739,6 +745,11 @@ class AiCompanion(commands.Cog):
 
     def _learning_context(self, guild_id: Optional[int]) -> str:
         if guild_id is None:
+            return ""
+        # Only inject learning context every 5th message to save tokens
+        count = self._learning_inject_counter.get(guild_id, 0) + 1
+        self._learning_inject_counter[guild_id] = count
+        if count % 5 != 0:
             return ""
         return _build_learning_context(self.server_vocab.get(guild_id, {}))
 
@@ -1268,7 +1279,7 @@ class AiCompanion(commands.Cog):
 
         # ── 5. Proactive jump-in (3% chance, only when NOT triggered) ─────
         if not triggered:
-            if random.random() < 0.03:
+            if random.random() < 0.01:
                 asyncio.create_task(self._proactive_reply(message))
             return
 
@@ -1289,6 +1300,29 @@ class AiCompanion(commands.Cog):
                 f"[replying to your message: "
                 f"\"{message.reference.resolved.content[:200]}\"]"
             )
+
+        # ── Per-user cooldown (30 seconds) ───────────────────────────────
+        import time
+        now = time.time()
+        last_reply = self._user_cooldowns.get(user_id, 0)
+        cooldown_remaining = 30.0 - (now - last_reply)
+
+        if cooldown_remaining > 0:
+            if random.random() < 0.4:
+                cooldown_replies = [
+                    "bro chill im still thinking 💀",
+                    "one sec one sec",
+                    "bro i JUST replied to you",
+                    "give me a second omg",
+                    "i'm not a machine stop pinging me back to back",
+                    "bro. BREATHE.",
+                    f"wait like {int(cooldown_remaining)} more seconds istg",
+                    "you're so impatient i cannot",
+                    "bro i haven't even finished my thought yet",
+                    "one conversation at a time omg 😭",
+                ]
+                await message.channel.send(random.choice(cooldown_replies))
+            return
 
         # c. Conversation lock check ─────────────────────────────────────
         # If Biki is currently processing a reply for ANY user, queue this
@@ -1395,6 +1429,7 @@ class AiCompanion(commands.Cog):
                 await asyncio.sleep(1.0)
                 async with message.channel.typing():
                     reply = await self._ai_reply(user_id, clean, guild_id=guild_id)
+                self._user_cooldowns[user_id] = time.time()
                 await self._send_biki_reply(message, reply)
             except Exception as exc:
                 log.error("ai_companion: AI call failed: %s", exc)

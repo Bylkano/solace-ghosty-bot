@@ -1939,27 +1939,45 @@ class AiCompanion(commands.Cog):
 
     @app_commands.command(
         name="bikistats",
-        description="Show Biki's current in-memory session stats.",
+        description="Show Biki's config and session stats for this server.",
     )
     @app_commands.guild_only()
     async def bikistats(self, interaction: discord.Interaction) -> None:
         assert interaction.guild_id is not None
-        total_msgs    = sum(len(v) for v in self.conversations.values())
-        total_users   = len(self.conversations)
-        spoken_this   = len(self._users_spoken)
-        dismissed_cnt = len(self.dismissed)
-        mood          = self.guild_moods.get(interaction.guild_id, "normal")
-        pending_cnt   = len(self._pending)
+        gid = interaction.guild_id
+
+        # ── Config ───────────────────────────────────────────────────────
+        mood          = self.guild_moods.get(gid, "normal")
+        silenced      = self.guild_silenced.get(gid, False)
+        personality   = self.guild_personalities.get(gid, "")
+        facts_count   = len(self.guild_facts.get(gid, []))
+        personality_preview = (
+            personality[:120] + ("…" if len(personality) > 120 else "")
+            if personality else "none (default Biki)"
+        )
+
+        # ── Session ──────────────────────────────────────────────────────
+        total_msgs     = sum(len(v) for v in self.conversations.values())
+        total_users    = len(self.conversations)
+        spoken_this    = len(self._users_spoken)
+        dismissed_cnt  = len(self.dismissed)
+        pending_cnt    = len(self._pending)
         processing_cnt = len(self._processing)
+
+        silence_str = "🔇 **SILENCED**" if silenced else "🔊 active"
+
         await interaction.response.send_message(
-            f"**Biki session stats**\n"
-            f"• Conversations loaded: **{total_users}** users\n"
-            f"• Total messages in memory: **{total_msgs}**\n"
-            f"• Users spoken to this session: **{spoken_this}**\n"
-            f"• Currently dismissed by: **{dismissed_cnt}** user(s)\n"
-            f"• Active mood: **{mood}**\n"
-            f"• Currently processing: **{processing_cnt}** conversation(s)\n"
-            f"• Pending in queue: **{pending_cnt}** message(s)",
+            f"**Biki — server config**\n"
+            f"• Status: {silence_str}\n"
+            f"• Mood: **{mood}**\n"
+            f"• Custom personality: {personality_preview}\n"
+            f"• Remembered facts: **{facts_count}** (use `/bikifacts` to view)\n"
+            f"\n"
+            f"**Session stats**\n"
+            f"• Conversations in memory: **{total_users}** users / **{total_msgs}** messages\n"
+            f"• Spoken to this session: **{spoken_this}** user(s)\n"
+            f"• Dismissed by: **{dismissed_cnt}** user(s)\n"
+            f"• Processing: **{processing_cnt}** · Pending: **{pending_cnt}**",
             ephemeral=True,
         )
 
@@ -2015,29 +2033,6 @@ class AiCompanion(commands.Cog):
             return
         await interaction.followup.send(
             "✅ Custom personality cleared. Biki is back to his default chaotic self.",
-            ephemeral=True,
-        )
-
-    @app_commands.command(
-        name="bikiviewpersonality",
-        description="View the current custom personality set for this server.",
-    )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    async def bikiviewpersonality(self, interaction: discord.Interaction) -> None:
-        assert interaction.guild_id is not None
-        personality = self.guild_personalities.get(interaction.guild_id, "")
-        if not personality:
-            await interaction.response.send_message(
-                "No custom personality set for this server. Biki is running on his default.",
-                ephemeral=True,
-            )
-            return
-        preview = personality[:1800]
-        if len(personality) > 1800:
-            preview += f"\n... *(truncated — {len(personality)} chars total)*"
-        await interaction.response.send_message(
-            f"**Current personality override:**\n{preview}",
             ephemeral=True,
         )
 

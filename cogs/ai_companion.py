@@ -281,6 +281,24 @@ _OFFLINE_REPLIES: list[str] = [
     "i will be back when i am back. which is not now",
 ]
 
+_OVER_LIMIT_REPLIES: list[str] = [
+    "i've talked way too much today, my brain is fried. see y'all tomorrow lol",
+    "bro i literally cannot form another thought today. i'm cooked. come back tomorrow",
+    "nah i've been yakking all day i need to rest. tomorrow bestie 💀",
+    "my word count for today is done. i don't make the rules. well i do but still",
+    "i've used up every brain cell i had today. depleted. empty. see you tomorrow",
+    "bro i'm at my daily limit of caring. try again tomorrow",
+    "i talked SO much today that i physically cannot anymore. tomorrow fr",
+    "daily word budget: spent. entirely. nothing left. bye until tomorrow 💀",
+    "i am genuinely out of thoughts for today. the tank is empty. tomorrow",
+    "ngl i've been running my mouth all day and i'm done. catch me tomorrow",
+    "okay so. i may have talked to literally everyone today and now i'm out. tomorrow babe",
+    "brain.exe has reached its daily quota. shutting down until tomorrow. goodbye",
+    "i've said too much today. that's it that's the message. tomorrow",
+    "i literally cannot produce another word today. it's not you it's my daily limit 💀",
+    "i'm on a forced speaking break. touched the daily ceiling. back tomorrow fr",
+]
+
 # ---------------------------------------------------------------------------
 # Mood system — per-guild tone overrides
 # ---------------------------------------------------------------------------
@@ -703,6 +721,74 @@ def _db_load_all_moods() -> dict[int, str]:
 
 
 # ---------------------------------------------------------------------------
+# Daily token budget tracker
+# ---------------------------------------------------------------------------
+
+import json as _json_mod
+import pathlib as _pathlib_mod
+import threading as _threading_mod
+
+_DAILY_TOKEN_CAP   = 2_500_000
+_TOKEN_FILE        = _pathlib_mod.Path(__file__).parent.parent / "token_usage.json"
+_token_lock        = _threading_mod.Lock()
+
+
+class DailyTokenLimitReached(Exception):
+    """Raised when the daily token budget has been exhausted."""
+
+
+def _load_token_tracker() -> dict:
+    """Load tracker from disk, or return a fresh one for today."""
+    today = __import__("datetime").date.today().isoformat()
+    try:
+        if _TOKEN_FILE.exists():
+            data = _json_mod.loads(_TOKEN_FILE.read_text())
+            if data.get("date") == today:
+                return data
+    except Exception:
+        pass
+    return {"date": today, "total": 0}
+
+
+def _save_token_tracker(tracker: dict) -> None:
+    """Persist tracker to disk (best-effort)."""
+    try:
+        _TOKEN_FILE.write_text(_json_mod.dumps(tracker))
+    except Exception:
+        pass
+
+
+def _check_budget_and_add(tokens_used: int) -> None:
+    """
+    Thread-safe: check daily budget before adding tokens.
+    Raises DailyTokenLimitReached if the cap is already met.
+    Adds `tokens_used` to today's total and saves.
+    """
+    today = __import__("datetime").date.today().isoformat()
+    with _token_lock:
+        tracker = _load_token_tracker()
+        if tracker["date"] != today:
+            tracker = {"date": today, "total": 0}
+        if tracker["total"] >= _DAILY_TOKEN_CAP:
+            raise DailyTokenLimitReached(
+                f"Daily cap of {_DAILY_TOKEN_CAP:,} tokens reached "
+                f"(used today: {tracker['total']:,})"
+            )
+        tracker["total"] += tokens_used
+        _save_token_tracker(tracker)
+
+
+def _is_over_daily_limit() -> bool:
+    """Quick pre-call check: returns True if today's budget is already spent."""
+    today = __import__("datetime").date.today().isoformat()
+    with _token_lock:
+        tracker = _load_token_tracker()
+        if tracker["date"] != today:
+            return False
+        return tracker["total"] >= _DAILY_TOKEN_CAP
+
+
+# ---------------------------------------------------------------------------
 # DeepInfra client singleton — instantiated once, reused on every call
 # ---------------------------------------------------------------------------
 
@@ -760,6 +846,11 @@ def _call_ai(
             f"{facts_lines}"
         )
     system = learning_context + _SYSTEM_PROMPT + personality_section + facts_section + mood_addon
+
+    # ── Daily token budget pre-check ──────────────────────────────────────
+    if _is_over_daily_limit():
+        raise DailyTokenLimitReached("Daily token cap already reached")
+
     client = _get_deepinfra_client()
     try:
         response = client.chat.completions.create(
@@ -770,7 +861,19 @@ def _call_ai(
             frequency_penalty=0.7,
             presence_penalty=0.5,
         )
+        # ── Track actual tokens used ──────────────────────────────────────
+        try:
+            tokens_used = response.usage.total_tokens if response.usage else max_tokens
+            _check_budget_and_add(tokens_used)
+            log.debug("ai_companion: tokens used this call=%d", tokens_used)
+        except DailyTokenLimitReached:
+            raise
+        except Exception as track_err:
+            log.warning("ai_companion: token tracking failed: %s", track_err)
+
         return _sanitise(response.choices[0].message.content.strip())
+    except DailyTokenLimitReached:
+        raise
     except Exception as e:
         log.warning("ai_companion: DeepInfra call failed: %s", e)
         raise RuntimeError(f"DeepInfra backend failed: {e}") from e
@@ -1037,15 +1140,19 @@ class AiCompanion(commands.Cog):
 
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
         facts = self.guild_facts.get(guild_id, []) if guild_id else []
-        reply = await asyncio.to_thread(
-            _call_ai,
-            history,
-            self._mood_addon(guild_id),
-            self._learning_context(guild_id),
-            max_tokens,
-            personality,
-            facts or None,
-        )
+        try:
+            reply = await asyncio.to_thread(
+                _call_ai,
+                history,
+                self._mood_addon(guild_id),
+                self._learning_context(guild_id),
+                max_tokens,
+                personality,
+                facts or None,
+            )
+        except DailyTokenLimitReached:
+            log.info("ai_companion: daily token cap reached — returning over-limit reply")
+            return random.choice(_OVER_LIMIT_REPLIES)
 
         self._append_history(user_id, "user", user_text)
         self._append_history(user_id, "assistant", reply)

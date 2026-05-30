@@ -1061,18 +1061,18 @@ class AiCompanion(commands.Cog):
         parts     = _split_parts(text)
         use_reply = force_reply or random.random() < 0.40
 
-        for i, part in enumerate(parts):
-            # Step 1 — 1 second pause before showing typing indicator
-            # Simulates the human delay before starting to type
-            await asyncio.sleep(1.0)
+        # 1 second reading pause before Biki starts typing (simulates a human
+        # reading the message before responding). Happens once, before the first part.
+        await asyncio.sleep(1.0)
 
-            # Step 2 — show typing indicator for WPM-scaled duration
-            # Lasts as long as it would take a human to type that message
+        for i, part in enumerate(parts):
+            # Show typing indicator for WPM-scaled duration —
+            # longer messages = longer typing time
             typing_duration = _typing_seconds(part)
             async with trigger.channel.typing():
                 await asyncio.sleep(typing_duration)
 
-            # Step 3 — send the message immediately after typing ends
+            # Send the message immediately after typing ends
             if i == 0 and use_reply:
                 try:
                     await trigger.reply(part, mention_author=False)
@@ -1081,7 +1081,7 @@ class AiCompanion(commands.Cog):
             else:
                 await trigger.channel.send(part)
 
-            # Step 4 — pause between parts like a human would
+            # Short human-like pause between parts (for [SPLIT] messages)
             if i < len(parts) - 1:
                 await asyncio.sleep(random.uniform(0.8, 1.8))
 
@@ -1111,19 +1111,21 @@ class AiCompanion(commands.Cog):
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
         facts = self.guild_facts.get(guild_id, []) if guild_id else []
         try:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-            async with message.channel.typing():
-                response = await asyncio.to_thread(
-                    _call_ai,
-                    [{"role": "user", "content": prompt}],
-                    self._mood_addon(guild_id),
-                    self._learning_context(guild_id),
-                    120,  # max_tokens — short and punchy
-                    personality,
-                    facts or None,
-                )
+            # Random delay so it doesn't feel like Biki is always watching
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            response = await asyncio.to_thread(
+                _call_ai,
+                [{"role": "user", "content": prompt}],
+                self._mood_addon(guild_id),
+                self._learning_context(guild_id),
+                120,  # max_tokens — short and punchy
+                personality,
+                facts or None,
+            )
             if response:
-                await message.reply(response, mention_author=False)
+                # Use _send_biki_reply so proactive messages also get the
+                # 1s reading pause + WPM-scaled typing simulation
+                await self._send_biki_reply(message, response, force_reply=True)
         except Exception:
             pass  # silently skip — proactive replies are best-effort
 
@@ -1273,11 +1275,10 @@ class AiCompanion(commands.Cog):
                 f"You just deleted a message because {author.display_name} asked. "
                 "Confirm it dramatically. You have the power."
             )
-            async with message.channel.typing():
-                reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id,
-                    max_tokens=150,
-                )
+            reply = await self._ai_reply(
+                author.id, clean, extra_note=note, guild_id=message.guild.id,
+                max_tokens=150,
+            )
             await self._send_biki_reply(message, reply)
             return True
 
@@ -1323,11 +1324,10 @@ class AiCompanion(commands.Cog):
                 "Someone tried to make you take a moderation action against an admin "
                 "or against yourself. Refuse dramatically and chaotically."
             )
-            async with message.channel.typing():
-                reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id,
-                    max_tokens=150,
-                )
+            reply = await self._ai_reply(
+                author.id, clean, extra_note=note, guild_id=message.guild.id,
+                max_tokens=150,
+            )
             await self._send_biki_reply(message, reply)
             return True
 
@@ -1359,11 +1359,10 @@ class AiCompanion(commands.Cog):
                 f"Say something like 'done. {target.display_name} is cooked for "
                 f"{human_dur} 💀'"
             )
-            async with message.channel.typing():
-                reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id,
-                    max_tokens=150,
-                )
+            reply = await self._ai_reply(
+                author.id, clean, extra_note=note, guild_id=message.guild.id,
+                max_tokens=150,
+            )
             await self._send_biki_reply(message, reply)
 
         elif action == "unmute":
@@ -1378,11 +1377,10 @@ class AiCompanion(commands.Cog):
                 f"Say something like 'fine fine {target.display_name} "
                 "you're free. don't make me regret this'"
             )
-            async with message.channel.typing():
-                reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id,
-                    max_tokens=150,
-                )
+            reply = await self._ai_reply(
+                author.id, clean, extra_note=note, guild_id=message.guild.id,
+                max_tokens=150,
+            )
             await self._send_biki_reply(message, reply)
 
         elif action == "kick":
@@ -1398,11 +1396,10 @@ class AiCompanion(commands.Cog):
                 f"You just kicked {name} because {author.display_name} asked. "
                 f"Say something like 'YEET 👋 {name} has left the building. bye bestie'"
             )
-            async with message.channel.typing():
-                reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id,
-                    max_tokens=150,
-                )
+            reply = await self._ai_reply(
+                author.id, clean, extra_note=note, guild_id=message.guild.id,
+                max_tokens=150,
+            )
             await self._send_biki_reply(message, reply)
 
         elif action == "ban":
@@ -1418,11 +1415,10 @@ class AiCompanion(commands.Cog):
                 f"You just banned {name} because {author.display_name} asked. "
                 f"Say something like 'damn okay. {name} is GONE gone. rip 💀'"
             )
-            async with message.channel.typing():
-                reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id,
-                    max_tokens=150,
-                )
+            reply = await self._ai_reply(
+                author.id, clean, extra_note=note, guild_id=message.guild.id,
+                max_tokens=150,
+            )
             await self._send_biki_reply(message, reply)
 
         elif action == "warn":
@@ -1452,11 +1448,10 @@ class AiCompanion(commands.Cog):
                 f"Say something like 'consider yourself warned "
                 f"{target.display_name} 👀 biki is watching'"
             )
-            async with message.channel.typing():
-                reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id,
-                    max_tokens=150,
-                )
+            reply = await self._ai_reply(
+                author.id, clean, extra_note=note, guild_id=message.guild.id,
+                max_tokens=150,
+            )
             await self._send_biki_reply(message, reply)
 
         return True
@@ -1587,11 +1582,10 @@ class AiCompanion(commands.Cog):
                         "Make your re-entry absolutely unhinged."
                     )
                     try:
-                        async with message.channel.typing():
-                            reply = await self._ai_reply(
-                                user_id, clean, extra_note=note, guild_id=guild_id,
-                                max_tokens=150,
-                            )
+                        reply = await self._ai_reply(
+                            user_id, clean, extra_note=note, guild_id=guild_id,
+                            max_tokens=150,
+                        )
                         await self._send_biki_reply(message, reply)
                     except Exception as exc:
                         log.error("ai_companion: return reply failed: %s", exc)
@@ -1610,11 +1604,10 @@ class AiCompanion(commands.Cog):
                     "dismissed you. Most dramatic comeback ever."
                 )
                 try:
-                    async with message.channel.typing():
-                        reply = await self._ai_reply(
-                            user_id, clean, extra_note=note, guild_id=guild_id,
-                            max_tokens=150,
-                        )
+                    reply = await self._ai_reply(
+                        user_id, clean, extra_note=note, guild_id=guild_id,
+                        max_tokens=150,
+                    )
                     await self._send_biki_reply(message, reply)
                 except Exception as exc:
                     log.error("ai_companion: spite-return failed: %s", exc)
@@ -1633,11 +1626,10 @@ class AiCompanion(commands.Cog):
                     "Acknowledge it chaotically then go quiet."
                 )
                 try:
-                    async with message.channel.typing():
-                        reply = await self._ai_reply(
-                            user_id, clean, extra_note=note, guild_id=guild_id,
-                            max_tokens=150,
-                        )
+                    reply = await self._ai_reply(
+                        user_id, clean, extra_note=note, guild_id=guild_id,
+                        max_tokens=150,
+                    )
                     await self._send_biki_reply(message, reply)
                 except Exception as exc:
                     log.error("ai_companion: timed dismiss failed: %s", exc)
@@ -1654,23 +1646,20 @@ class AiCompanion(commands.Cog):
                 }
                 note = "This person is kicking you out. Most dramatic chaotic goodbye ever."
                 try:
-                    async with message.channel.typing():
-                        reply = await self._ai_reply(
-                            user_id, clean, extra_note=note, guild_id=guild_id,
-                            max_tokens=150,
-                        )
+                    reply = await self._ai_reply(
+                        user_id, clean, extra_note=note, guild_id=guild_id,
+                        max_tokens=150,
+                    )
                     await self._send_biki_reply(message, reply)
                 except Exception as exc:
                     log.error("ai_companion: dismiss failed: %s", exc)
                 return
 
             # j. Normal reply ─────────────────────────────────────────────
-            # 1s reading pause → keep typing alive during AI call →
-            # _send_biki_reply handles per-part typing simulation
+            # Generate silently, then _send_biki_reply handles:
+            #   1s reading pause → WPM-scaled typing → send
             try:
-                await asyncio.sleep(1.0)
-                async with message.channel.typing():
-                    reply = await self._ai_reply(user_id, clean, guild_id=guild_id)
+                reply = await self._ai_reply(user_id, clean, guild_id=guild_id)
                 self._user_cooldowns[user_id] = time.time()
                 await self._send_biki_reply(message, reply)
             except Exception as exc:

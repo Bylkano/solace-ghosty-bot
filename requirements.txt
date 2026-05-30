@@ -4,3 +4,4 @@ aiohttp>=3.9.0
 flask>=3.0.0
 psycopg2-binary>=2.9.0
 g4f
+Pillow>=10.0.0

@@ -2092,6 +2092,53 @@ class AiCompanion(commands.Cog):
 
 
     # ------------------------------------------------------------------
+    # /bikitokens — show today's token budget usage
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="bikitokens",
+        description="Show today's DeepInfra token usage and remaining daily budget.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikitokens(self, interaction: discord.Interaction) -> None:
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        with _token_lock:
+            tracker = _load_token_tracker()
+
+        used  = tracker["total"] if tracker.get("date") == today else 0
+        cap   = _DAILY_TOKEN_CAP
+        left  = max(0, cap - used)
+        pct   = (used / cap) * 100
+
+        if pct >= 100:
+            bar_filled = 20
+            status = "🔴 **DAILY LIMIT REACHED** — Biki is offline until tomorrow"
+        elif pct >= 80:
+            bar_filled = round(pct / 5)
+            status = "🟠 getting low — watch it"
+        elif pct >= 50:
+            bar_filled = round(pct / 5)
+            status = "🟡 halfway there"
+        else:
+            bar_filled = round(pct / 5)
+            status = "🟢 all good"
+
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+
+        await interaction.response.send_message(
+            f"**Biki — Daily Token Budget**\n"
+            f"Date: `{today}`\n\n"
+            f"`{bar}` {pct:.1f}%\n\n"
+            f"• Used today:  **{used:,}** tokens\n"
+            f"• Remaining:   **{left:,}** tokens\n"
+            f"• Daily cap:   **{cap:,}** tokens\n\n"
+            f"Status: {status}",
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
     # /bikisetpersonality — write a custom personality override for this server
     # ------------------------------------------------------------------
 

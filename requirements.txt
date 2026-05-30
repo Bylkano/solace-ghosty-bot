@@ -5,3 +5,4 @@ flask>=3.0.0
 psycopg2-binary>=2.9.0
 g4f
 Pillow>=10.0.0
+groq>=0.9.0

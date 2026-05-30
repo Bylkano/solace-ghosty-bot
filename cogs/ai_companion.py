@@ -738,16 +738,22 @@ class DailyTokenLimitReached(Exception):
 
 
 def _load_token_tracker() -> dict:
-    """Load tracker from disk, or return a fresh one for today."""
+    """Load tracker from disk, or return a fresh one for today.
+
+    File format: {"date": "YYYY-MM-DD", "total": <int>, "cap": <int>}
+    The `cap` field persists across day resets so custom limits survive midnight.
+    """
     today = __import__("datetime").date.today().isoformat()
     try:
         if _TOKEN_FILE.exists():
             data = _json_mod.loads(_TOKEN_FILE.read_text())
             if data.get("date") == today:
                 return data
+            # New day — reset count but keep any custom cap
+            return {"date": today, "total": 0, "cap": data.get("cap", _DAILY_TOKEN_CAP)}
     except Exception:
         pass
-    return {"date": today, "total": 0}
+    return {"date": today, "total": 0, "cap": _DAILY_TOKEN_CAP}
 
 
 def _save_token_tracker(tracker: dict) -> None:
@@ -756,6 +762,20 @@ def _save_token_tracker(tracker: dict) -> None:
         _TOKEN_FILE.write_text(_json_mod.dumps(tracker))
     except Exception:
         pass
+
+
+def _effective_cap(tracker: dict) -> int:
+    """Return the active daily cap — custom if set, default otherwise."""
+    return tracker.get("cap", _DAILY_TOKEN_CAP)
+
+
+def _set_token_cap(new_cap: int) -> int:
+    """Thread-safe: update the daily cap and persist it. Returns the new cap."""
+    with _token_lock:
+        tracker = _load_token_tracker()
+        tracker["cap"] = new_cap
+        _save_token_tracker(tracker)
+    return new_cap
 
 
 def _check_budget_and_add(tokens_used: int) -> None:
@@ -768,10 +788,11 @@ def _check_budget_and_add(tokens_used: int) -> None:
     with _token_lock:
         tracker = _load_token_tracker()
         if tracker["date"] != today:
-            tracker = {"date": today, "total": 0}
-        if tracker["total"] >= _DAILY_TOKEN_CAP:
+            tracker = {"date": today, "total": 0, "cap": tracker.get("cap", _DAILY_TOKEN_CAP)}
+        cap = _effective_cap(tracker)
+        if tracker["total"] >= cap:
             raise DailyTokenLimitReached(
-                f"Daily cap of {_DAILY_TOKEN_CAP:,} tokens reached "
+                f"Daily cap of {cap:,} tokens reached "
                 f"(used today: {tracker['total']:,})"
             )
         tracker["total"] += tokens_used
@@ -785,7 +806,7 @@ def _is_over_daily_limit() -> bool:
         tracker = _load_token_tracker()
         if tracker["date"] != today:
             return False
-        return tracker["total"] >= _DAILY_TOKEN_CAP
+        return tracker["total"] >= _effective_cap(tracker)
 
 
 # ---------------------------------------------------------------------------
@@ -2108,9 +2129,10 @@ class AiCompanion(commands.Cog):
             tracker = _load_token_tracker()
 
         used  = tracker["total"] if tracker.get("date") == today else 0
-        cap   = _DAILY_TOKEN_CAP
+        cap   = _effective_cap(tracker)
         left  = max(0, cap - used)
         pct   = (used / cap) * 100
+        is_custom = cap != _DAILY_TOKEN_CAP
 
         if pct >= 100:
             bar_filled = 20
@@ -2126,6 +2148,7 @@ class AiCompanion(commands.Cog):
             status = "🟢 all good"
 
         bar = "█" * bar_filled + "░" * (20 - bar_filled)
+        cap_label = f"**{cap:,}** *(custom — use `/bikibudget` to change)*" if is_custom else f"**{cap:,}** *(default)*"
 
         await interaction.response.send_message(
             f"**Biki — Daily Token Budget**\n"
@@ -2133,8 +2156,80 @@ class AiCompanion(commands.Cog):
             f"`{bar}` {pct:.1f}%\n\n"
             f"• Used today:  **{used:,}** tokens\n"
             f"• Remaining:   **{left:,}** tokens\n"
-            f"• Daily cap:   **{cap:,}** tokens\n\n"
+            f"• Daily cap:   {cap_label}\n\n"
             f"Status: {status}",
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
+    # /bikibudget — adjust the daily token cap on the fly
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="bikibudget",
+        description="View or change Biki's daily token cap.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(new_cap="New daily token limit (e.g. 1500000). Leave blank to just view the current cap.")
+    async def bikibudget(
+        self, interaction: discord.Interaction, new_cap: int | None = None
+    ) -> None:
+        with _token_lock:
+            tracker = _load_token_tracker()
+        current_cap = _effective_cap(tracker)
+
+        # ── View mode (no argument) ───────────────────────────────────────
+        if new_cap is None:
+            is_custom = current_cap != _DAILY_TOKEN_CAP
+            label = "custom" if is_custom else "default"
+            await interaction.response.send_message(
+                f"**Biki — Daily Token Cap**\n"
+                f"Current cap: **{current_cap:,}** tokens ({label})\n"
+                f"Default cap: **{_DAILY_TOKEN_CAP:,}** tokens\n\n"
+                f"To change it: `/bikibudget new_cap:<number>`\n"
+                f"To reset to default: `/bikibudget new_cap:{_DAILY_TOKEN_CAP}`",
+                ephemeral=True,
+            )
+            return
+
+        # ── Validation ────────────────────────────────────────────────────
+        MIN_CAP = 10_000
+        MAX_CAP = 10_000_000
+
+        if new_cap < MIN_CAP:
+            await interaction.response.send_message(
+                f"❌ Cap must be at least **{MIN_CAP:,}** tokens (you entered `{new_cap:,}`).",
+                ephemeral=True,
+            )
+            return
+        if new_cap > MAX_CAP:
+            await interaction.response.send_message(
+                f"❌ Cap can't exceed **{MAX_CAP:,}** tokens — that's way too high.",
+                ephemeral=True,
+            )
+            return
+
+        # ── Apply ─────────────────────────────────────────────────────────
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(_set_token_cap, new_cap)
+        except Exception as exc:
+            log.error("bikibudget: failed to save cap: %s", exc)
+            await interaction.followup.send(
+                f"❌ Failed to save new cap: `{exc}`", ephemeral=True
+            )
+            return
+
+        direction = "⬆️ increased" if new_cap > current_cap else "⬇️ decreased"
+        is_default = new_cap == _DAILY_TOKEN_CAP
+        note = " (reset to default)" if is_default else ""
+
+        await interaction.followup.send(
+            f"✅ Daily token cap {direction}{note}.\n"
+            f"• Old cap: **{current_cap:,}** tokens\n"
+            f"• New cap: **{new_cap:,}** tokens\n\n"
+            f"Takes effect immediately. Use `/bikitokens` to monitor usage.",
             ephemeral=True,
         )
 

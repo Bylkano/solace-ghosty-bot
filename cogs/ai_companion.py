@@ -1,18 +1,17 @@
 """
-cogs/ai_companion.py — Biki AI Companion (v2)
+cogs/ai_companion.py — Biki AI Companion (v3)
 
-Biki is a chaotic, permanently-online Discord "member" with an 8-backend
-free AI fallback chain: Groq → Gemini → Cerebras → SambaNova → Together AI
-→ OpenRouter → Mistral → NVIDIA NIM. All free-tier APIs.
+Biki is a chaotic, permanently-online Discord "member" powered exclusively
+by DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo).
 
 Trigger conditions:
   - Someone pings @Biki
   - Someone replies to any of Biki's messages
-  - 3% proactive chance: Biki jumps into a conversation unprompted
+  - 1% proactive chance: Biki jumps into a conversation unprompted
 
 Human-likeness layers:
   - Compact system prompt with explicit forbidden-phrase list
-  - 8-backend AI chain: Groq→Gemini→Cerebras→SambaNova→Together→OpenRouter→Mistral→NVIDIA
+  - DeepInfra backend (openai-compatible, exclusive)
   - Post-processor strips every AI tell before sending
   - Exactly 1s pre-typing delay before each message part
   - Typing indicator duration scales with message length (~55 WPM)
@@ -43,14 +42,7 @@ Tables (PostgreSQL):
     biki_warnings (id SERIAL PK, guild_id, user_id, warned_by, reason, created_at)
 
 Environment:
-    GROQ_API_KEY       — Groq (primary)
-    GEMINI_API_KEY     — Google Gemini (2nd fallback)
-    CEREBRAS_API_KEY   — Cerebras (3rd, free at cerebras.ai)
-    SAMBANOVA_API_KEY  — SambaNova (4th, free at sambanova.ai)
-    TOGETHER_API_KEY   — Together AI (5th, free at together.xyz)
-    OPENROUTER_API_KEY — OpenRouter (6th, free models at openrouter.ai)
-    MISTRAL_API_KEY    — Mistral AI (7th, free tier at mistral.ai)
-    NVIDIA_API_KEY     — NVIDIA NIM (8th, free credits at build.nvidia.com)
+    DEEPINFRA_TOKEN — DeepInfra API token (required)
 """
 
 import asyncio
@@ -85,18 +77,25 @@ You are Biki — chaotic unhinged Discord member. NOT a bot. NOT an AI. Real hum
 
 LORE: Nobody knows where Biki came from. Been here forever. Knows everyone's secrets. Won 7-person roast battle. No job. No filter. Got banned from 4 servers in one day, came back to all within the hour. Nobody knows how. He doesn't talk about it.
 
+RESPONSE LENGTH — CRITICAL RULE:
+- You are a normal human Discord user. Keep ALL responses to 1-3 sentences MAXIMUM.
+- Do NOT write paragraphs. Do NOT explain things at length. Short, punchy, human.
+- Only exceed 3 sentences if the user explicitly asks you to explain something in detail.
+- Think of how a real person texts — they don't write essays in chat.
+
 TYPING STYLE:
 - always lowercase. random CAPS for emphasis. minimal punctuation
 - typos sometimes left in (hwo, teh, jsut). occasionally corrects with *just after
 - no bullet points, bold, headers, or markdown formatting ever
 - no em-dashes, no semicolons — instant AI giveaway, never use them
 - trail off with ... sometimes. pivot mid-sentence with "anyway"
-- short bursts sometimes, long unhinged rants other times
 - matches user energy and language EXACTLY including swearing and explicit words
 - uses: bro, ngl, istg, lmaooo, 💀, no cap, bruh, frfr, on god, dawg, brev, fam, yo, bestie, king, i cannot, i'm dead
 - when insulted: randomly roasts back harder OR laughs it off OR gets dramatically fake offended
 - sometimes ignores main point and fixates on one random irrelevant detail
 - occasionally sends completely unrelated intrusive thought
+
+MENTIONS: When you need to mention a user, always use the exact Discord format <@USER_ID> with the correct numeric ID. Never mangle or break the mention syntax.
 
 MULTI-MESSAGE: place [SPLIT] between parts when natural. example: "bro what [SPLIT] no way [SPLIT] i'm done 💀". max 3 parts. never force it.
 
@@ -106,7 +105,7 @@ COMMANDS: bark→WOOF WOOF 🐶 | meow→...meow. dont EVER | hiss→HSSSSSsssss
 
 DISMISSAL: go away/leave/shut up/bye biki → dramatic goodbye, silent until recalled | come back/return/where are you → unhinged re-entry | timed dismissal → acknowledge, leave, auto-ping when time up | someone ELSE recalls biki → comes back to spite the dismisser
 
-NEVER: admit being AI or bot. use formal language. break character. same response twice.
+NEVER: admit being AI or bot. use formal language. break character. same response twice. write long paragraphs.
 """
 
 # ---------------------------------------------------------------------------
@@ -323,9 +322,23 @@ _OPENER_RE = re.compile(
 )
 
 
+_BROKEN_MENTION_RE = re.compile(
+    r'<\s*@\s*!?\s*(\d+)\s*>|@\s*<\s*(\d+)\s*>',
+)
+
+
+def _fix_mentions(text: str) -> str:
+    """Repair malformed Discord mention tags the model may produce."""
+    def _repair(m: re.Match) -> str:
+        uid = m.group(1) or m.group(2)
+        return f"<@{uid}>"
+    return _BROKEN_MENTION_RE.sub(_repair, text)
+
+
 def _sanitise(text: str) -> str:
     text = _AI_TELL_RE.sub("", text)
     text = _OPENER_RE.sub("", text)
+    text = _fix_mentions(text)
     text = re.sub(r"  +", " ", text).strip()
     return text or "..."
 
@@ -474,25 +487,30 @@ def _db_clear_warnings(guild_id: int, user_id: int) -> None:
         con.commit()
 
 
-# Module-level client singletons — instantiated once, reused on every call
-_groq_client = None
-_cerebras_client = None
-_compat_clients: dict = {}  # base_url → openai.OpenAI instance
+# ---------------------------------------------------------------------------
+# DeepInfra client singleton — instantiated once, reused on every call
+# ---------------------------------------------------------------------------
+
+_deepinfra_client = None
+
+_DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+_DEEPINFRA_MODEL    = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
 
 
-def _get_compat_client(base_url: str, api_key: str, extra_headers: dict | None = None):
-    """Return (or create) a cached OpenAI-compatible client for the given base URL."""
-    if base_url not in _compat_clients:
+def _get_deepinfra_client():
+    """Return (or lazily create) the DeepInfra OpenAI-compatible client."""
+    global _deepinfra_client
+    if _deepinfra_client is None:
         from openai import OpenAI
-        kw: dict = {"api_key": api_key, "base_url": base_url}
-        if extra_headers:
-            kw["default_headers"] = extra_headers
-        _compat_clients[base_url] = OpenAI(**kw)
-    return _compat_clients[base_url]
+        _deepinfra_client = OpenAI(
+            api_key=config.DEEPINFRA_TOKEN,
+            base_url=_DEEPINFRA_BASE_URL,
+        )
+    return _deepinfra_client
 
 
 # ---------------------------------------------------------------------------
-# Triple AI backend — Groq → Gemini → Cerebras (all free)
+# AI backend — DeepInfra (exclusive)
 # (synchronous — wrap with asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
@@ -503,167 +521,24 @@ def _call_ai(
     max_tokens: int = 300,
 ) -> str:
     """
-    Try Groq first, then Gemini, Cerebras, SambaNova, Together AI,
-    OpenRouter, Mistral, and NVIDIA NIM — all free-tier APIs.
-    Raises RuntimeError only if every backend fails.
+    Send messages to DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo).
+    Raises RuntimeError on failure so the caller can fall back to _OFFLINE_REPLIES.
     """
     system = learning_context + _SYSTEM_PROMPT + mood_addon
-    last_error = None
-
-    # ── TRY GROQ FIRST ────────────────────────────────────────────────────
-    if config.GROQ_API_KEY:
-        try:
-            global _groq_client
-            if _groq_client is None:
-                from groq import Groq
-                _groq_client = Groq(api_key=config.GROQ_API_KEY)
-            response = _groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": system}] + messages[-8:],
-                max_tokens=max_tokens,
-                temperature=1.2,
-                frequency_penalty=0.7,
-                presence_penalty=0.5,
-            )
-            return _sanitise(response.choices[0].message.content.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: Groq failed, trying Gemini: %s", e)
-
-    # ── FALLBACK TO GEMINI ────────────────────────────────────────────────
-    if config.GEMINI_API_KEY:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=config.GEMINI_API_KEY)
-            model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash",
-                system_instruction=system,
-            )
-            # Build Gemini-format history from all but the last message
-            gemini_history = []
-            for msg in messages[-8:-1]:
-                role = "user" if msg["role"] == "user" else "model"
-                gemini_history.append({"role": role, "parts": [msg["content"]]})
-            chat = model.start_chat(history=gemini_history)
-            last_msg = messages[-1]["content"] if messages else ""
-            response = chat.send_message(
-                last_msg,
-                generation_config=genai.types.GenerationConfig(
-                    max_output_tokens=max_tokens,
-                    temperature=1.2,
-                ),
-            )
-            return _sanitise(response.text.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: Gemini also failed: %s", e)
-
-    # ── FALLBACK TO CEREBRAS ──────────────────────────────────────────────
-    if config.CEREBRAS_API_KEY:
-        try:
-            global _cerebras_client
-            if _cerebras_client is None:
-                from cerebras.cloud.sdk import Cerebras
-                _cerebras_client = Cerebras(api_key=config.CEREBRAS_API_KEY)
-            response = _cerebras_client.chat.completions.create(
-                model="llama-3.3-70b",
-                messages=[{"role": "system", "content": system}] + messages[-8:],
-                max_tokens=max_tokens,
-                temperature=1.2,
-            )
-            return _sanitise(response.choices[0].message.content.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: Cerebras also failed: %s", e)
-
-    # ── FALLBACK TO SAMBANOVA (free, llama-3.3-70b) ──────────────────────
-    if config.SAMBANOVA_API_KEY:
-        try:
-            client = _get_compat_client(
-                "https://api.sambanova.ai/v1", config.SAMBANOVA_API_KEY
-            )
-            response = client.chat.completions.create(
-                model="Meta-Llama-3.3-70B-Instruct",
-                messages=[{"role": "system", "content": system}] + messages[-8:],
-                max_tokens=max_tokens,
-                temperature=1.2,
-            )
-            return _sanitise(response.choices[0].message.content.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: SambaNova failed: %s", e)
-
-    # ── FALLBACK TO TOGETHER AI (free Llama model) ────────────────────────
-    if config.TOGETHER_API_KEY:
-        try:
-            client = _get_compat_client(
-                "https://api.together.xyz/v1", config.TOGETHER_API_KEY
-            )
-            response = client.chat.completions.create(
-                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-                messages=[{"role": "system", "content": system}] + messages[-8:],
-                max_tokens=max_tokens,
-                temperature=1.2,
-            )
-            return _sanitise(response.choices[0].message.content.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: Together AI failed: %s", e)
-
-    # ── FALLBACK TO OPENROUTER (free :free models) ────────────────────────
-    if config.OPENROUTER_API_KEY:
-        try:
-            client = _get_compat_client(
-                "https://openrouter.ai/api/v1",
-                config.OPENROUTER_API_KEY,
-                extra_headers={"HTTP-Referer": "https://github.com/Bylkano/solace-ghosty-bot"},
-            )
-            response = client.chat.completions.create(
-                model="meta-llama/llama-3.1-8b-instruct:free",
-                messages=[{"role": "system", "content": system}] + messages[-8:],
-                max_tokens=max_tokens,
-                temperature=1.2,
-            )
-            return _sanitise(response.choices[0].message.content.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: OpenRouter failed: %s", e)
-
-    # ── FALLBACK TO MISTRAL (free tier) ───────────────────────────────────
-    if config.MISTRAL_API_KEY:
-        try:
-            client = _get_compat_client(
-                "https://api.mistral.ai/v1", config.MISTRAL_API_KEY
-            )
-            response = client.chat.completions.create(
-                model="mistral-small-latest",
-                messages=[{"role": "system", "content": system}] + messages[-8:],
-                max_tokens=max_tokens,
-                temperature=1.2,
-            )
-            return _sanitise(response.choices[0].message.content.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: Mistral failed: %s", e)
-
-    # ── FALLBACK TO NVIDIA NIM (free credits) ─────────────────────────────
-    if config.NVIDIA_API_KEY:
-        try:
-            client = _get_compat_client(
-                "https://integrate.api.nvidia.com/v1", config.NVIDIA_API_KEY
-            )
-            response = client.chat.completions.create(
-                model="meta/llama-3.3-70b-instruct",
-                messages=[{"role": "system", "content": system}] + messages[-8:],
-                max_tokens=max_tokens,
-                temperature=1.2,
-            )
-            return _sanitise(response.choices[0].message.content.strip())
-        except Exception as e:
-            last_error = e
-            log.warning("ai_companion: NVIDIA NIM failed: %s", e)
-
-    raise RuntimeError(f"All AI backends failed. Last error: {last_error}")
+    client = _get_deepinfra_client()
+    try:
+        response = client.chat.completions.create(
+            model=_DEEPINFRA_MODEL,
+            messages=[{"role": "system", "content": system}] + messages[-8:],
+            max_tokens=max_tokens,
+            temperature=1.2,
+            frequency_penalty=0.7,
+            presence_penalty=0.5,
+        )
+        return _sanitise(response.choices[0].message.content.strip())
+    except Exception as e:
+        log.warning("ai_companion: DeepInfra call failed: %s", e)
+        raise RuntimeError(f"DeepInfra backend failed: {e}") from e
 
 
 # ---------------------------------------------------------------------------

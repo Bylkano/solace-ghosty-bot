@@ -13,16 +13,8 @@ DEV_GUILD_ID: int | None = int(guild_id) if (guild_id := os.getenv("DEV_GUILD_ID
 # Database
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
-# AI backends — 8-backend fallback chain (all free)
-# Priority: Groq → Gemini → Cerebras → SambaNova → Together → OpenRouter → Mistral → NVIDIA
-GROQ_API_KEY: str      = os.getenv("GROQ_API_KEY", "")
-GEMINI_API_KEY: str    = os.getenv("GEMINI_API_KEY", "")
-CEREBRAS_API_KEY: str  = os.getenv("CEREBRAS_API_KEY", "")
-SAMBANOVA_API_KEY: str = os.getenv("SAMBANOVA_API_KEY", "")
-TOGETHER_API_KEY: str  = os.getenv("TOGETHER_API_KEY", "")
-OPENROUTER_API_KEY: str= os.getenv("OPENROUTER_API_KEY", "")
-MISTRAL_API_KEY: str   = os.getenv("MISTRAL_API_KEY", "")
-NVIDIA_API_KEY: str    = os.getenv("NVIDIA_API_KEY", "")
+# AI backend — DeepInfra (exclusive)
+DEEPINFRA_TOKEN: str = os.getenv("DEEPINFRA_TOKEN", "")
 
 if not BOT_TOKEN:
     raise ValueError(

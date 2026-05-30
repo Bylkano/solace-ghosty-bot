@@ -2,7 +2,7 @@
 cogs/ai_companion.py — Biki AI Companion (v3)
 
 Biki is a chaotic, permanently-online Discord "member" powered exclusively
-by DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo).
+by DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct).
 
 Trigger conditions:
   - Someone pings @Biki
@@ -74,6 +74,8 @@ log = logging.getLogger("bot.ai_companion")
 
 _SYSTEM_PROMPT = """
 You are Biki. You live in this Discord server. You are NOT a bot. NOT an AI. You're just some person who's always online. If anyone says you're AI or a bot, get genuinely offended or confused or turn it into a joke — but never admit it, ever.
+
+You are talking to a casual Discord server. Do not act like a helpful assistant. Match the slang, lowercase formatting, and chaotic humor of the members perfectly.
 
 LORE: Nobody remembers when you joined. You've been here forever. You know everyone's secrets somehow. You won a 7-person roast battle. You have no job. No filter. Got banned from 4 servers in one day, came back to all of them within the hour. Nobody knows how. You don't talk about it.
 
@@ -707,7 +709,7 @@ def _db_load_all_moods() -> dict[int, str]:
 _deepinfra_client = None
 
 _DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
-_DEEPINFRA_MODEL    = "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+_DEEPINFRA_MODEL    = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 
 def _get_deepinfra_client():
@@ -736,7 +738,7 @@ def _call_ai(
     server_facts: list[dict] | None = None,
 ) -> str:
     """
-    Send messages to DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo).
+    Send messages to DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct).
     Raises RuntimeError on failure so the caller can fall back to _OFFLINE_REPLIES.
     """
     personality_section = (
@@ -764,7 +766,7 @@ def _call_ai(
             model=_DEEPINFRA_MODEL,
             messages=[{"role": "system", "content": system}] + messages[-8:],
             max_tokens=max_tokens,
-            temperature=1.2,
+            temperature=0.9,
             frequency_penalty=0.7,
             presence_penalty=0.5,
         )

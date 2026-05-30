@@ -2,6 +2,12 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
+#delete
+import sys
+print("=== CONFIG DEBUG ===", file=sys.stderr)
+print(f"GROQ_API_KEY found: {bool(os.getenv('GROQ_API_KEY'))}", file=sys.stderr)
+print(f"GROQ_API_KEY value: {os.getenv('GROQ_API_KEY', 'NOT FOUND')[:10]}...", file=sys.stderr)
+print("===================", file=sys.stderr) #delete
 
 # Accepts DISCORD_TOKEN (standard for most hosting platforms) with a
 # fallback to BOT_TOKEN so existing Replit secret configs keep working.

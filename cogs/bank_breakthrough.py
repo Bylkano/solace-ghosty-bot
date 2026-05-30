@@ -235,6 +235,16 @@ def _db_get_coins(team: str) -> int:
             return row[0] if row else 0
 
 
+def _db_get_all_coins() -> list[tuple[str, int]]:
+    """Return [(team_name, coins), ...] sorted highest first."""
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "SELECT team_name, coins FROM breakthrough_coins ORDER BY coins DESC"
+            )
+            return [(row[0], row[1]) for row in cur.fetchall()]
+
+
 # ── Team membership DB ────────────────────────────────────────────────────────
 
 def _db_team_add(guild_id: int, user_id: int, team_name: str) -> None:
@@ -1417,6 +1427,33 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         else:
             em.description = f"```\n{_render_grid(state)}\n```"
             await interaction.response.send_message(embed=em, ephemeral=True)
+
+
+    @app_commands.command(
+        name="breakthrough-leaderboard",
+        description="Show the all-time Heist Coin leaderboard for Bank Breakthrough.",
+    )
+    @app_commands.guild_only()
+    async def breakthrough_leaderboard(self, interaction: discord.Interaction) -> None:
+        rows = _db_get_all_coins()
+
+        em = discord.Embed(
+            title="🪙  Bank Breakthrough — Heist Coin Leaderboard",
+            colour=C_ITEM,
+        )
+
+        if not rows:
+            em.description = "_No coins earned yet. Start a match with `/breakthrough-setup`!_"
+        else:
+            MEDALS = ["🥇", "🥈", "🥉"]
+            lines = []
+            for i, (team, coins) in enumerate(rows):
+                medal = MEDALS[i] if i < len(MEDALS) else f"`#{i+1}`"
+                lines.append(f"{medal}  **{team.title()}** — **{coins:,}** 🪙")
+            em.description = "\n".join(lines)
+
+        em.set_footer(text="Bank Breakthrough  •  Coins earned from loot tiles & vault breaches only")
+        await interaction.response.send_message(embed=em)
 
 
 async def setup(bot: commands.Bot) -> None:

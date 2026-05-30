@@ -47,10 +47,9 @@ COGS = [
     "cogs.moderation",
     "cogs.events",
     "cogs.welcome",
-    "cogs.simon_says",
     "cogs.server_drops_economy",
     "cogs.auction",
-    "cogs.bank_breakthrough",
+    "cogs.ai_companion",
 ]
 
 

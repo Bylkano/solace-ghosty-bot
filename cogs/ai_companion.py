@@ -456,6 +456,16 @@ def _db_init() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS biki_server_facts (
+                    id         SERIAL PRIMARY KEY,
+                    guild_id   BIGINT NOT NULL,
+                    fact_text  TEXT NOT NULL,
+                    added_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
         con.commit()
 
 
@@ -586,6 +596,63 @@ def _db_load_all_personalities() -> dict[int, str]:
 
 
 # ---------------------------------------------------------------------------
+# Server facts DB helpers
+# ---------------------------------------------------------------------------
+
+def _db_add_fact(guild_id: int, fact_text: str) -> int:
+    """Insert a fact and return its new ID."""
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "INSERT INTO biki_server_facts (guild_id, fact_text) VALUES (%s, %s) RETURNING id",
+                (guild_id, fact_text),
+            )
+            row = cur.fetchone()
+        con.commit()
+    return row[0]
+
+
+def _db_get_facts(guild_id: int) -> list[dict]:
+    """Return all facts for a guild, ordered by id."""
+    with _db_connect() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, fact_text FROM biki_server_facts WHERE guild_id = %s ORDER BY id",
+                (guild_id,),
+            )
+            rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+def _db_delete_fact(fact_id: int, guild_id: int) -> bool:
+    """Delete a fact by id (scoped to guild for safety). Returns True if a row was deleted."""
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "DELETE FROM biki_server_facts WHERE id = %s AND guild_id = %s",
+                (fact_id, guild_id),
+            )
+            deleted = cur.rowcount > 0
+        con.commit()
+    return deleted
+
+
+def _db_load_all_facts() -> dict[int, list[dict]]:
+    """Load all facts for all guilds at startup."""
+    with _db_connect() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, guild_id, fact_text FROM biki_server_facts ORDER BY guild_id, id"
+            )
+            rows = cur.fetchall()
+    result: dict[int, list[dict]] = {}
+    for r in rows:
+        gid = int(r["guild_id"])
+        result.setdefault(gid, []).append({"id": r["id"], "fact_text": r["fact_text"]})
+    return result
+
+
+# ---------------------------------------------------------------------------
 # DeepInfra client singleton — instantiated once, reused on every call
 # ---------------------------------------------------------------------------
 
@@ -618,6 +685,7 @@ def _call_ai(
     learning_context: str = "",
     max_tokens: int = 300,
     personality_override: str = "",
+    server_facts: list[dict] | None = None,
 ) -> str:
     """
     Send messages to DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo).
@@ -630,7 +698,18 @@ def _call_ai(
         f"{personality_override}"
         if personality_override else ""
     )
-    system = learning_context + _SYSTEM_PROMPT + personality_section + mood_addon
+    facts_section = ""
+    if server_facts:
+        facts_lines = "\n".join(f"- {f['fact_text']}" for f in server_facts)
+        facts_section = (
+            f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"THINGS BIKI KNOWS ABOUT THIS SERVER\n"
+            f"(treat these as undeniable facts — weave them naturally into conversation, "
+            f"don't announce them unprompted but reference them when relevant)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{facts_lines}"
+        )
+    system = learning_context + _SYSTEM_PROMPT + personality_section + facts_section + mood_addon
     client = _get_deepinfra_client()
     try:
         response = client.chat.completions.create(
@@ -819,6 +898,9 @@ class AiCompanion(commands.Cog):
         # guild_id → True if Biki is silenced (won't respond to anyone)
         self.guild_silenced: dict[int, bool] = {}
 
+        # guild_id → list of {id, fact_text} dicts (loaded from DB, editable via /bikiremember)
+        self.guild_facts: dict[int, list[dict]] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -828,11 +910,13 @@ class AiCompanion(commands.Cog):
             await asyncio.to_thread(_db_init)
             self.allowed_channels = await asyncio.to_thread(_db_load_all)
             self.guild_personalities = await asyncio.to_thread(_db_load_all_personalities)
+            self.guild_facts = await asyncio.to_thread(_db_load_all_facts)
             log.info(
                 "ai_companion: loaded allowed channels for %d guild(s), "
-                "personalities for %d guild(s)",
+                "personalities for %d guild(s), facts for %d guild(s)",
                 len(self.allowed_channels),
                 len(self.guild_personalities),
+                len(self.guild_facts),
             )
         except Exception as exc:
             log.error("ai_companion: DB init/load failed: %s", exc)
@@ -900,6 +984,7 @@ class AiCompanion(commands.Cog):
         history.append({"role": "user", "content": input_content})
 
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
+        facts = self.guild_facts.get(guild_id, []) if guild_id else []
         reply = await asyncio.to_thread(
             _call_ai,
             history,
@@ -907,6 +992,7 @@ class AiCompanion(commands.Cog):
             self._learning_context(guild_id),
             max_tokens,
             personality,
+            facts or None,
         )
 
         self._append_history(user_id, "user", user_text)
@@ -1023,6 +1109,7 @@ class AiCompanion(commands.Cog):
         guild_id = message.guild.id if message.guild else None
 
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
+        facts = self.guild_facts.get(guild_id, []) if guild_id else []
         try:
             await asyncio.sleep(random.uniform(1.0, 3.0))
             async with message.channel.typing():
@@ -1033,6 +1120,7 @@ class AiCompanion(commands.Cog):
                     self._learning_context(guild_id),
                     120,  # max_tokens — short and punchy
                     personality,
+                    facts or None,
                 )
             if response:
                 await message.reply(response, mention_author=False)
@@ -1936,6 +2024,99 @@ class AiCompanion(commands.Cog):
                 "🔊 Biki is **back**. good luck with that.",
                 ephemeral=False,
             )
+
+
+    # ------------------------------------------------------------------
+    # /bikiremember — inject a permanent fact Biki will always know
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="bikiremember",
+        description="Tell Biki something to always remember about this server.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikiremember(
+        self, interaction: discord.Interaction, fact: str
+    ) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+        try:
+            fact_id = await asyncio.to_thread(_db_add_fact, interaction.guild_id, fact)
+            self.guild_facts.setdefault(interaction.guild_id, []).append(
+                {"id": fact_id, "fact_text": fact}
+            )
+        except Exception as exc:
+            log.error("bikiremember: DB error: %s", exc)
+            await interaction.followup.send(
+                f"❌ Failed to save fact: `{exc}`", ephemeral=True
+            )
+            return
+        total = len(self.guild_facts.get(interaction.guild_id, []))
+        await interaction.followup.send(
+            f"✅ Got it. Biki will remember: **{fact}**\n"
+            f"*(fact #{fact_id} — {total} total for this server)*",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="bikiforget",
+        description="Delete a fact Biki knows about this server.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikiforget(
+        self, interaction: discord.Interaction, fact_id: int
+    ) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+        try:
+            deleted = await asyncio.to_thread(_db_delete_fact, fact_id, interaction.guild_id)
+        except Exception as exc:
+            log.error("bikiforget: DB error: %s", exc)
+            await interaction.followup.send(
+                f"❌ Failed to delete fact: `{exc}`", ephemeral=True
+            )
+            return
+        if not deleted:
+            await interaction.followup.send(
+                f"❌ No fact with ID `{fact_id}` found for this server.", ephemeral=True
+            )
+            return
+        # Remove from in-memory list
+        guild_fact_list = self.guild_facts.get(interaction.guild_id, [])
+        self.guild_facts[interaction.guild_id] = [
+            f for f in guild_fact_list if f["id"] != fact_id
+        ]
+        await interaction.followup.send(
+            f"✅ Fact `#{fact_id}` deleted. Biki has forgotten it.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="bikifacts",
+        description="List everything Biki currently remembers about this server.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikifacts(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        facts = self.guild_facts.get(interaction.guild_id, [])
+        if not facts:
+            await interaction.response.send_message(
+                "Biki doesn't remember anything specific about this server yet. "
+                "Use `/bikiremember` to add facts.",
+                ephemeral=True,
+            )
+            return
+        lines = [f"`#{f['id']}` — {f['fact_text']}" for f in facts]
+        body = "\n".join(lines)
+        if len(body) > 1900:
+            body = body[:1900] + f"\n... *(showing first entries, {len(facts)} total)*"
+        await interaction.response.send_message(
+            f"**Things Biki knows about this server ({len(facts)} facts):**\n{body}\n\n"
+            f"Use `/bikiforget <id>` to remove one.",
+            ephemeral=True,
+        )
 
 
 async def setup(bot: commands.Bot) -> None:

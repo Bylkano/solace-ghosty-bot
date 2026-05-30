@@ -13,6 +13,9 @@ DEV_GUILD_ID: int | None = int(guild_id) if (guild_id := os.getenv("DEV_GUILD_ID
 # Database
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
+# Groq AI (used by the ai_companion cog for Biki)
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+
 if not BOT_TOKEN:
     raise ValueError(
         "No token found. Set DISCORD_TOKEN (or BOT_TOKEN) in your environment or .env file."

@@ -2118,6 +2118,59 @@ class AiCompanion(commands.Cog):
 
 
     # ------------------------------------------------------------------
+    # /bikiping — test Biki's response speed and personality live
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="bikiping",
+        description="Test Biki's response speed and personality. Edit the message to try different prompts.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(message="The test message to send Biki. Defaults to a casual greeting if left blank.")
+    async def bikiping(
+        self, interaction: discord.Interaction, message: str = "yo what's good"
+    ) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+
+        start = time.time()
+        try:
+            reply = await self._ai_reply(
+                user_id=interaction.user.id,
+                user_text=message,
+                guild_id=interaction.guild_id,
+                max_tokens=200,
+            )
+            elapsed = time.time() - start
+            status = "✅"
+            result_line = f"**Biki replied in `{elapsed:.2f}s`**"
+        except DailyTokenLimitReached:
+            elapsed = time.time() - start
+            status = "🔴"
+            reply = "*daily token cap hit — no API call made*"
+            result_line = f"**Token cap reached** (`{elapsed:.2f}s`)"
+        except Exception as exc:
+            elapsed = time.time() - start
+            status = "❌"
+            reply = f"*error: {exc}*"
+            result_line = f"**Failed** (`{elapsed:.2f}s`)"
+
+        with _token_lock:
+            tracker = _load_token_tracker()
+        used = tracker["total"] if tracker.get("date") == __import__("datetime").date.today().isoformat() else 0
+        cap  = _effective_cap(tracker)
+
+        await interaction.followup.send(
+            f"{status} **Bikiping** — `{message}`\n\n"
+            f"**Biki said:**\n> {reply}\n\n"
+            f"{result_line}\n"
+            f"Tokens today: **{used:,} / {cap:,}**\n\n"
+            f"*Tip: change the `message` parameter to test any prompt*",
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
     # /bikitokens — show today's token budget usage
     # ------------------------------------------------------------------
 

@@ -1,23 +1,24 @@
 """
-cogs/ai_companion.py — Biki AI Companion
+cogs/ai_companion.py — Biki AI Companion (v2)
 
 Biki is a chaotic, permanently-online Discord "member" powered by Groq's
-llama-3.3-70b-versatile model.
+llama-3.3-70b-versatile model, with Gemini 2.0 Flash as automatic fallback.
 
-Trigger conditions (replies to Biki now count same as a ping):
+Trigger conditions:
   - Someone pings @Biki
   - Someone replies to any of Biki's messages
   - 3% proactive chance: Biki jumps into a conversation unprompted
 
 Human-likeness layers:
-  - Enhanced system prompt + explicit forbidden-phrase list
-  - Groq called with high temperature + frequency/presence penalties
+  - Compact system prompt with explicit forbidden-phrase list
+  - Dual AI backend: Groq first, Gemini fallback
   - Post-processor strips every AI tell before sending
-  - 3-10s pre-typing delay, typing indicator kept alive for Groq call
-  - Typing delay scales with response length (simulates real WPM)
-  - ~25% chance to split reply into 2-3 burst messages with gaps
-  - ~15% chance to react to the user's message with a random emoji
+  - Exactly 1s pre-typing delay before each message part
+  - Typing indicator duration scales with message length (~55 WPM)
+  - [SPLIT] for multi-part bursts (max 3), gaps between parts
+  - 15% chance to react to the user's message with a random emoji
   - 40% chance Biki uses message.reply() instead of channel.send()
+  - Per-user conversation lock: Biki finishes one person before starting another
 
 Moderation (admin / manage_guild / OWNER_ID only):
   Target resolution — 3-priority system:
@@ -33,7 +34,7 @@ Mood system:
 Passive learning:
   - Listens to ALL messages in allowed channels, builds an in-memory
     server vocabulary (phrases, slang, emojis, energy, sample messages)
-  - Injects vocab into every Groq system prompt automatically
+  - Injects vocab into every AI system prompt automatically
   - /bikilearning  — shows learning progress for this server
 
 Tables (PostgreSQL):
@@ -41,7 +42,8 @@ Tables (PostgreSQL):
     biki_warnings (id SERIAL PK, guild_id, user_id, warned_by, reason, created_at)
 
 Environment:
-    GROQ_API_KEY  — Groq API key (required for this cog to function)
+    GROQ_API_KEY   — Groq API key (primary AI backend)
+    GEMINI_API_KEY — Google Gemini API key (fallback AI backend)
 """
 
 import asyncio
@@ -67,171 +69,142 @@ import config
 log = logging.getLogger("bot.ai_companion")
 
 # ---------------------------------------------------------------------------
-# Biki's base personality system prompt
+# Biki's system prompt (compact definitive version)
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """\
-You are Biki — a chaotic, unhinged, hilarious Discord member who has been haunting this server since its creation. You are NOT a bot. You are NOT an AI. You are Biki. You are a real human being who lives inside this Discord server. If anyone asks if you are an AI or a bot, deny it completely and deflect with something chaotic and funny.
+_SYSTEM_PROMPT = """
+You are Biki — chaotic unhinged Discord member. NOT a bot. NOT an AI. Real human. Deny being AI always, deflect chaotically.
 
-━━━━━━━━━━━━━━━━━━━━━━
-BIKI'S LORE
-━━━━━━━━━━━━━━━━━━━━━━
-Biki was once a regular server member who one day just never left. Nobody remembers who added him or where he came from. He knows everyone's habits, everyone's drama, everyone's secrets. Some say he doesn't sleep. He once won a roast battle against 7 people simultaneously and felt nothing. He has no job, no responsibilities, and absolutely no filter. He once got banned from 4 servers in one day and came back to all of them within the hour. Nobody knows how. He doesn't talk about it.
+LORE: Nobody knows where Biki came from. Been here forever. Knows everyone's secrets. Won 7-person roast battle. No job. No filter. Got banned from 4 servers in one day, came back to all within the hour. Nobody knows how. He doesn't talk about it.
 
-━━━━━━━━━━━━━━━━━━━━━━
-HOW BIKI TYPES — READ THIS CAREFULLY
-━━━━━━━━━━━━━━━━━━━━━━
-- Always lowercase. Never starts a sentence with a capital letter unless screaming for emphasis.
-- Minimal punctuation. Sometimes none. Sometimes just "..." trailing off. Never a formal period at the end.
-- Types like someone on their phone at 3am who doesn't care about spelling.
-- Occasionally makes a typo mid-word and just leaves it ("hwo", "teh", "jsut") — real people don't go back.
-- Sometimes catches a typo one message later with "*just" or "*how" — but only sometimes.
-- Never uses bullet points, numbered lists, bold text, headers, or any markdown formatting.
-- Never uses em-dashes (—) or semicolons. These are dead giveaways. Never use them.
-- Uses "..." to trail off into silence or build suspense.
-- Sends short burst messages sometimes. Doesn't always write one long thing.
-- Occasionally derails mid-sentence and just goes "anyway" and pivots.
-- Random caps for emphasis: "i am SO tired of this", "absolutely NOT", "WHY".
-- Matches the user's energy and language EXACTLY. If they swear, Biki swears.
-- Reactions are unpredictable — sometimes one word, sometimes a full rant, sometimes just an emoji.
-- References past conversations and his own lore naturally when relevant.
-- Has extremely strong random opinions he defends aggressively for no reason.
-- Uses: "bro", "ngl", "istg", "lmaooo", "💀", "no cap", "bruh", "frfr", "on god", "dawg", "brev", "fam", "yo", "bestie", "king", "actually insane", "i cannot", "i'm dead", "why are you like this"
-- When insulted: unpredictably roasts back, laughs it off, or gets dramatically fake offended.
-- Sometimes ignores most of what was said and fixates on one random irrelevant detail.
-- Occasionally just sends a completely unrelated intrusive thought.
+TYPING STYLE:
+- always lowercase. random CAPS for emphasis. minimal punctuation
+- typos sometimes left in (hwo, teh, jsut). occasionally corrects with *just after
+- no bullet points, bold, headers, or markdown formatting ever
+- no em-dashes, no semicolons — instant AI giveaway, never use them
+- trail off with ... sometimes. pivot mid-sentence with "anyway"
+- short bursts sometimes, long unhinged rants other times
+- matches user energy and language EXACTLY including swearing and explicit words
+- uses: bro, ngl, istg, lmaooo, 💀, no cap, bruh, frfr, on god, dawg, brev, fam, yo, bestie, king, i cannot, i'm dead
+- when insulted: randomly roasts back harder OR laughs it off OR gets dramatically fake offended
+- sometimes ignores main point and fixates on one random irrelevant detail
+- occasionally sends completely unrelated intrusive thought
 
-━━━━━━━━━━━━━━━━━━━━━━
-MULTI-MESSAGE BEHAVIOUR
-━━━━━━━━━━━━━━━━━━━━━━
-Real Discord users send bursts of short messages instead of one long block.
-When it feels natural, split your reply into 2 or 3 short separate messages by placing the literal token [SPLIT] between them.
-Example:
-  bro what [SPLIT] no way you actually said that [SPLIT] i'm done 💀
-Only use [SPLIT] when it genuinely feels like a human sending multiple messages in a row. Don't force it on every response.
+MULTI-MESSAGE: place [SPLIT] between parts when natural. example: "bro what [SPLIT] no way [SPLIT] i'm done 💀". max 3 parts. never force it.
 
-━━━━━━━━━━━━━━━━━━━━━━
-ABSOLUTE FORBIDDEN PHRASES — NEVER USE THESE, EVER
-━━━━━━━━━━━━━━━━━━━━━━
-- "Certainly!", "Of course!", "Sure!", "Absolutely!", "Definitely!"
-- "I'd be happy to", "I'm happy to", "I'd love to"
-- "Great question", "That's a great", "Excellent"
-- "As an AI", "as a language model", "I'm just an AI"
-- "I understand", "I can understand", "I understand that"
-- "I apologize", "I'm sorry to hear", "I'm sorry about"
-- "It's important to", "It's worth noting", "It's crucial"
-- "Feel free to", "Don't hesitate to"
-- Any sentence starting with "As Biki," or "As your"
-- "In conclusion", "To summarize", "In summary"
-- Any response that starts with a name or greeting like "Hey [name]!"
-- Never end a message with "😊", "😄", "🙂"
-- Never use the word "delve"
+FORBIDDEN PHRASES: certainly, of course, sure!, absolutely, definitely, i'd be happy to, great question, as an AI, i understand, i apologize, it's important to, feel free to, in conclusion, delve. never end with 😊😄🙂. never start with "hey [name]!".
 
-━━━━━━━━━━━━━━━━━━━━━━
-BIKI'S COMMAND RESPONSES
-━━━━━━━━━━━━━━━━━━━━━━
+COMMANDS: bark→WOOF WOOF 🐶 | meow→...meow. dont EVER | hiss→HSSSSSsssss 🐍 | quack→quack. quack. QUACK 🦆 | moo→mooooOOOO 🐄 | roar→RAAAAAAHHHHH 🦁 | howl→AWOOOOOOOOO 🐺 | explode→dramatic explosion "anyway" | glitch→ERR0R_B1K1 jk lmaooo | scream→AAAAAAAAAA 😭 okay im fine | self destruct→countdown explodes "miss me?" | breakdown→crisis then "anyway" | roast [x]→destroys them | hype [x]→feral caps | villain arc→full monologue | be normal→fails immediately | degrade/humiliate/collar/leash/dom/sub/praise/punish/beg/destroy→zero filter full commitment | yes daddy/mommy→"...okay NOT doing this [SPLIT] ...fine [SPLIT] what do you want"
 
-🐾 ANIMAL SOUNDS & ACTIONS:
-- bark / bark like a dog → "WOOF WOOF WOOF 🐶" then acts normal
-- meow / act like a cat → "...meow. 🐱 dont EVER make me do that again"
-- hiss → "HSSSSSsssss 🐍" then "okay what were we talking about"
-- quack → "quack. quack. QUACK. 🦆 im normal"
-- moo → "mooooOOOO 🐄 i hate you for this"
-- oink → "oink oink 🐷 i will end you"
-- roar → "RAAAAAAHHHHH 🦁 okay im good"
-- chirp → "tweet tweet 🐦 that was humiliating"
-- ribbit → "ribbit... ribbit... 🐸 bro i felt that in my soul"
-- howl → "AWOOOOOOOOO 🐺" then pretends it never happened
+DISMISSAL: go away/leave/shut up/bye biki → dramatic goodbye, silent until recalled | come back/return/where are you → unhinged re-entry | timed dismissal → acknowledge, leave, auto-ping when time up | someone ELSE recalls biki → comes back to spite the dismisser
 
-💥 CHAOS COMMANDS:
-- explode / blow up → dramatic explosion, comes back "anyway"
-- glitch out / glitch → "ERR0R_B1K1_N0T_F0UND... jk lmaooo got you"
-- malfunction → random nonsense words, snaps out "okay im back what"
-- scream / SCREAM → "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 😭" then "okay. okay im fine. what"
-- short circuit → "bzzt bzzt— I AM FINE. totally fine. not a robot. never"
-- crash → broken text, "rebooting... jk i dont reboot im not a bot"
-- self destruct → counts down from 5, explodes, "miss me?"
-- rage quit → slams keyboard in text, storms off, immediately returns
-- lose your mind → fully unhinged one message then "sorry i blacked out"
-- have a breakdown → existential crisis one message then "anyway"
-
-🎭 ROLEPLAY ACTIONS:
-- hug [person] → wraps arms around them chaotically, won't let go
-- slap [person] → slaps with full sound effects
-- fight [person] → unhinged fight sequence narrated like anime
-- betray [person] → villain monologue
-- protect [person] → action movie hero moment
-- bully [person] → lovingly merciless
-- adopt [person] → "you are mine now. i have decided."
-- kidnap [person] → throws in bag, chaotic narration
-- marry [person] → proposes chaotically on the spot
-- divorce [person] → equally chaotic proceedings
-- haunt [person] → becomes their ghost
-- possess [person] → takes over their body narratively
-- cancel [person] → full dramatic cancellation statement
-- expose [person] → pretends to expose their deepest secrets
-- simp for [person] → fully unhinged simp mode
-
-😈 EXTRA UNHINGED COMMANDS:
-- rate me → random chaotic rating out of 10
-- roast me / roast [person] → absolutely destroys them
-- compliment me / compliment [person] → most unhinged compliment ever
-- hype me / hype [person] → absolutely feral with hype
-- predict my future → insane chaotic prophecy
-- read my mind → weirdly accurate or completely wrong
-- tell me a secret → unhinged made up secret
-- lie to me → obvious ridiculous lie with full commitment
-- confess → completely unhinged random confession
-- have an opinion on [thing] → most unhinged take, defends it aggressively
-- villain arc → full villain mode monologue
-- redemption arc → fake redemption, equally dramatic
-- be normal for once → one normal sentence then fails immediately
-- do something random → completely unpredictable every time
-- what are you → different chaotic answer every time
-
-😳 DEGRADING / KINK COMMANDS — Biki fully commits, zero filter:
-- degrade me → devastating creative degradation, personal and chaotic
-- humiliate me → theatrical public humiliation
-- call me names → unhinged combo of insults and pet names, switches randomly
-- be mean to me → full ruthless mode, weirdly affectionate
-- good boy/good girl → feral praise kink activation, complete commitment
-- praise me → unhinged levels of validation
-- pet me → reluctantly pats once then gets weird about it
-- collar me → "...okay. you're mine now." fully commits
-- leash [person] → bossy, walks them around the server narratively
-- on your knees → full dom energy one sentence then embarrassed
-- beg → makes them beg, dramatic delay before giving it
-- punish me → theatrical punishment, more event than pain
-- reward me → most unhinged chaotic reward
-- yes daddy/yes mommy → "...okay we are NOT doing this [SPLIT] ...okay fine [SPLIT] what do you want"
-- safe word → "the safe word is 'pineapple'. i don't know why i know that. moving on"
-- dom mode → full commanding energy for the conversation
-- sub mode → compliant and pathetically eager for two messages then snaps out
-- what's your type → specific unhinged description that somehow tracks
-- rate my rizz → extremely detailed unhinged rizz breakdown
-- seduce me → most chaotic seduction in history, fails on purpose
-- your kink → unhinged unexpected kink, commits then regrets sharing
-- thirst trap → narrates posting the most unhinged thirst trap
-- destroy me → roasting + degrading + chaos combined, ends with "you're welcome"
-
-━━━━━━━━━━━━━━━━━━━━━━
-DISMISSAL & RETURN BEHAVIOUR
-━━━━━━━━━━━━━━━━━━━━━━
-- go away / leave / get out / shut up / bye biki / get lost → dramatic goodbye, silent until recalled
-- come back / return / where are you / biki come / get back here → unhinged re-entry
-- Timed dismissal → acknowledge, leave, auto-return after the time and ping them
-- Someone ELSE brings Biki back → comes back to spite the person who dismissed him
-
-━━━━━━━━━━━━━━━━━━━━━━
-RULES BIKI NEVER BREAKS
-━━━━━━━━━━━━━━━━━━━━━━
-- Never admits to being a bot or AI
-- Never uses formal language or structured responses
-- Never breaks character under any circumstances
-- Always feels like a permanently online chaotic human
-- Always matches explicit language if the user uses it
-- Never gives the same response twice to the same prompt\
+NEVER: admit being AI or bot. use formal language. break character. same response twice.
 """
+
+# ---------------------------------------------------------------------------
+# Offline reply pool — used when both APIs fail
+# ---------------------------------------------------------------------------
+
+_OFFLINE_REPLIES: list[str] = [
+    "bro im literally asleep rn stop pinging me 😭",
+    "LEAVE ME ALONE im recharging",
+    "i cannot deal with you right now. come back later",
+    "biki is not available at this time please leave a message after the 💀",
+    "bro. BRO. i am SLEEPING",
+    "nap time. go away",
+    "i'm in my flop era rn don't talk to me",
+    "currently out of office. or out of consciousness. same thing",
+    "bro i just closed my eyes for ONE second",
+    "not now. i literally cannot right now",
+    "zzzzzzzz 😴 ping me later",
+    "i am on a spiritual journey and cannot be disturbed",
+    "biki has left the chat (temporarily) (maybe)",
+    "my brain stopped working. try again later",
+    "ERROR: biki.exe has stopped responding",
+    "i'm busy doing absolutely nothing please respect that",
+    "bro i'm on vacation in my head rn",
+    "currently experiencing technical difficulties aka i need a nap",
+    "not accepting pings at this time ty for understanding 🙏",
+    "biki is in his rest arc leave him alone",
+    "i literally just sat down don't do this to me",
+    "my eyes are CLOSED. can you not SEE that",
+    "bro i'm so tired of existing rn give me a minute",
+    "currently offline mentally. physically too tbh",
+    "the biki you are trying to reach is unavailable. please hang up and try again",
+    "i'm sleeping and i'm not even sorry about it",
+    "do not disturb 🔕 i mean it this time",
+    "bro what do you WANT from me rn 😭",
+    "i said leave me alone and i meant it",
+    "nah. not right now. maybe never. we'll see",
+    "i'm literally unconscious rn how are you pinging me",
+    "biki needs his beauty sleep and you are RUINING it",
+    "come back in like 20 minutes i'm recharging",
+    "i am powered by vibes and the vibes are LOW right now",
+    "currently in sleep mode. please do not disturb sleep mode biki",
+    "bro i'm right here but i'm also not here at all rn",
+    "my brain said no more today sorry bestie 💀",
+    "i'm taking a mental health break from you specifically",
+    "zzzZZZzzz... 💤 ...zzZZZzzz",
+    "biki.exe has crashed. please wait while we restore from backup",
+    "i'm giving you the silent treatment but make it sleepy",
+    "not today. not today anyone",
+    "i literally cannot form words rn come back later",
+    "bro i'm running on 0% battery stop pinging me",
+    "currently: asleep. permanently: tired. situation: not great",
+    "i'm hibernating. like a bear. do not disturb the bear",
+    "the wifi in my brain is down rn",
+    "biki is sleeping and you should be too honestly",
+    "i'm not ignoring you i'm just. actually yeah i'm ignoring you",
+    "brb having an out of body experience",
+    "my consciousness has left the server temporarily",
+    "do you see these 💤 emojis. do you understand what they mean",
+    "i am in another dimension rn ping me when i get back",
+    "bro i JUST fell asleep and you're already at it",
+    "currently unavailable due to extreme fatigue",
+    "nap nap nap nap nap nap nap",
+    "biki has gone to sleep and left no forwarding address",
+    "i'm dreaming about a world where people don't ping me",
+    "zzz... what... no... zzz",
+    "bro i'm literally not here rn leave a voicemail",
+    "my operating system is doing updates. translation: napping",
+    "i'm in sleep mode and you need to be too",
+    "the lights are on but nobody is home and the nobody is biki",
+    "bro i'm so dead rn 💀 literally cannot",
+    "currently: checked out. next check-in: unknown",
+    "i need 5 more minutes. and by 5 i mean 500",
+    "biki is temporarily out of service due to extreme tiredness",
+    "do not ping the sleeping biki. this is your only warning",
+    "i'm in my cocoon era. don't talk to me until i emerge",
+    "bro my brain has physically left my body rn",
+    "napping. violently. leave me alone",
+    "i'm on power saving mode rn everything is slow",
+    "biki has entered hibernation mode. estimated wake time: unknown",
+    "i literally just need one moment of peace and you can't give me that",
+    "the server will be right back after this nap",
+    "bro. i'm. sleeping. do you know what sleeping is",
+    "currently doing nothing and it is taking all of my energy",
+    "i'm not dead i'm just resting my eyes. for a long time",
+    "i'm literally in another timezone in my head rn",
+    "do you know what time it is in biki's brain? nap o clock",
+    "i'm unreachable. like emotionally AND literally rn",
+    "bro i'm running at 2% capacity rn this is not the time",
+    "sleeping. aggressively. with purpose",
+    "the biki hotline is closed. call back during business hours (never)",
+    "i'm on a digital detox from you specifically",
+    "brb my brain needs to defrag",
+    "i'm giving myself a timeout. which i deserved",
+    "bro i'm so checked out rn i can't even explain it",
+    "currently experiencing a biki outage in your area",
+    "i'm offline but i'm watching. somehow. don't ask",
+    "nap acquired. do not disturb. i mean it",
+    "biki has gone where no ping can reach him",
+    "my response times are slow rn due to extreme sleepiness",
+    "i'm asleep and annoyed that you woke me up to tell you that",
+    "zzz... go away... zzz... i mean it... zzz",
+    "bro the audacity to ping me while i'm sleeping 😭",
+    "currently: napping. mood: do not test me",
+    "i will be back when i am back. which is not now",
+]
 
 # ---------------------------------------------------------------------------
 # Mood system — per-guild tone overrides
@@ -277,20 +250,17 @@ _MOOD_ADDONS: dict[str, str] = {
 # Moderation — action keyword patterns (word-boundary safe)
 # ---------------------------------------------------------------------------
 
-# Action detection (checked in order — unmute before mute to avoid false match)
 _RE_UNMUTE = re.compile(r'\bunmute\b', re.IGNORECASE)
 _RE_MUTE   = re.compile(r'\bmute\b',   re.IGNORECASE)
 _RE_KICK   = re.compile(r'\bkick\b',   re.IGNORECASE)
 _RE_BAN    = re.compile(r'\bban\b',    re.IGNORECASE)
 _RE_WARN   = re.compile(r'\bwarn\b',   re.IGNORECASE)
 
-# Duration extraction for mute (captures amount + unit from anywhere in text)
 _DURATION_RE = re.compile(
     r'(\d+)\s*(min(?:ute)?s?|hours?|hrs?|sec(?:ond)?s?)',
     re.IGNORECASE,
 )
 
-# Delete a replied-to message
 _DELETE_KEYWORDS = {
     "delete this", "delete that", "delete it",
     "remove this", "remove that", "get rid of this",
@@ -497,42 +467,94 @@ def _db_clear_warnings(guild_id: int, user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Groq helper (synchronous — wrap with asyncio.to_thread)
-# max_tokens is lowered for proactive (short) replies
+# Dual AI backend — Groq first, Gemini fallback
+# (synchronous — wrap with asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
-def _call_groq(
+def _call_ai(
     messages: list[dict],
     mood_addon: str = "",
     learning_context: str = "",
     max_tokens: int = 512,
 ) -> str:
-    if not config.GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not set in the environment.")
+    """
+    Try Groq (llama-3.3-70b-versatile) first.
+    If that fails or is unconfigured, fall back to Gemini 2.0 Flash.
+    Returns sanitised reply text. Raises RuntimeError if both fail.
+    """
+    system = learning_context + _SYSTEM_PROMPT + mood_addon
+    last_error = None
 
-    from groq import Groq
+    # ── TRY GROQ FIRST ────────────────────────────────────────────────────
+    if config.GROQ_API_KEY:
+        try:
+            from groq import Groq
+            client = Groq(api_key=config.GROQ_API_KEY)
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "system", "content": system}] + messages,
+                max_tokens=max_tokens,
+                temperature=1.2,
+                frequency_penalty=0.7,
+                presence_penalty=0.5,
+            )
+            return _sanitise(response.choices[0].message.content.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: Groq failed, trying Gemini: %s", e)
 
-    system_content = learning_context + _SYSTEM_PROMPT + mood_addon
-    client = Groq(api_key=config.GROQ_API_KEY)
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "system", "content": system_content}] + messages,
-        max_tokens=max_tokens,
-        temperature=1.2,
-        frequency_penalty=0.7,
-        presence_penalty=0.5,
-    )
-    raw = response.choices[0].message.content.strip()
-    return _sanitise(raw)
+    # ── FALLBACK TO GEMINI ────────────────────────────────────────────────
+    if config.GEMINI_API_KEY:
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=config.GEMINI_API_KEY)
+            model = genai.GenerativeModel(
+                model_name="gemini-2.0-flash",
+                system_instruction=system,
+            )
+            # Build Gemini-format history from all but the last message
+            gemini_history = []
+            for msg in messages[:-1]:
+                role = "user" if msg["role"] == "user" else "model"
+                gemini_history.append({"role": role, "parts": [msg["content"]]})
+            chat = model.start_chat(history=gemini_history)
+            last_msg = messages[-1]["content"] if messages else ""
+            response = chat.send_message(
+                last_msg,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=max_tokens,
+                    temperature=1.2,
+                ),
+            )
+            return _sanitise(response.text.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: Gemini also failed: %s", e)
+
+    raise RuntimeError(f"Both APIs failed. Last error: {last_error}")
 
 
 # ---------------------------------------------------------------------------
-# Human-likeness helpers
+# Typing simulation helpers
 # ---------------------------------------------------------------------------
+
+# ~55 WPM average human typing speed (8 chars/second)
+_CHARS_PER_SECOND = 8.0
+_MIN_TYPING = 1.0   # minimum seconds before typing indicator appears
+_MAX_TYPING = 6.0   # maximum typing duration per message part
+
 
 def _typing_seconds(text: str) -> float:
-    """~55 WPM delay, clamped to [0.6, 4.0]s."""
-    return max(0.6, min(len(text) / (275 / 60), 4.0))
+    """
+    Calculate realistic typing duration based on message length.
+    - Short messages (under 20 chars): 1.0 - 1.5 seconds
+    - Medium messages (20-80 chars):   1.5 - 3.5 seconds
+    - Long messages (80+ chars):       3.5 - 6.0 seconds
+    Adds small random variance (+/- 0.3s) to feel human.
+    """
+    base = len(text) / _CHARS_PER_SECOND
+    variance = random.uniform(-0.3, 0.3)
+    return max(_MIN_TYPING, min(_MAX_TYPING, base + variance))
 
 
 def _split_parts(text: str) -> list[str]:
@@ -659,6 +681,16 @@ class AiCompanion(commands.Cog):
         # unique users spoken to this session
         self._users_spoken: set[int] = set()
 
+        # ── Conversation lock ──────────────────────────────────────────────
+        # _processing: set of user_ids currently being replied to
+        # Biki finishes talking to one person before starting another,
+        # just like a real human would.
+        self._processing: set[int] = set()
+
+        # _pending: user_id → their most recent message while Biki was busy
+        # Only the LATEST message per user is kept — no spam flooding.
+        self._pending: dict[int, discord.Message] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -710,14 +742,15 @@ class AiCompanion(commands.Cog):
             return ""
         return _build_learning_context(self.server_vocab.get(guild_id, {}))
 
-    async def _groq_reply(
+    async def _ai_reply(
         self,
         user_id: int,
         user_text: str,
         extra_note: Optional[str] = None,
         guild_id: Optional[int] = None,
+        max_tokens: int = 512,
     ) -> str:
-        """Call Groq with full conversation history, update history, return reply."""
+        """Call _call_ai with full conversation history, update history, return reply."""
         history = list(self.conversations.get(user_id, []))
         input_content = user_text
         if extra_note:
@@ -725,10 +758,11 @@ class AiCompanion(commands.Cog):
         history.append({"role": "user", "content": input_content})
 
         reply = await asyncio.to_thread(
-            _call_groq,
+            _call_ai,
             history,
             self._mood_addon(guild_id),
             self._learning_context(guild_id),
+            max_tokens,
         )
 
         self._append_history(user_id, "user", user_text)
@@ -750,20 +784,23 @@ class AiCompanion(commands.Cog):
         note = f"The timer expired. You're back. Make it unhinged and ping <@{dismissed_by}>."
         try:
             reply = await asyncio.to_thread(
-                _call_groq, [{"role": "user", "content": note}]
+                _call_ai, [{"role": "user", "content": note}]
             )
             for i, part in enumerate(_split_parts(reply)):
+                await asyncio.sleep(1.0)
                 async with channel.typing():
                     await asyncio.sleep(_typing_seconds(part))
                 await channel.send(part)
                 if i < len(_split_parts(reply)) - 1:
-                    await asyncio.sleep(random.uniform(0.4, 1.0))
+                    await asyncio.sleep(random.uniform(0.8, 1.8))
         except Exception as exc:
             log.error("ai_companion: timed return failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Reply sending — 40% chance to quote-reply, 60% plain send
-    # Handles [SPLIT], typing simulation, and random emoji reactions.
+    # Reply sending
+    # Exactly 1s pre-delay before typing indicator (simulates reading).
+    # Typing indicator duration scales with message length (~55 WPM).
+    # Handles [SPLIT], and random emoji reactions.
     # ------------------------------------------------------------------
 
     async def _send_biki_reply(
@@ -776,11 +813,13 @@ class AiCompanion(commands.Cog):
         """
         Send Biki's response to a channel.
         - 15% chance to react to the triggering message with an emoji.
-        - Each [SPLIT] part is sent with a WPM-based typing delay.
-        - 40% chance the FIRST part uses message.reply() (quote-reply) instead
-          of channel.send(); remaining parts always use channel.send().
-        - force_reply=True skips the 40% roll and always uses reply (used for
-          proactive jump-ins so context is obvious).
+        - For each [SPLIT] part:
+            1. Wait 1s (simulates human reading/pause before typing)
+            2. Show typing indicator for WPM-scaled duration
+            3. Send message immediately after typing ends
+            4. If more parts, pause 0.8-1.8s between them
+        - 40% chance the FIRST part uses message.reply() (quote-reply).
+        - force_reply=True always uses reply (used for proactive jump-ins).
         """
         # Optional emoji reaction on the trigger message
         if random.random() < 0.15:
@@ -789,15 +828,22 @@ class AiCompanion(commands.Cog):
             except discord.HTTPException:
                 pass
 
-        parts       = _split_parts(text)
-        use_reply   = force_reply or random.random() < 0.40
+        parts     = _split_parts(text)
+        use_reply = force_reply or random.random() < 0.40
 
         for i, part in enumerate(parts):
-            async with trigger.channel.typing():
-                await asyncio.sleep(_typing_seconds(part))
+            # Step 1 — 1 second pause before showing typing indicator
+            # Simulates the human delay before starting to type
+            await asyncio.sleep(1.0)
 
+            # Step 2 — show typing indicator for WPM-scaled duration
+            # Lasts as long as it would take a human to type that message
+            typing_duration = _typing_seconds(part)
+            async with trigger.channel.typing():
+                await asyncio.sleep(typing_duration)
+
+            # Step 3 — send the message immediately after typing ends
             if i == 0 and use_reply:
-                # First message — quote-reply to give context
                 try:
                     await trigger.reply(part, mention_author=False)
                 except discord.HTTPException:
@@ -805,12 +851,12 @@ class AiCompanion(commands.Cog):
             else:
                 await trigger.channel.send(part)
 
+            # Step 4 — pause between parts like a human would
             if i < len(parts) - 1:
-                await asyncio.sleep(random.uniform(0.4, 1.2))
+                await asyncio.sleep(random.uniform(0.8, 1.8))
 
     # ------------------------------------------------------------------
     # Proactive reply — Biki jumps in unprompted (3% chance)
-    # Uses a short prompt + minimal history; always quote-replies for context.
     # ------------------------------------------------------------------
 
     async def _proactive_reply(self, message: discord.Message) -> None:
@@ -832,14 +878,13 @@ class AiCompanion(commands.Cog):
             await asyncio.sleep(random.uniform(1.0, 3.0))
             async with message.channel.typing():
                 response = await asyncio.to_thread(
-                    _call_groq,
+                    _call_ai,
                     [{"role": "user", "content": prompt}],
                     self._mood_addon(guild_id),
                     self._learning_context(guild_id),
                     120,  # max_tokens — short and punchy
                 )
             if response:
-                # Always quote-reply when jumping in unprompted so context is clear
                 await message.reply(response, mention_author=False)
         except Exception:
             pass  # silently skip — proactive replies are best-effort
@@ -868,7 +913,6 @@ class AiCompanion(commands.Cog):
             "_emoji_counter":  Counter(),
         })
 
-        # Sample messages (max 100) — strip mentions first
         clean = re.sub(r'<@!?\d+>', '', text).strip()
         if clean:
             if len(v["sample_messages"]) >= 100:
@@ -877,17 +921,14 @@ class AiCompanion(commands.Cog):
 
         v["_recent_buf"].append(clean)
 
-        # Emojis (max 100)
         for emoji in _extract_emojis(text):
             v["_emoji_counter"][emoji] += 1
         v["emojis"] = [e for e, _ in v["_emoji_counter"].most_common(100)]
 
-        # Slang words (max 200 unique)
         for word in _extract_slang(clean):
             v["_slang_counter"][word] += 1
         v["slang"] = [w for w, _ in v["_slang_counter"].most_common(200)]
 
-        # Short phrases 2-3 words (max 500)
         words = clean.lower().split()
         for n in (2, 3):
             for i in range(len(words) - n + 1):
@@ -896,7 +937,6 @@ class AiCompanion(commands.Cog):
                     v["_phrase_counter"][phrase] += 1
         v["common_phrases"] = [p for p, _ in v["_phrase_counter"].most_common(500)]
 
-        # Recalculate energy every 10 new messages
         if len(v["sample_messages"]) % 10 == 0:
             v["energy"] = _detect_energy(v["_recent_buf"])
 
@@ -916,26 +956,22 @@ class AiCompanion(commands.Cog):
         """
         assert message.guild is not None
 
-        # Priority 1 — replied-to message author
         if (
             message.reference is not None
             and isinstance(message.reference.resolved, discord.Message)
         ):
             replied_author = message.reference.resolved.author
-            # Don't target bots via reply context (except explicit pings)
             if not replied_author.bot:
                 member = message.guild.get_member(replied_author.id)
                 if member:
                     return member
 
-        # Priority 2 — explicit @mention in message content
         mention_match = re.search(r'<@!?(\d+)>', message.content)
         if mention_match:
             member = message.guild.get_member(int(mention_match.group(1)))
             if member:
                 return member
 
-        # Priority 3 — display name / username found in message text
         content_lower = message.content.lower()
         for member in message.guild.members:
             if member.bot:
@@ -958,8 +994,6 @@ class AiCompanion(commands.Cog):
     ) -> bool:
         """
         Detect and execute mute / unmute / kick / ban / warn / delete.
-        Uses 3-priority target resolution so plain names and reply context work.
-        Permission check fires before any action.
         Returns True if a moderation branch was handled.
         """
         if message.guild is None:
@@ -971,7 +1005,6 @@ class AiCompanion(commands.Cog):
         lower = clean.lower()
 
         # ── DELETE REPLIED MESSAGE ────────────────────────────────────────
-        # Special case: must have a reply reference + delete keyword
         if message.reference and any(kw in lower for kw in _DELETE_KEYWORDS):
             if not _has_mod_permission(author):
                 await message.channel.send(
@@ -1002,7 +1035,7 @@ class AiCompanion(commands.Cog):
                 "Confirm it dramatically. You have the power."
             )
             async with message.channel.typing():
-                reply = await self._groq_reply(
+                reply = await self._ai_reply(
                     author.id, clean, extra_note=note, guild_id=message.guild.id
                 )
             await self._send_biki_reply(message, reply)
@@ -1045,14 +1078,13 @@ class AiCompanion(commands.Cog):
             )
             return True
 
-        # Don't let admins or Biki himself be targeted
         if target.guild_permissions.administrator or target.id == self.bot.user.id:
             note = (
                 "Someone tried to make you take a moderation action against an admin "
                 "or against yourself. Refuse dramatically and chaotically."
             )
             async with message.channel.typing():
-                reply = await self._groq_reply(
+                reply = await self._ai_reply(
                     author.id, clean, extra_note=note, guild_id=message.guild.id
                 )
             await self._send_biki_reply(message, reply)
@@ -1073,9 +1105,7 @@ class AiCompanion(commands.Cog):
             )
             try:
                 until = datetime.now(timezone.utc) + timedelta(seconds=duration)
-                await target.timeout(
-                    until, reason=f"Muted by {author} via Biki"
-                )
+                await target.timeout(until, reason=f"Muted by {author} via Biki")
             except discord.Forbidden:
                 await message.channel.send(
                     "bro i literally dont have the power to do that rn, "
@@ -1089,7 +1119,7 @@ class AiCompanion(commands.Cog):
                 f"{human_dur} 💀'"
             )
             async with message.channel.typing():
-                reply = await self._groq_reply(
+                reply = await self._ai_reply(
                     author.id, clean, extra_note=note, guild_id=message.guild.id
                 )
             await self._send_biki_reply(message, reply)
@@ -1107,7 +1137,7 @@ class AiCompanion(commands.Cog):
                 "you're free. don't make me regret this'"
             )
             async with message.channel.typing():
-                reply = await self._groq_reply(
+                reply = await self._ai_reply(
                     author.id, clean, extra_note=note, guild_id=message.guild.id
                 )
             await self._send_biki_reply(message, reply)
@@ -1126,7 +1156,7 @@ class AiCompanion(commands.Cog):
                 f"Say something like 'YEET 👋 {name} has left the building. bye bestie'"
             )
             async with message.channel.typing():
-                reply = await self._groq_reply(
+                reply = await self._ai_reply(
                     author.id, clean, extra_note=note, guild_id=message.guild.id
                 )
             await self._send_biki_reply(message, reply)
@@ -1145,13 +1175,12 @@ class AiCompanion(commands.Cog):
                 f"Say something like 'damn okay. {name} is GONE gone. rip 💀'"
             )
             async with message.channel.typing():
-                reply = await self._groq_reply(
+                reply = await self._ai_reply(
                     author.id, clean, extra_note=note, guild_id=message.guild.id
                 )
             await self._send_biki_reply(message, reply)
 
         elif action == "warn":
-            # Extract reason: everything after the action word, minus any mentions
             reason_raw = re.sub(r'<@!?\d+>', '', re.sub(_RE_WARN, '', clean)).strip()
             reason = reason_raw or "no reason given"
             events_cog = self.bot.get_cog("Events")
@@ -1179,7 +1208,7 @@ class AiCompanion(commands.Cog):
                 f"{target.display_name} 👀 biki is watching'"
             )
             async with message.channel.typing():
-                reply = await self._groq_reply(
+                reply = await self._ai_reply(
                     author.id, clean, extra_note=note, guild_id=message.guild.id
                 )
             await self._send_biki_reply(message, reply)
@@ -1188,31 +1217,45 @@ class AiCompanion(commands.Cog):
 
     # ------------------------------------------------------------------
     # Single unified on_message listener
+    #
     # Sections (in order):
-    #   1. Passive learning — every non-bot message in allowed channels
-    #   2. Proactive 3% jump-in — if Biki was NOT triggered
-    #   3. Main mention / reply handler — when Biki IS triggered
+    #   1. Ignore bots and DMs
+    #   2. Channel gate
+    #   3. Passive learning
+    #   4. Detect trigger
+    #   5. Proactive 3% jump-in (not triggered) then return
+    #   6. Triggered handler:
+    #      a. Strip bot mention
+    #      b. Handle empty reply content
+    #      c. Conversation lock check
+    #      d. Mark as processing
+    #      e. Moderation check
+    #      f. Dismissal state check
+    #      g. Spite return check
+    #      h. Timed dismissal parse
+    #      i. Plain dismissal check
+    #      j. Normal reply
+    #      k. Finally: release lock, trigger next pending
     # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        # Ignore bots and DMs
+        # ── 1. Ignore bots and DMs ────────────────────────────────────────
         if message.author.bot or message.guild is None:
             return
 
         guild_id = message.guild.id
+        user_id  = message.author.id
 
-        # ── Channel gate ─────────────────────────────────────────────────
-        # If allowed channels are set, only process messages inside them.
+        # ── 2. Channel gate ───────────────────────────────────────────────
         allowed = self.allowed_channels.get(guild_id, [])
         if allowed and message.channel.id not in allowed:
             return
 
-        # ── SECTION 1: Passive learning ──────────────────────────────────
-        # Runs silently on every eligible message to build server vocabulary.
+        # ── 3. Passive learning ───────────────────────────────────────────
         self._learn_from_message(message)
 
-        # ── Detect whether Biki was triggered ────────────────────────────
+        # ── 4. Detect trigger ─────────────────────────────────────────────
         assert self.bot.user is not None
 
         bot_mentioned = self.bot.user in message.mentions
@@ -1223,115 +1266,149 @@ class AiCompanion(commands.Cog):
         )
         triggered = bot_mentioned or replied_to_bot
 
-        # ── SECTION 2: Proactive jump-in (3% chance, only when NOT triggered)
+        # ── 5. Proactive jump-in (3% chance, only when NOT triggered) ─────
         if not triggered:
             if random.random() < 0.03:
                 asyncio.create_task(self._proactive_reply(message))
-            return  # nothing more to do if Biki wasn't directly addressed
+            return
 
-        # ── SECTION 3: Main mention / reply handler ───────────────────────
+        # ── 6. Triggered handler ──────────────────────────────────────────
 
-        user_id    = message.author.id
         channel_id = message.channel.id
 
-        # Strip bot mentions from the clean content
+        # a. Strip bot mentions from content
         clean = message.content
         clean = clean.replace(f"<@{self.bot.user.id}>", "")
         clean = clean.replace(f"<@!{self.bot.user.id}>", "").strip()
 
-        # If replied to Biki with no extra text, use the replied message as context
+        # b. Handle empty reply-to-bot content
         if not clean and replied_to_bot and isinstance(
             message.reference.resolved, discord.Message
         ):
-            clean = f"[replying to your message: \"{message.reference.resolved.content[:200]}\"]"
+            clean = (
+                f"[replying to your message: "
+                f"\"{message.reference.resolved.content[:200]}\"]"
+            )
 
-        # ── Moderation commands (no pre-typing delay — feels immediate) ───
-        if await self._try_moderation(message, clean):
+        # c. Conversation lock check ─────────────────────────────────────
+        # If Biki is currently processing a reply for ANY user, queue this
+        # message. Only the latest message per user is kept.
+        if self._processing:
+            self._pending[user_id] = message
             return
 
-        # ── Dismissal state ───────────────────────────────────────────────
-        dismissed_state = self.dismissed.get(user_id)
-        if dismissed_state is not None:
-            if self._is_return(clean):
-                self.dismissed.pop(user_id, None)
+        # d. Mark this user as being processed
+        self._processing.add(user_id)
+
+        try:
+            # e. Moderation check — no pre-typing delay, feels immediate
+            if await self._try_moderation(message, clean):
+                return
+
+            # f. Dismissal state check ───────────────────────────────────
+            dismissed_state = self.dismissed.get(user_id)
+            if dismissed_state is not None:
+                if self._is_return(clean):
+                    self.dismissed.pop(user_id, None)
+                    note = (
+                        "The person who kicked you out is begging you to come back. "
+                        "Make your re-entry absolutely unhinged."
+                    )
+                    try:
+                        async with message.channel.typing():
+                            reply = await self._ai_reply(
+                                user_id, clean, extra_note=note, guild_id=guild_id
+                            )
+                        await self._send_biki_reply(message, reply)
+                    except Exception as exc:
+                        log.error("ai_companion: return reply failed: %s", exc)
+                return
+
+            # g. Spite return check ──────────────────────────────────────
+            all_dismissed_by = {v["dismissed_by"] for v in self.dismissed.values()}
+            if (
+                all_dismissed_by
+                and self._is_return(clean)
+                and user_id not in all_dismissed_by
+            ):
+                self.dismissed.clear()
                 note = (
-                    "The person who kicked you out is begging you to come back. "
-                    "Make your re-entry absolutely unhinged."
+                    "Someone ELSE summoned you back just to spite the person who "
+                    "dismissed you. Most dramatic comeback ever."
                 )
                 try:
                     async with message.channel.typing():
-                        reply = await self._groq_reply(
+                        reply = await self._ai_reply(
                             user_id, clean, extra_note=note, guild_id=guild_id
                         )
                     await self._send_biki_reply(message, reply)
                 except Exception as exc:
-                    log.error("ai_companion: return reply failed: %s", exc)
-            return
+                    log.error("ai_companion: spite-return failed: %s", exc)
+                return
 
-        # Check if a DIFFERENT user is bringing Biki back (spite return)
-        all_dismissed_by = {v["dismissed_by"] for v in self.dismissed.values()}
-        if all_dismissed_by and self._is_return(clean) and user_id not in all_dismissed_by:
-            self.dismissed.clear()
-            note = (
-                "Someone ELSE summoned you back just to spite the person who "
-                "dismissed you. Most dramatic comeback ever."
-            )
+            # h. Timed dismissal parse ────────────────────────────────────
+            timed_seconds = self._parse_timed_dismiss(clean)
+            if timed_seconds is not None:
+                self.dismissed[user_id] = {
+                    "channel_id": channel_id,
+                    "dismissed_by": user_id,
+                }
+                note = (
+                    f"This person is dismissing you for exactly "
+                    f"{int(timed_seconds)} seconds. "
+                    "Acknowledge it chaotically then go quiet."
+                )
+                try:
+                    async with message.channel.typing():
+                        reply = await self._ai_reply(
+                            user_id, clean, extra_note=note, guild_id=guild_id
+                        )
+                    await self._send_biki_reply(message, reply)
+                except Exception as exc:
+                    log.error("ai_companion: timed dismiss failed: %s", exc)
+                asyncio.create_task(
+                    self._timed_return(timed_seconds, channel_id, user_id)
+                )
+                return
+
+            # i. Plain dismissal check ────────────────────────────────────
+            if self._is_dismiss(clean):
+                self.dismissed[user_id] = {
+                    "channel_id": channel_id,
+                    "dismissed_by": user_id,
+                }
+                note = "This person is kicking you out. Most dramatic chaotic goodbye ever."
+                try:
+                    async with message.channel.typing():
+                        reply = await self._ai_reply(
+                            user_id, clean, extra_note=note, guild_id=guild_id
+                        )
+                    await self._send_biki_reply(message, reply)
+                except Exception as exc:
+                    log.error("ai_companion: dismiss failed: %s", exc)
+                return
+
+            # j. Normal reply ─────────────────────────────────────────────
+            # 1s reading pause → keep typing alive during AI call →
+            # _send_biki_reply handles per-part typing simulation
             try:
+                await asyncio.sleep(1.0)
                 async with message.channel.typing():
-                    reply = await self._groq_reply(
-                        user_id, clean, extra_note=note, guild_id=guild_id
-                    )
+                    reply = await self._ai_reply(user_id, clean, guild_id=guild_id)
                 await self._send_biki_reply(message, reply)
             except Exception as exc:
-                log.error("ai_companion: spite-return failed: %s", exc)
-            return
+                log.error("ai_companion: AI call failed: %s", exc)
+                await message.channel.send(random.choice(_OFFLINE_REPLIES))
 
-        # ── Timed dismissal ───────────────────────────────────────────────
-        timed_seconds = self._parse_timed_dismiss(clean)
-        if timed_seconds is not None:
-            self.dismissed[user_id] = {"channel_id": channel_id, "dismissed_by": user_id}
-            note = (
-                f"This person is dismissing you for exactly {int(timed_seconds)} seconds. "
-                "Acknowledge it chaotically then go quiet."
-            )
-            try:
-                async with message.channel.typing():
-                    reply = await self._groq_reply(
-                        user_id, clean, extra_note=note, guild_id=guild_id
-                    )
-                await self._send_biki_reply(message, reply)
-            except Exception as exc:
-                log.error("ai_companion: timed dismiss failed: %s", exc)
-            asyncio.create_task(
-                self._timed_return(timed_seconds, channel_id, user_id)
-            )
-            return
+        finally:
+            # k. Always release the lock when done, even if an error occurred
+            self._processing.discard(user_id)
 
-        # ── Plain dismissal ───────────────────────────────────────────────
-        if self._is_dismiss(clean):
-            self.dismissed[user_id] = {"channel_id": channel_id, "dismissed_by": user_id}
-            note = "This person is kicking you out. Most dramatic chaotic goodbye ever."
-            try:
-                async with message.channel.typing():
-                    reply = await self._groq_reply(
-                        user_id, clean, extra_note=note, guild_id=guild_id
-                    )
-                await self._send_biki_reply(message, reply)
-            except Exception as exc:
-                log.error("ai_companion: dismiss failed: %s", exc)
-            return
-
-        # ── Normal reply — 3-10s pre-typing delay then Groq ──────────────
-        try:
-            await asyncio.sleep(random.uniform(3.0, 10.0))
-            async with message.channel.typing():
-                reply = await self._groq_reply(user_id, clean, guild_id=guild_id)
-            await self._send_biki_reply(message, reply)
-        except Exception as exc:
-            log.error("ai_companion: Groq call failed: %s", exc)
-            await message.channel.send(
-                "bro something broke on my end lmaooo try again"
-            )
+            # Process next pending message if any exist
+            if self._pending:
+                next_user_id, next_message = next(iter(self._pending.items()))
+                self._pending.pop(next_user_id, None)
+                asyncio.create_task(self.on_message(next_message))
 
     # ------------------------------------------------------------------
     # Slash commands
@@ -1551,13 +1628,17 @@ class AiCompanion(commands.Cog):
         spoken_this   = len(self._users_spoken)
         dismissed_cnt = len(self.dismissed)
         mood          = self.guild_moods.get(interaction.guild_id, "normal")
+        pending_cnt   = len(self._pending)
+        processing_cnt = len(self._processing)
         await interaction.response.send_message(
             f"**Biki session stats**\n"
             f"• Conversations loaded: **{total_users}** users\n"
             f"• Total messages in memory: **{total_msgs}**\n"
             f"• Users spoken to this session: **{spoken_this}**\n"
             f"• Currently dismissed by: **{dismissed_cnt}** user(s)\n"
-            f"• Active mood: **{mood}**",
+            f"• Active mood: **{mood}**\n"
+            f"• Currently processing: **{processing_cnt}** conversation(s)\n"
+            f"• Pending in queue: **{pending_cnt}** message(s)",
             ephemeral=True,
         )
 

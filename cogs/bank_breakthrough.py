@@ -28,10 +28,12 @@ Gadgets (Energy Pool: 100 EP max · +10 EP/round regen):
 Map (15×15):
   • Spawns at corners: [0,0] [0,14] [14,0] [14,14]
   • Central Vault: 2×2 block [7,7]–[8,8] · needs 3 Breach Points
-  • Security Walls [🧱]: 30-wall permanent structural skeleton + BFS-validated random extras
+  • Security Walls [🧱]: 24-wall permanent skeleton in corridors between spawn blocks + BFS extras
   • Security Doors: guard all 4 vault approaches
-  • Common Loot (💵): +100 🪙
-  • Diamond Briefcase (💎): spawns round 3 · +500 🪙 · blocks Boost
+  • Cash Bundle  (💵): +100 🪙
+  • Gold Bar     (💰): +200 🪙
+  • Mystery Box  (📦): revealed on pickup — 60% chance +50…+400 🪙 · 40% chance −50…−200 🪙
+  • Diamond Briefcase (💎): spawns round 3 · +500 🪙 · blocks Boost while carried
   • Alarm Traps (⚠️): hidden until stepped on; stun 1 round
 
 Round Flow:
@@ -70,12 +72,21 @@ BOOST_EP_COST       = 20
 DIAMOND_SPAWN_ROUND = 3
 
 LOOT_REWARD_COMMON  = 100
+LOOT_REWARD_GOLD    = 200
 LOOT_REWARD_DIAMOND = 500
 BREACH_COIN_REWARD  = 300
 
-NUM_EXTRA_RANDOM_WALLS = 8   # random extras stacked on top of structural skeleton each match
-NUM_LOOT_TILES         = 10
-NUM_TRAPS              = 6
+MYSTERY_GAIN_MIN   = 50
+MYSTERY_GAIN_MAX   = 400
+MYSTERY_LOSS_MIN   = 50
+MYSTERY_LOSS_MAX   = 200
+MYSTERY_GAIN_CHANCE = 0.60   # 60 % chance of gain; 40 % chance of loss
+
+NUM_EXTRA_RANDOM_WALLS = 8   # random extras layered on top of structural skeleton each match
+NUM_LOOT_COMMON        = 5
+NUM_LOOT_GOLD          = 3
+NUM_LOOT_MYSTERY       = 2
+NUM_TRAPS              = 5
 
 CHAMPION_STARTS = [(0, 0), (0, 14), (14, 0), (14, 14)]
 
@@ -87,42 +98,45 @@ FIXED_DOORS: frozenset[tuple[int, int]] = frozenset({
 })
 
 # ── Permanent structural wall skeleton ────────────────────────────────────────
-# These walls are NEVER removed or regenerated — they are placed once and stay
-# for the entire match. They form L-barriers, corridor chokepoints, and funnel
-# pillars that block direct straight-line paths from corner spawns to the vault,
-# forcing players to navigate bends and tactical corridors.
+# Walls sit BETWEEN the four corner spawn blocks and the centre vault zone —
+# never inside a spawn quadrant.  Layout is fully 4-way symmetric so every
+# player faces an identical situation.  Each corridor has one guaranteed open
+# "needle" column/row that runs straight through to the vault:
+#   • Top / bottom corridors  → col 7 is always clear
+#   • Left / right corridors  → row 7 is always clear
+#
+# Corridor zones (where walls are placed):
+#   Top   : rows  1–4 , cols 5–9   (between TL/TR spawn blocks)
+#   Bottom: rows 10–13, cols 5–9   (between BL/BR spawn blocks)
+#   Left  : rows  5–9 , cols 1–4   (between TL/BL spawn blocks)
+#   Right : rows  5–9 , cols 10–13 (between TR/BR spawn blocks)
 STRUCTURAL_WALLS: frozenset[tuple[int, int]] = frozenset({
-    # Top-left L-barrier — blocks direct NW → center straight line
-    (2, 2), (3, 2), (4, 2),
-    (4, 3), (4, 4),
-
-    # Top-right L-barrier (mirror)
-    (2, 12), (3, 12), (4, 12),
-    (4, 10), (4, 11),
-
-    # Bottom-left L-barrier (mirror)
-    (10, 2), (10, 3), (10, 4),
-    (11, 2), (12, 2),
-
-    # Bottom-right L-barrier (mirror)
-    (10, 10), (10, 11), (10, 12),
-    (11, 12), (12, 12),
-
-    # Left mid-corridor chokepoint — forces side approach to west vault door
-    (6, 3), (7, 3), (8, 3),
-
-    # Right mid-corridor chokepoint (mirror)
-    (6, 11), (7, 11), (8, 11),
-
-    # Top-center funnel pillars — narrows the northern approach to the vault
+    # ═══ TOP CENTER CORRIDOR ════════════════════════════════════════════
+    # Gate-post pair at row 1 (col 7 gap = needle)
+    (1, 6), (1, 8),
+    # Offset posts at row 3 force an S-bend around the needle
     (3, 5), (3, 9),
 
-    # Bottom-center funnel pillars (mirror)
+    # ═══ BOTTOM CENTER CORRIDOR (4-way mirror of top) ════════════════════
+    (13, 6), (13, 8),
     (11, 5), (11, 9),
 
-    # Inner approach screens — forces passage through vault doors
-    (5, 4), (5, 10),
-    (9, 4), (9, 10),
+    # ═══ LEFT CENTER CORRIDOR ═══════════════════════════════════════════
+    # Gate-post pair at col 1 (row 7 gap = needle)
+    (6, 1), (8, 1),
+    # Offset posts at col 3 force an S-bend around the needle
+    (5, 3), (9, 3),
+
+    # ═══ RIGHT CENTER CORRIDOR (4-way mirror of left) ════════════════════
+    (6, 13), (8, 13),
+    (5, 11), (9, 11),
+
+    # ═══ INNER CROSS-CORRIDOR SCREENS (4-way symmetric ring) ════════════
+    # Transition zone between the outer corridors and the vault approach lanes
+    (4, 6),  (4, 8),
+    (10, 6), (10, 8),
+    (6, 4),  (8, 4),
+    (6, 10), (8, 10),
 })
 
 # Registered gadgets — ONLY these 3 are allowed in the system
@@ -387,9 +401,19 @@ def _generate_map(state: GameState) -> None:
         (r, c) for r in range(GRID_SIZE) for c in range(GRID_SIZE) if (r, c) not in taken
     ]
     random.shuffle(open_tiles)
-    for pos in open_tiles[:NUM_LOOT_TILES]:
-        state.loot_tiles[pos] = "common"
-    state.traps = set(open_tiles[NUM_LOOT_TILES : NUM_LOOT_TILES + NUM_TRAPS])
+
+    total_loot = NUM_LOOT_COMMON + NUM_LOOT_GOLD + NUM_LOOT_MYSTERY
+    loot_pool  = open_tiles[:total_loot]
+    kinds      = (
+        ["common"]  * NUM_LOOT_COMMON  +
+        ["gold"]    * NUM_LOOT_GOLD    +
+        ["mystery"] * NUM_LOOT_MYSTERY
+    )
+    random.shuffle(kinds)
+    for pos, kind in zip(loot_pool, kinds):
+        state.loot_tiles[pos] = kind
+
+    state.traps = set(open_tiles[total_loot : total_loot + NUM_TRAPS])
 
 
 def _spawn_diamond(state: GameState) -> Optional[tuple[int, int]]:
@@ -481,6 +505,10 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
     DOOR_O_BG   = (50,  85,  35)
     LOOT_BG     = (8,   50,  14)
     LOOT_FG     = (40,  190, 65)
+    GOLD_BG     = (55,  38,  0)
+    GOLD_FG     = (240, 175, 0)
+    MYST_BG     = (38,  8,   55)
+    MYST_FG     = (185, 70,  255)
     DIAM_BG     = (6,   22,  80)
     DIAM_FG     = (70,  150, 255)
     TRAP_BG     = (65,  6,   6)
@@ -618,6 +646,12 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
             if loot_kind == "common":
                 draw.rectangle([x0 + 4, y0 + 4, x1 - 4, y1 - 4], fill=LOOT_BG, outline=LOOT_FG, width=1)
                 draw.text((cx, cy), "$", fill=LOOT_FG, font=f_md, anchor="mm")
+            elif loot_kind == "gold":
+                draw.rectangle([x0 + 4, y0 + 4, x1 - 4, y1 - 4], fill=GOLD_BG, outline=GOLD_FG, width=1)
+                draw.text((cx, cy), "Au", fill=GOLD_FG, font=f_md, anchor="mm")
+            elif loot_kind == "mystery":
+                draw.rectangle([x0 + 4, y0 + 4, x1 - 4, y1 - 4], fill=MYST_BG, outline=MYST_FG, width=1)
+                draw.text((cx, cy), "?", fill=MYST_FG, font=f_md, anchor="mm")
             elif loot_kind == "diamond":
                 draw.rectangle([x0 + 4, y0 + 4, x1 - 4, y1 - 4], fill=DIAM_BG, outline=DIAM_FG, width=1)
                 draw.text((cx, cy), "◆", fill=DIAM_FG, font=f_md, anchor="mm")
@@ -690,6 +724,8 @@ def _render_grid_text(state: GameState) -> str:
             elif pos in state.doors and pos not in state.opened_doors: row.append("🚪")
             elif pos in state.opened_doors: row.append("🔓")
             elif state.loot_tiles.get(pos) == "diamond": row.append("💎")
+            elif state.loot_tiles.get(pos) == "gold":    row.append("💰")
+            elif state.loot_tiles.get(pos) == "mystery": row.append("📦")
             elif state.loot_tiles.get(pos) == "common":  row.append("💵")
             else: row.append("⬛")
         rows.append("".join(row))
@@ -1160,16 +1196,26 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         )
         em.add_field(
             name="🗺️ Grid",
-            value=f"15×15 — {len(state.walls)} permanent walls · BFS validated",
-            inline=True,
+            value=f"15×15 — {len(state.walls)} permanent walls in corridors between blocks · BFS validated",
+            inline=False,
         )
         em.add_field(name="⚡ Energy", value="100 EP · +10/round regen", inline=True)
         em.add_field(
-            name="🎒 Gadget Kit (3 only)",
+            name="🎒 Gadget Kit  (3 total)",
             value=(
-                "⚡ Movement Boost (20 EP)\n"
-                "🥶 Freeze Charge (40 EP)\n"
-                "🔀 Board Shuffle (60 EP · 1×/game)"
+                "⚡ Movement Boost — 20 EP — 2nd move this round\n"
+                "🥶 Freeze Charge — 40 EP — stun 1 adj. opponent (EP refunded on miss)\n"
+                "🔀 Board Shuffle — 60 EP — random teleport · 1×/match"
+            ),
+            inline=True,
+        )
+        em.add_field(
+            name="💰 Loot Spawns",
+            value=(
+                f"💵 Cash Bundle ×{NUM_LOOT_COMMON} (+{LOOT_REWARD_COMMON:,} 🪙)\n"
+                f"💰 Gold Bar ×{NUM_LOOT_GOLD} (+{LOOT_REWARD_GOLD:,} 🪙)\n"
+                f"📦 Mystery Box ×{NUM_LOOT_MYSTERY} (±random · reveals on pickup)\n"
+                f"💎 Diamond Briefcase ×1 at round {DIAMOND_SPAWN_ROUND} (+{LOOT_REWARD_DIAMOND:,} 🪙)"
             ),
             inline=False,
         )
@@ -1231,31 +1277,36 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         em.add_field(
             name="⚡  Movement Boost  —  20 EP  |  Self-cast",
             value=(
-                "Unlocks a **second directional arrow click** this turn, letting you move 2 tiles in one round.\n"
-                "**Cannot be used while carrying the Diamond Briefcase.**\n"
-                "Select it from the gadget dropdown, then press a second direction button.\n"
-                "EP is deducted at resolution; if you can't afford it, the second move is cancelled."
+                "Grants you a **second directional arrow press** this round, letting you cover **2 tiles** instead of 1.\n"
+                "Queue the gadget from the dropdown first, then press your **first** direction, then your **second** direction.\n"
+                "**Blocked while carrying the Diamond Briefcase** — the extra move is silently stripped.\n"
+                "EP is deducted at resolution; if you no longer have 20 EP, the second step is cancelled and you move 1 tile instead.\n"
+                "Hit **🚫 Cancel** in the dropdown to undo a queued Boost (also removes the second direction)."
             ),
             inline=False,
         )
 
         em.add_field(
-            name="🥶  Freeze Charge  —  40 EP  |  Sabotage — target via dropdown",
+            name="🥶  Freeze Charge  —  40 EP  |  Sabotage  |  target via dropdown",
             value=(
-                "Select a target champion from the pop-up picker after choosing this gadget.\n"
-                "At resolution, if the target is **adjacent** (orthogonal or diagonal), they are "
-                "**frozen and rooted for 1 full round** — their move is cancelled and they skip their entire next turn.\n"
-                "If the target is **not adjacent** at resolution, **40 EP is refunded in full**."
+                "After selecting this gadget a **target picker** appears — choose which opponent to freeze.\n"
+                "At resolution, if your target is **within 1 tile** (orthogonal **or** diagonal), they are:\n"
+                "  • Immediately rooted — their queued move is cancelled this round\n"
+                "  • **Frozen for 1 full round** — they auto-skip their entire next planning phase\n"
+                "If the target has moved out of range by resolution time, **the 40 EP is fully refunded** — no penalty.\n"
+                "You can only freeze **one** opponent per round."
             ),
             inline=False,
         )
 
         em.add_field(
-            name="🔀  Board Shuffle  —  60 EP  |  Self-cast  |  ⚠️ 1 use per player per match",
+            name="🔀  Board Shuffle  —  60 EP  |  Self-cast  |  ⚠️ 1× per player per match",
             value=(
-                "Instantly teleports you to a **completely random, safe empty floor tile** anywhere on the map.\n"
-                "**Each player may only use this once per match.** The `🔀✓` marker appears in the board legend when spent.\n"
-                "Useful for escaping chokepoints, resetting position, or surprising opponents."
+                "Teleports you to a **random safe empty floor tile** anywhere on the 15×15 grid.\n"
+                "Safe means: not a wall, vault cell, locked door, triggered trap, or occupied tile.\n"
+                "**Each player may only use this once per match**, regardless of how much EP they have.\n"
+                "Once spent, a `🔀✓` badge appears next to your name in the board legend.\n"
+                "Best used to escape a corner trap, reset your approach vector, or bait opponents."
             ),
             inline=False,
         )
@@ -1263,15 +1314,16 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         em.add_field(
             name="📌  General Rules",
             value=(
-                "• Only **one gadget** may be queued per round — a new selection replaces the previous.\n"
-                "• Select **🚫 Cancel** to clear your gadget (also undoes a Boost if it was queued).\n"
-                "• EP is verified again at resolution — if insufficient, the gadget is cancelled at no charge.\n"
-                f"• Max EP cap: **{MAX_EP}** · Passive regen: **+{EP_REGEN} EP/round**."
+                "• Only **one gadget** may be queued per round — selecting a new one replaces the previous.\n"
+                "• **🚫 Cancel** clears your gadget selection and undoes a queued Boost.\n"
+                "• EP costs are deducted **at resolution**, not when you queue — so you can queue freely and cancel.\n"
+                "• If you fall below the cost by resolution time, the gadget cancels with **no charge**.\n"
+                f"• EP cap: **{MAX_EP}** · Regen: **+{EP_REGEN} EP** at the end of every round."
             ),
             inline=False,
         )
 
-        em.set_footer(text="Breakthrough v4 · Gadget Reference · All costs deducted at resolution")
+        em.set_footer(text="Breakthrough v4 · Gadget Reference · Costs deducted at resolution · 3 gadgets total")
         await interaction.response.send_message(embed=em, ephemeral=True)
 
     @app_commands.command(name="breakthrough-leaderboard", description="Show the all-time Heist Coin leaderboard.")
@@ -1533,9 +1585,34 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                 new_bal = _db_add_coins(champ.team, LOOT_REWARD_COMMON)
                 champ.loot_claimed += 1
                 resolution_log.append(
-                    f"💵 **{champ.display_name}** grabbed cash! +{LOOT_REWARD_COMMON:,} 🪙 "
+                    f"💵 **{champ.display_name}** grabbed a Cash Bundle! +{LOOT_REWARD_COMMON:,} 🪙 "
                     f"(team total: {new_bal:,})"
                 )
+            elif loot_kind == "gold":
+                del state.loot_tiles[pos]
+                new_bal = _db_add_coins(champ.team, LOOT_REWARD_GOLD)
+                champ.loot_claimed += 1
+                resolution_log.append(
+                    f"💰 **{champ.display_name}** snagged a Gold Bar! +{LOOT_REWARD_GOLD:,} 🪙 "
+                    f"(team total: {new_bal:,})"
+                )
+            elif loot_kind == "mystery":
+                del state.loot_tiles[pos]
+                champ.loot_claimed += 1
+                if random.random() < MYSTERY_GAIN_CHANCE:
+                    amount  = random.randint(MYSTERY_GAIN_MIN, MYSTERY_GAIN_MAX)
+                    new_bal = _db_add_coins(champ.team, amount)
+                    resolution_log.append(
+                        f"📦 **{champ.display_name}** opened a Mystery Box — **JACKPOT!** "
+                        f"+{amount:,} 🪙 (team total: {new_bal:,})"
+                    )
+                else:
+                    amount  = random.randint(MYSTERY_LOSS_MIN, MYSTERY_LOSS_MAX)
+                    new_bal = _db_add_coins(champ.team, -amount)
+                    resolution_log.append(
+                        f"📦 **{champ.display_name}** opened a Mystery Box — **BOOBY TRAP!** "
+                        f"−{amount:,} 🪙 (team total: {new_bal:,})"
+                    )
             elif loot_kind == "diamond":
                 del state.loot_tiles[pos]
                 champ.carrying_diamond = True
@@ -1594,11 +1671,16 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                 colour=C_ACTION,
                 description="\n".join(resolution_log),
             )
+            loot_v = list(state.loot_tiles.values())
+            loot_summary_parts = []
+            if (n := loot_v.count("common")):   loot_summary_parts.append(f"{n} 💵")
+            if (n := loot_v.count("gold")):     loot_summary_parts.append(f"{n} 💰")
+            if (n := loot_v.count("mystery")):  loot_summary_parts.append(f"{n} 📦")
+            if "diamond" in loot_v:             loot_summary_parts.append("1 💎")
             log_em.set_footer(
                 text=(
                     f"Vault: {state.breach_points}/{VAULT_POINTS_REQ} BP  ·  "
-                    f"Loot: {sum(1 for v in state.loot_tiles.values() if v == 'common')} common"
-                    f"{'  ·  1 💎 diamond' if 'diamond' in state.loot_tiles.values() else ''}"
+                    f"Loot on board: {', '.join(loot_summary_parts) or 'none'}"
                 )
             )
             await channel.send(embed=log_em)
@@ -1630,11 +1712,15 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             value=f"**{ROUND_TIMER}s** — Use buttons below",
             inline=True,
         )
-        common_left  = sum(1 for v in state.loot_tiles.values() if v == "common")
-        diamond_left = "1 💎" if "diamond" in state.loot_tiles.values() else "—"
+        loot_vals = list(state.loot_tiles.values())
+        loot_parts: list[str] = []
+        if (n := loot_vals.count("common")):  loot_parts.append(f"**{n}** 💵")
+        if (n := loot_vals.count("gold")):    loot_parts.append(f"**{n}** 💰")
+        if (n := loot_vals.count("mystery")): loot_parts.append(f"**{n}** 📦")
+        if "diamond" in loot_vals:            loot_parts.append("**1** 💎")
         em.add_field(
-            name="💰 Loot",
-            value=f"**{common_left}** common · {diamond_left} diamond",
+            name="💰 Loot on Board",
+            value=" · ".join(loot_parts) if loot_parts else "—",
             inline=True,
         )
         em.set_footer(

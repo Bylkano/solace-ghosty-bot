@@ -2,12 +2,6 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
-#delete
-import sys
-print("=== CONFIG DEBUG ===", file=sys.stderr)
-print(f"GROQ_API_KEY found: {bool(os.getenv('GROQ_API_KEY'))}", file=sys.stderr)
-print(f"GROQ_API_KEY value: {os.getenv('GROQ_API_KEY', 'NOT FOUND')[:10]}...", file=sys.stderr)
-print("===================", file=sys.stderr) #delete
 
 # Accepts DISCORD_TOKEN (standard for most hosting platforms) with a
 # fallback to BOT_TOKEN so existing Replit secret configs keep working.
@@ -19,8 +13,9 @@ DEV_GUILD_ID: int | None = int(guild_id) if (guild_id := os.getenv("DEV_GUILD_ID
 # Database
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
-# Groq AI (used by the ai_companion cog for Biki)
+# AI backends (Groq is primary, Gemini is automatic fallback)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
 if not BOT_TOKEN:
     raise ValueError(

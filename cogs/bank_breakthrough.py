@@ -1293,6 +1293,88 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             em.description = f"```\n{_render_grid_text(state)}\n```"
             await interaction.response.send_message(embed=em, ephemeral=True)
 
+    @app_commands.command(name="gadgethelp", description="Show a private reference card for all Breakthrough gadgets.")
+    @app_commands.guild_only()
+    async def gadget_help(self, interaction: discord.Interaction) -> None:
+        em = discord.Embed(
+            title="🎒  Breakthrough — Gadget Reference",
+            colour=C_TEAM,
+            description=(
+                "All gadgets are selected from the **🎒 Select Gadget…** dropdown during the planning phase.\n"
+                "EP is deducted at resolution — not when you queue the gadget.\n"
+            ),
+        )
+
+        em.add_field(
+            name="💨  Smoke Grenade  —  30 EP",
+            value=(
+                "**Self-cast.** Blankets your current tile in Fog of War for **2 rounds**. "
+                "Your `[row, col]` shows as `[?,?]` in the status table and you are hidden "
+                "from opponents on the rendered board."
+            ),
+            inline=False,
+        )
+
+        em.add_field(
+            name="⚡  Overdrive  —  30 EP",
+            value=(
+                "**Self-cast.** Activates for **2 rounds** starting from the end of the current round.\n"
+                f"• EP regen: **+{EP_REGEN_OVERDRIVE}/round** (normally +{EP_REGEN})\n"
+                f"• Boost cost: **{BOOST_EP_COST_OVERDRIVE} EP** (normally {BOOST_EP_COST})\n"
+                "Status shows as `⚡ OD(Xr)` in the champion table."
+            ),
+            inline=False,
+        )
+
+        em.add_field(
+            name="🔋  EMP Charge  —  40 EP",
+            value=(
+                "**Targets an opponent** (picked via pop-up dropdown after selecting EMP).\n"
+                "At resolution, if the target is **orthogonally adjacent**, they are "
+                "**stunned for 1 round** — their move is cancelled and they can't act next turn.\n"
+                "If the target is *not* adjacent the EP cost is **refunded** in full."
+            ),
+            inline=False,
+        )
+
+        em.add_field(
+            name="👻  Decoy Hologram  —  50 EP",
+            value=(
+                "**Self-cast.** Places a holographic clone on the tile you occupied at the "
+                "**start of this round** (your previous position). Fails if you haven't moved "
+                "yet (first round) or the previous tile is a wall / vault cell.\n"
+                "The decoy appears as your champion emoji on the board, potentially drawing "
+                "opponent attention."
+            ),
+            inline=False,
+        )
+
+        em.add_field(
+            name="🎯  Direction Hijack  —  50 EP",
+            value=(
+                "**Targets an opponent** (picked via pop-up dropdown after selecting Hijack).\n"
+                "At resolution, the target's **first queued move direction is replaced** with "
+                "a random orthogonal direction (not their intended one). "
+                "Boosted second moves are unaffected — only the first step is hijacked."
+            ),
+            inline=False,
+        )
+
+        em.add_field(
+            name="📌  General Rules",
+            value=(
+                "• You can only queue **one gadget per round** — selecting a new one replaces the previous.\n"
+                "• Select **🚫 Cancel** from the dropdown to clear your queued gadget.\n"
+                "• EP is checked again at resolution — if you've spent EP elsewhere and no longer "
+                "have enough, the gadget is cancelled (no cost).\n"
+                f"• Max EP cap: **{MAX_EP}**."
+            ),
+            inline=False,
+        )
+
+        em.set_footer(text="Breakthrough · Gadget Reference Card · All costs deducted at resolution")
+        await interaction.response.send_message(embed=em, ephemeral=True)
+
     @app_commands.command(name="breakthrough-leaderboard", description="Show the all-time Heist Coin leaderboard.")
     @app_commands.guild_only()
     async def breakthrough_leaderboard(self, interaction: discord.Interaction) -> None:

@@ -49,7 +49,7 @@ C_BANK    = 0x5865F2   # bank / balance — blurple
 
 # ─────────────────────────────── branding GIFs ───────────────────────────────
 
-GIF_AUCTION_OPEN = "https://media.giphy.com/media/26BRv0ThflsHCqDrG/giphy.gif"   # cash-counting stacks
+GIF_AUCTION_OPEN = "https://media.giphy.com/media/ToMjGpjpXbeVZe9yQqa/giphy.gif"  # SpongeBob opens box — shiny item reveal
 GIF_SOLD         = "https://media.giphy.com/media/g9582DNuQppxC/giphy.gif"          # Leonardo DiCaprio raising a glass — Great Gatsby toast
 GIF_OUTBID       = "https://media.giphy.com/media/xT9IgN8QALQjpnkPbq/giphy.gif"  # intense rivalry
 

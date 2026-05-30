@@ -2,7 +2,8 @@
 cogs/ai_companion.py — Biki AI Companion (v2)
 
 Biki is a chaotic, permanently-online Discord "member" powered by Groq's
-llama-3.3-70b-versatile model, with Gemini 2.0 Flash as automatic fallback.
+llama-3.3-70b-versatile model, with Gemini 2.0 Flash as second fallback
+and Cerebras (also llama-3.3-70b) as third fallback — all free.
 
 Trigger conditions:
   - Someone pings @Biki
@@ -11,7 +12,7 @@ Trigger conditions:
 
 Human-likeness layers:
   - Compact system prompt with explicit forbidden-phrase list
-  - Dual AI backend: Groq first, Gemini fallback
+  - Triple AI backend: Groq → Gemini → Cerebras (all free)
   - Post-processor strips every AI tell before sending
   - Exactly 1s pre-typing delay before each message part
   - Typing indicator duration scales with message length (~55 WPM)
@@ -42,8 +43,9 @@ Tables (PostgreSQL):
     biki_warnings (id SERIAL PK, guild_id, user_id, warned_by, reason, created_at)
 
 Environment:
-    GROQ_API_KEY   — Groq API key (primary AI backend)
-    GEMINI_API_KEY — Google Gemini API key (fallback AI backend)
+    GROQ_API_KEY      — Groq API key (primary AI backend)
+    GEMINI_API_KEY    — Google Gemini API key (second fallback)
+    CEREBRAS_API_KEY  — Cerebras API key (third fallback, free at cerebras.ai)
 """
 
 import asyncio
@@ -467,11 +469,12 @@ def _db_clear_warnings(guild_id: int, user_id: int) -> None:
         con.commit()
 
 
-# Module-level Groq client singleton — avoids re-instantiating on every call
+# Module-level client singletons — instantiated once, reused on every call
 _groq_client = None
+_cerebras_client = None
 
 # ---------------------------------------------------------------------------
-# Dual AI backend — Groq first, Gemini fallback
+# Triple AI backend — Groq → Gemini → Cerebras (all free)
 # (synchronous — wrap with asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
@@ -483,8 +486,8 @@ def _call_ai(
 ) -> str:
     """
     Try Groq (llama-3.3-70b-versatile) first.
-    If that fails or is unconfigured, fall back to Gemini 2.0 Flash.
-    Returns sanitised reply text. Raises RuntimeError if both fail.
+    Fall back to Gemini 2.0 Flash, then Cerebras (llama-3.3-70b).
+    All three are free-tier APIs. Raises RuntimeError only if all three fail.
     """
     system = learning_context + _SYSTEM_PROMPT + mood_addon
     last_error = None
@@ -537,7 +540,25 @@ def _call_ai(
             last_error = e
             log.warning("ai_companion: Gemini also failed: %s", e)
 
-    raise RuntimeError(f"Both APIs failed. Last error: {last_error}")
+    # ── FALLBACK TO CEREBRAS ──────────────────────────────────────────────
+    if config.CEREBRAS_API_KEY:
+        try:
+            global _cerebras_client
+            if _cerebras_client is None:
+                from cerebras.cloud.sdk import Cerebras
+                _cerebras_client = Cerebras(api_key=config.CEREBRAS_API_KEY)
+            response = _cerebras_client.chat.completions.create(
+                model="llama-3.3-70b",
+                messages=[{"role": "system", "content": system}] + messages[-8:],
+                max_tokens=max_tokens,
+                temperature=1.2,
+            )
+            return _sanitise(response.choices[0].message.content.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: Cerebras also failed: %s", e)
+
+    raise RuntimeError(f"All AI backends failed. Last error: {last_error}")
 
 
 # ---------------------------------------------------------------------------

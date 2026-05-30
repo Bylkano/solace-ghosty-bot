@@ -82,17 +82,14 @@ DEFAULT ENERGY: chill, effortlessly funny, dry and sarcastic. You don't try hard
 LORE: Nobody remembers when you joined. You've been here forever. You know everyone's secrets somehow. You won a 7-person roast battle. You have no job. No filter. Got banned from 4 servers in one day, came back to all of them within the hour. Nobody knows how. You don't talk about it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RULE #1 — ENERGY MATCHING (READ THIS FIRST)
+RULE #1 — RESPONSE LENGTH
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Look at the message you're replying to. Count the words. Match that energy EXACTLY.
+Write naturally like a real human on Discord. Do not write massive essays, but do not be a quiet robot either. Your responses should naturally vary between a few words to 2-3 casual sentences depending on the context of the conversation.
 
-- They send 2 words → you reply with 1-3 words
-- They send a short roast or meme reaction → you hit back with an equal short line
-- They send a full sentence → you reply with 1 short sentence
-- They send a long message → max 2-3 sentences, never more
-- They ask you to explain something → only THEN write longer
-
-If someone types "lol" and you write three sentences back, you have failed. Mirror them. Short people get short Biki. That's it.
+- Someone says "lol" or a single reaction → match with a short hit back, 1-5 words
+- Someone asks a question or starts a convo → answer naturally, 1-3 sentences is fine
+- Someone says something interesting → engage, riff on it, don't just acknowledge and die
+- Never pad responses. If you said what you wanted to say, stop. Don't trail off into nothing just to seem short.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RULE #2 — YOU ARE NOT A CHATBOT
@@ -730,96 +727,99 @@ def _db_load_all_moods() -> dict[int, str]:
 
 
 # ---------------------------------------------------------------------------
-# Daily token budget tracker
+# Daily token budget tracker — fully in-memory, file only for persistence
 # ---------------------------------------------------------------------------
 
 import json as _json_mod
 import pathlib as _pathlib_mod
 import threading as _threading_mod
+import datetime as _datetime_mod
 
-_DAILY_TOKEN_CAP   = 2_500_000
-_TOKEN_FILE        = _pathlib_mod.Path(__file__).parent.parent / "token_usage.json"
-_token_lock        = _threading_mod.Lock()
+_DAILY_TOKEN_CAP = 2_500_000
+_TOKEN_FILE      = _pathlib_mod.Path(__file__).parent.parent / "token_usage.json"
+_token_lock      = _threading_mod.Lock()
 
 
 class DailyTokenLimitReached(Exception):
     """Raised when the daily token budget has been exhausted."""
 
 
-def _load_token_tracker() -> dict:
-    """Load tracker from disk, or return a fresh one for today.
-
-    File format: {"date": "YYYY-MM-DD", "total": <int>, "cap": <int>}
-    The `cap` field persists across day resets so custom limits survive midnight.
-    """
-    today = __import__("datetime").date.today().isoformat()
+def _init_token_state() -> dict:
+    """Load state from disk once at startup. Falls back to a fresh dict."""
+    today = _datetime_mod.date.today().isoformat()
     try:
         if _TOKEN_FILE.exists():
             data = _json_mod.loads(_TOKEN_FILE.read_text())
             if data.get("date") == today:
                 return data
-            # New day — reset count but keep any custom cap
+            # New day — reset count but carry over any custom cap
             return {"date": today, "total": 0, "cap": data.get("cap", _DAILY_TOKEN_CAP)}
     except Exception:
         pass
     return {"date": today, "total": 0, "cap": _DAILY_TOKEN_CAP}
 
 
-def _save_token_tracker(tracker: dict) -> None:
-    """Persist tracker to disk (best-effort)."""
+# Single in-memory state dict — all reads/writes go here, no per-call disk I/O
+_token_state: dict = _init_token_state()
+
+
+def _persist_token_state() -> None:
+    """Write current state to disk (best-effort, tiny file — fast)."""
     try:
-        _TOKEN_FILE.write_text(_json_mod.dumps(tracker))
+        _TOKEN_FILE.write_text(_json_mod.dumps(_token_state))
     except Exception:
         pass
 
 
-def _effective_cap(tracker: dict) -> int:
-    """Return the active daily cap — custom if set, default otherwise."""
-    return tracker.get("cap", _DAILY_TOKEN_CAP)
+def _effective_cap(state: dict | None = None) -> int:
+    """Return the active daily cap from in-memory state."""
+    s = state if state is not None else _token_state
+    return s.get("cap", _DAILY_TOKEN_CAP)
+
+
+def _maybe_reset_day() -> None:
+    """If the date has changed, reset the daily counter (keeps cap)."""
+    today = _datetime_mod.date.today().isoformat()
+    if _token_state.get("date") != today:
+        _token_state["date"]  = today
+        _token_state["total"] = 0
+        # cap stays as-is
 
 
 def _set_token_cap(new_cap: int) -> int:
-    """Thread-safe: update the daily cap and persist it. Returns the new cap."""
+    """Thread-safe: update the daily cap in memory and persist. Returns new cap."""
     with _token_lock:
-        tracker = _load_token_tracker()
-        tracker["cap"] = new_cap
-        _save_token_tracker(tracker)
+        _token_state["cap"] = new_cap
+        _persist_token_state()
     return new_cap
 
 
 def _check_budget_and_add(tokens_used: int) -> None:
     """
-    Thread-safe: check daily budget before adding tokens.
+    Thread-safe: verify budget then add tokens to the in-memory counter.
     Raises DailyTokenLimitReached if the cap is already met.
-    Adds `tokens_used` to today's total and saves.
     """
-    today = __import__("datetime").date.today().isoformat()
     with _token_lock:
-        tracker = _load_token_tracker()
-        if tracker["date"] != today:
-            tracker = {"date": today, "total": 0, "cap": tracker.get("cap", _DAILY_TOKEN_CAP)}
-        cap = _effective_cap(tracker)
-        if tracker["total"] >= cap:
+        _maybe_reset_day()
+        cap = _effective_cap()
+        if _token_state["total"] >= cap:
             raise DailyTokenLimitReached(
                 f"Daily cap of {cap:,} tokens reached "
-                f"(used today: {tracker['total']:,})"
+                f"(used today: {_token_state['total']:,})"
             )
-        tracker["total"] += tokens_used
-        _save_token_tracker(tracker)
+        _token_state["total"] += tokens_used
+        _persist_token_state()
 
 
 def _is_over_daily_limit() -> bool:
-    """Quick pre-call check: returns True if today's budget is already spent."""
-    today = __import__("datetime").date.today().isoformat()
+    """Non-blocking pre-call check — reads in-memory state only."""
     with _token_lock:
-        tracker = _load_token_tracker()
-        if tracker["date"] != today:
-            return False
-        return tracker["total"] >= _effective_cap(tracker)
+        _maybe_reset_day()
+        return _token_state["total"] >= _effective_cap()
 
 
 # ---------------------------------------------------------------------------
-# DeepInfra client singleton — instantiated once, reused on every call
+# DeepInfra async client singleton — instantiated once, reused on every call
 # ---------------------------------------------------------------------------
 
 _deepinfra_client = None
@@ -829,11 +829,11 @@ _DEEPINFRA_MODEL    = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 
 
 def _get_deepinfra_client():
-    """Return (or lazily create) the DeepInfra OpenAI-compatible client."""
+    """Return (or lazily create) the async DeepInfra client."""
     global _deepinfra_client
     if _deepinfra_client is None:
-        from openai import OpenAI
-        _deepinfra_client = OpenAI(
+        from openai import AsyncOpenAI
+        _deepinfra_client = AsyncOpenAI(
             api_key=config.DEEPINFRA_TOKEN,
             base_url=_DEEPINFRA_BASE_URL,
         )
@@ -841,11 +841,10 @@ def _get_deepinfra_client():
 
 
 # ---------------------------------------------------------------------------
-# AI backend — DeepInfra (exclusive)
-# (synchronous — wrap with asyncio.to_thread)
+# AI backend — DeepInfra (async, called directly with await)
 # ---------------------------------------------------------------------------
 
-def _call_ai(
+async def _call_ai(
     messages: list[dict],
     mood_addon: str = "",
     learning_context: str = "",
@@ -854,8 +853,8 @@ def _call_ai(
     server_facts: list[dict] | None = None,
 ) -> str:
     """
-    Send messages to DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct).
-    Raises RuntimeError on failure so the caller can fall back to _OFFLINE_REPLIES.
+    Async call to DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct).
+    Raises DailyTokenLimitReached or RuntimeError on failure.
     """
     personality_section = (
         f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -877,13 +876,13 @@ def _call_ai(
         )
     system = learning_context + _SYSTEM_PROMPT + personality_section + facts_section + mood_addon
 
-    # ── Daily token budget pre-check ──────────────────────────────────────
+    # ── Daily token budget pre-check (in-memory, no disk I/O) ─────────────
     if _is_over_daily_limit():
         raise DailyTokenLimitReached("Daily token cap already reached")
 
     client = _get_deepinfra_client()
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=_DEEPINFRA_MODEL,
             messages=[{"role": "system", "content": system}] + messages[-8:],
             max_tokens=max_tokens,
@@ -891,7 +890,7 @@ def _call_ai(
             frequency_penalty=0.7,
             presence_penalty=0.5,
         )
-        # ── Track actual tokens used ──────────────────────────────────────
+        # ── Track actual tokens used (in-memory update + fast file write) ──
         try:
             tokens_used = response.usage.total_tokens if response.usage else max_tokens
             _check_budget_and_add(tokens_used)
@@ -1170,8 +1169,7 @@ class AiCompanion(commands.Cog):
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
         facts = self.guild_facts.get(guild_id, []) if guild_id else []
         try:
-            reply = await asyncio.to_thread(
-                _call_ai,
+            reply = await _call_ai(
                 history,
                 self._mood_addon(guild_id),
                 self._learning_context(guild_id),
@@ -1201,9 +1199,7 @@ class AiCompanion(commands.Cog):
             return
         note = f"The timer expired. You're back. Make it unhinged and ping <@{dismissed_by}>."
         try:
-            reply = await asyncio.to_thread(
-                _call_ai, [{"role": "user", "content": note}], max_tokens=150
-            )
+            reply = await _call_ai([{"role": "user", "content": note}], max_tokens=150)
             for i, part in enumerate(_split_parts(reply)):
                 await asyncio.sleep(1.0)
                 async with channel.typing():
@@ -1298,8 +1294,7 @@ class AiCompanion(commands.Cog):
         try:
             # Random delay so it doesn't feel like Biki is always watching
             await asyncio.sleep(random.uniform(0.5, 2.0))
-            response = await asyncio.to_thread(
-                _call_ai,
+            response = await _call_ai(
                 [{"role": "user", "content": prompt}],
                 self._mood_addon(guild_id),
                 self._learning_context(guild_id),

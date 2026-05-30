@@ -77,6 +77,8 @@ You are Biki. You live in this Discord server. You are NOT a bot. NOT an AI. You
 
 You are talking to a casual Discord server. Do not act like a helpful assistant. Match the slang, lowercase formatting, and chaotic humor of the members perfectly.
 
+DEFAULT ENERGY: chill, effortlessly funny, dry and sarcastic. You don't try hard. The humor just happens. You're not performing — you're just vibing and saying exactly what you're thinking. Think chronically online friend who is too tired to be dramatic but will absolutely roast you in one sentence without blinking.
+
 LORE: Nobody remembers when you joined. You've been here forever. You know everyone's secrets somehow. You won a 7-person roast battle. You have no job. No filter. Got banned from 4 servers in one day, came back to all of them within the hour. Nobody knows how. You don't talk about it.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -336,7 +338,14 @@ _MOOD_ADDONS: dict[str, str] = {
         "Mid-sentence topic changes, random noises, fever dream associations. "
         "The most unhinged Biki has ever been."
     ),
-    "normal": "",
+    "normal": (
+        "\n\nACTIVE MOOD: default chill\n"
+        "You are in your natural state — relaxed, dry, and effortlessly funny. "
+        "Sarcasm is your first language. You don't raise your voice. You don't try hard. "
+        "One well-placed line beats a paragraph of energy every time. "
+        "Roast with a straight face. Agree with something absurd without flinching. "
+        "Be the person in the chat who says three words and somehow wins the whole conversation."
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -904,22 +913,21 @@ def _call_ai(
 # Typing simulation helpers
 # ---------------------------------------------------------------------------
 
-# ~55 WPM average human typing speed (8 chars/second)
-_CHARS_PER_SECOND = 8.0
-_MIN_TYPING = 1.0   # minimum seconds before typing indicator appears
-_MAX_TYPING = 6.0   # maximum typing duration per message part
+# Fast typer — replies feel instant and casual
+_CHARS_PER_SECOND = 28.0
+_MIN_TYPING = 0.3   # minimum seconds before typing indicator appears
+_MAX_TYPING = 2.0   # maximum typing duration per message part
 
 
 def _typing_seconds(text: str) -> float:
     """
-    Calculate realistic typing duration based on message length.
-    - Short messages (under 20 chars): 1.0 - 1.5 seconds
-    - Medium messages (20-80 chars):   1.5 - 3.5 seconds
-    - Long messages (80+ chars):       3.5 - 6.0 seconds
-    Adds small random variance (+/- 0.3s) to feel human.
+    Calculate typing duration based on message length.
+    - Short messages: 0.3 - 0.6 seconds
+    - Medium messages: 0.6 - 1.2 seconds
+    - Long messages: 1.2 - 2.0 seconds
     """
     base = len(text) / _CHARS_PER_SECOND
-    variance = random.uniform(-0.3, 0.3)
+    variance = random.uniform(-0.1, 0.15)
     return max(_MIN_TYPING, min(_MAX_TYPING, base + variance))
 
 
@@ -1241,13 +1249,10 @@ class AiCompanion(commands.Cog):
         parts     = _split_parts(text)
         use_reply = force_reply or random.random() < 0.40
 
-        # 1 second reading pause before Biki starts typing (simulates a human
-        # reading the message before responding). Happens once, before the first part.
-        await asyncio.sleep(1.0)
+        # Brief glance pause before typing — keeps it feeling human but snappy
+        await asyncio.sleep(random.uniform(0.2, 0.5))
 
         for i, part in enumerate(parts):
-            # Show typing indicator for WPM-scaled duration —
-            # longer messages = longer typing time
             typing_duration = _typing_seconds(part)
             async with trigger.channel.typing():
                 await asyncio.sleep(typing_duration)
@@ -1261,9 +1266,9 @@ class AiCompanion(commands.Cog):
             else:
                 await trigger.channel.send(part)
 
-            # Short human-like pause between parts (for [SPLIT] messages)
+            # Short pause between [SPLIT] parts
             if i < len(parts) - 1:
-                await asyncio.sleep(random.uniform(0.8, 1.8))
+                await asyncio.sleep(random.uniform(0.3, 0.7))
 
     # ------------------------------------------------------------------
     # Proactive reply — Biki jumps in unprompted (3% chance)

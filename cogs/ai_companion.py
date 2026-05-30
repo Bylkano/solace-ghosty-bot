@@ -51,6 +51,7 @@ import logging
 import random
 import re
 import sys
+import time
 import pathlib
 from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
@@ -466,6 +467,9 @@ def _db_clear_warnings(guild_id: int, user_id: int) -> None:
         con.commit()
 
 
+# Module-level Groq client singleton — avoids re-instantiating on every call
+_groq_client = None
+
 # ---------------------------------------------------------------------------
 # Dual AI backend — Groq first, Gemini fallback
 # (synchronous — wrap with asyncio.to_thread)
@@ -475,7 +479,7 @@ def _call_ai(
     messages: list[dict],
     mood_addon: str = "",
     learning_context: str = "",
-    max_tokens: int = 512,
+    max_tokens: int = 300,
 ) -> str:
     """
     Try Groq (llama-3.3-70b-versatile) first.
@@ -488,11 +492,13 @@ def _call_ai(
     # ── TRY GROQ FIRST ────────────────────────────────────────────────────
     if config.GROQ_API_KEY:
         try:
-            from groq import Groq
-            client = Groq(api_key=config.GROQ_API_KEY)
-            response = client.chat.completions.create(
+            global _groq_client
+            if _groq_client is None:
+                from groq import Groq
+                _groq_client = Groq(api_key=config.GROQ_API_KEY)
+            response = _groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[{"role": "system", "content": system}] + messages,
+                messages=[{"role": "system", "content": system}] + messages[-8:],
                 max_tokens=max_tokens,
                 temperature=1.2,
                 frequency_penalty=0.7,
@@ -514,7 +520,7 @@ def _call_ai(
             )
             # Build Gemini-format history from all but the last message
             gemini_history = []
-            for msg in messages[:-1]:
+            for msg in messages[-8:-1]:
                 role = "user" if msg["role"] == "user" else "model"
                 gemini_history.append({"role": role, "parts": [msg["content"]]})
             chat = model.start_chat(history=gemini_history)
@@ -694,6 +700,9 @@ class AiCompanion(commands.Cog):
         # guild_id → message count for learning context injection throttle
         self._learning_inject_counter: dict[int, int] = {}
 
+        # guild_id → cached learning context string (invalidated every 10 new messages)
+        self._learning_ctx_cache: dict[int, str] = {}
+
         # user_id → timestamp of last successful reply (30s cooldown)
         self._user_cooldowns: dict[int, float] = {}
 
@@ -751,7 +760,12 @@ class AiCompanion(commands.Cog):
         self._learning_inject_counter[guild_id] = count
         if count % 5 != 0:
             return ""
-        return _build_learning_context(self.server_vocab.get(guild_id, {}))
+        # Return cached build; cache is invalidated in _learn_from_message every 10 msgs
+        if guild_id in self._learning_ctx_cache:
+            return self._learning_ctx_cache[guild_id]
+        ctx = _build_learning_context(self.server_vocab.get(guild_id, {}))
+        self._learning_ctx_cache[guild_id] = ctx
+        return ctx
 
     async def _ai_reply(
         self,
@@ -759,9 +773,10 @@ class AiCompanion(commands.Cog):
         user_text: str,
         extra_note: Optional[str] = None,
         guild_id: Optional[int] = None,
-        max_tokens: int = 512,
+        max_tokens: int = 300,
     ) -> str:
         """Call _call_ai with full conversation history, update history, return reply."""
+        user_text = user_text[:400]  # cap input tokens
         history = list(self.conversations.get(user_id, []))
         input_content = user_text
         if extra_note:
@@ -795,7 +810,7 @@ class AiCompanion(commands.Cog):
         note = f"The timer expired. You're back. Make it unhinged and ping <@{dismissed_by}>."
         try:
             reply = await asyncio.to_thread(
-                _call_ai, [{"role": "user", "content": note}]
+                _call_ai, [{"role": "user", "content": note}], max_tokens=150
             )
             for i, part in enumerate(_split_parts(reply)):
                 await asyncio.sleep(1.0)
@@ -883,6 +898,10 @@ class AiCompanion(commands.Cog):
             "Keep it SHORT. Max 1-2 sentences. Feel spontaneous not forced."
         )
 
+        # Not worth an API call for short messages
+        if len(message.content.split()) < 4:
+            return
+
         guild_id = message.guild.id if message.guild else None
 
         try:
@@ -950,6 +969,7 @@ class AiCompanion(commands.Cog):
 
         if len(v["sample_messages"]) % 10 == 0:
             v["energy"] = _detect_energy(v["_recent_buf"])
+            self._learning_ctx_cache.pop(guild_id, None)  # invalidate cache
 
     # ------------------------------------------------------------------
     # Moderation — 3-priority target resolution
@@ -1047,7 +1067,8 @@ class AiCompanion(commands.Cog):
             )
             async with message.channel.typing():
                 reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id
+                    author.id, clean, extra_note=note, guild_id=message.guild.id,
+                    max_tokens=150,
                 )
             await self._send_biki_reply(message, reply)
             return True
@@ -1096,7 +1117,8 @@ class AiCompanion(commands.Cog):
             )
             async with message.channel.typing():
                 reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id
+                    author.id, clean, extra_note=note, guild_id=message.guild.id,
+                    max_tokens=150,
                 )
             await self._send_biki_reply(message, reply)
             return True
@@ -1131,7 +1153,8 @@ class AiCompanion(commands.Cog):
             )
             async with message.channel.typing():
                 reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id
+                    author.id, clean, extra_note=note, guild_id=message.guild.id,
+                    max_tokens=150,
                 )
             await self._send_biki_reply(message, reply)
 
@@ -1149,7 +1172,8 @@ class AiCompanion(commands.Cog):
             )
             async with message.channel.typing():
                 reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id
+                    author.id, clean, extra_note=note, guild_id=message.guild.id,
+                    max_tokens=150,
                 )
             await self._send_biki_reply(message, reply)
 
@@ -1168,7 +1192,8 @@ class AiCompanion(commands.Cog):
             )
             async with message.channel.typing():
                 reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id
+                    author.id, clean, extra_note=note, guild_id=message.guild.id,
+                    max_tokens=150,
                 )
             await self._send_biki_reply(message, reply)
 
@@ -1187,7 +1212,8 @@ class AiCompanion(commands.Cog):
             )
             async with message.channel.typing():
                 reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id
+                    author.id, clean, extra_note=note, guild_id=message.guild.id,
+                    max_tokens=150,
                 )
             await self._send_biki_reply(message, reply)
 
@@ -1220,7 +1246,8 @@ class AiCompanion(commands.Cog):
             )
             async with message.channel.typing():
                 reply = await self._ai_reply(
-                    author.id, clean, extra_note=note, guild_id=message.guild.id
+                    author.id, clean, extra_note=note, guild_id=message.guild.id,
+                    max_tokens=150,
                 )
             await self._send_biki_reply(message, reply)
 
@@ -1302,7 +1329,6 @@ class AiCompanion(commands.Cog):
             )
 
         # ── Per-user cooldown (30 seconds) ───────────────────────────────
-        import time
         now = time.time()
         last_reply = self._user_cooldowns.get(user_id, 0)
         cooldown_remaining = 30.0 - (now - last_reply)
@@ -1351,7 +1377,8 @@ class AiCompanion(commands.Cog):
                     try:
                         async with message.channel.typing():
                             reply = await self._ai_reply(
-                                user_id, clean, extra_note=note, guild_id=guild_id
+                                user_id, clean, extra_note=note, guild_id=guild_id,
+                                max_tokens=150,
                             )
                         await self._send_biki_reply(message, reply)
                     except Exception as exc:
@@ -1373,7 +1400,8 @@ class AiCompanion(commands.Cog):
                 try:
                     async with message.channel.typing():
                         reply = await self._ai_reply(
-                            user_id, clean, extra_note=note, guild_id=guild_id
+                            user_id, clean, extra_note=note, guild_id=guild_id,
+                            max_tokens=150,
                         )
                     await self._send_biki_reply(message, reply)
                 except Exception as exc:
@@ -1395,7 +1423,8 @@ class AiCompanion(commands.Cog):
                 try:
                     async with message.channel.typing():
                         reply = await self._ai_reply(
-                            user_id, clean, extra_note=note, guild_id=guild_id
+                            user_id, clean, extra_note=note, guild_id=guild_id,
+                            max_tokens=150,
                         )
                     await self._send_biki_reply(message, reply)
                 except Exception as exc:
@@ -1415,7 +1444,8 @@ class AiCompanion(commands.Cog):
                 try:
                     async with message.channel.typing():
                         reply = await self._ai_reply(
-                            user_id, clean, extra_note=note, guild_id=guild_id
+                            user_id, clean, extra_note=note, guild_id=guild_id,
+                            max_tokens=150,
                         )
                     await self._send_biki_reply(message, reply)
                 except Exception as exc:

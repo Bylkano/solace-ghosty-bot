@@ -49,6 +49,7 @@ COGS = [
     "cogs.welcome",
     "cogs.simon_says",
     "cogs.server_drops_economy",
+    "cogs.auction",
 ]
 
 

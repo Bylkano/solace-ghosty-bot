@@ -1029,6 +1029,65 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
         ))
 
     # ───────────────────────────────────────────────────────────────────────
+    # COMMAND: !simontimer
+    # ───────────────────────────────────────────────────────────────────────
+
+    @commands.command(name="simontimer")
+    @commands.has_permissions(administrator=True)
+    async def simon_timer(
+        self, ctx: commands.Context, max_seconds: float = 0, min_seconds: float = 0
+    ) -> None:
+        """Set round time limits. Usage: !simontimer <max_seconds> <min_seconds>"""
+        global STARTING_TIME, MINIMUM_TIME
+
+        # ── show current values if no args given ──────────────────────────
+        if max_seconds == 0 and min_seconds == 0:
+            await ctx.send(embed=self._embed(
+                "⏱️  Current Timer Settings",
+                (
+                    f"**Max time (round 1):** `{STARTING_TIME:.0f}s`\n"
+                    f"**Min time (floor):** `{MINIMUM_TIME:.0f}s`\n\n"
+                    "Use `!simontimer <max> <min>` to change.\n"
+                    "Example: `!simontimer 25 8`"
+                ),
+                COLOUR_STATS,
+            ))
+            return
+
+        # ── validate ──────────────────────────────────────────────────────
+        errors = []
+        if not (5 <= max_seconds <= 120):
+            errors.append("Max time must be between **5** and **120** seconds.")
+        if not (3 <= min_seconds <= 60):
+            errors.append("Min time must be between **3** and **60** seconds.")
+        if not errors and min_seconds >= max_seconds:
+            errors.append("Min time must be **less than** max time.")
+
+        if errors:
+            await ctx.send(embed=self._embed(
+                "❌  Invalid Timer Values",
+                "\n".join(errors),
+                COLOUR_BOOM,
+            ))
+            return
+
+        old_max = STARTING_TIME
+        old_min = MINIMUM_TIME
+        STARTING_TIME = float(max_seconds)
+        MINIMUM_TIME  = float(min_seconds)
+
+        await ctx.send(embed=self._embed(
+            "⏱️  Timer Updated",
+            (
+                f"**Max time:** `{old_max:.0f}s` → **`{STARTING_TIME:.0f}s`**\n"
+                f"**Min time:** `{old_min:.0f}s` → **`{MINIMUM_TIME:.0f}s`**\n\n"
+                "Changes apply to the **next game**. 🎮"
+            ),
+            COLOUR_WIN,
+            footer=f"Updated by {ctx.author.display_name}",
+        ))
+
+    # ───────────────────────────────────────────────────────────────────────
     # COMMAND: !simonleaderboard
     # ───────────────────────────────────────────────────────────────────────
 
@@ -1138,7 +1197,7 @@ class SimonSaysGame(commands.Cog, name="Simon Says"):
             value=(
                 "Type **`join`** when a lobby opens to enter.\n"
                 "Players are called one at a time in rotation.\n"
-                "Time limit starts at **15s**, drops by 1s each elimination (min 10s).\n"
+                f"Time limit starts at **{STARTING_TIME:.0f}s**, drops by 1s each elimination (min {MINIMUM_TIME:.0f}s).\n"
                 "Wrong answer or timeout = **BOOM**. 💣"
             ),
             inline=False,

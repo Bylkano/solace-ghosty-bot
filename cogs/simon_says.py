@@ -83,7 +83,7 @@ COLOUR_PAUSE   = discord.Color.from_rgb(149, 165, 166)   # grey
 # ---------------------------------------------------------------------------
 # TIMING CONSTANTS
 # ---------------------------------------------------------------------------
-STARTING_TIME      = 15.0    # seconds for round 1
+STARTING_TIME      = 20.0    # seconds for round 1
 MINIMUM_TIME       = 10.0    # floor — never drops below this
 TIME_REDUCTION     =  1.0    # seconds shaved off per elimination
 POWERUP_BONUS      =  3.0    # extra seconds from a power-up

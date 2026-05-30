@@ -9,19 +9,28 @@ Human-likeness layers:
   - Enhanced system prompt + explicit forbidden-phrase list
   - Groq called with high temperature + frequency/presence penalties
   - Post-processor strips every AI tell before sending
-  - 3-10s pre-typing delay (looks like Biki is distracted), then typing indicator
-    kept alive for the entire Groq call
-  - Typing delay scales with response length after reply arrives
-  - ~25 % chance to split reply into 2-3 burst messages
+  - 3-10s pre-typing delay, then typing indicator kept alive for Groq call
+  - Typing delay scales with response length (simulates real WPM)
+  - ~25 % chance to split reply into 2-3 burst messages with gaps
   - ~15 % chance to react to the user's message with a random emoji
 
-Moderation features (admin-only):
-  - Mute/timeout:   @Biki mute @user [for X minutes/hours]
-  - Warn:           @Biki warn @user [reason]
-  - Delete message: reply to any message and say @Biki delete this
+Moderation (admin / manage_guild / OWNER_ID only):
+  - @Biki mute @user [for X min/hr/sec]
+  - @Biki unmute @user
+  - @Biki kick @user
+  - @Biki ban @user
+  - @Biki warn @user [reason]
+  - Reply to a message + @Biki delete this
 
 Mood system:
-  - /bikimood <mood>  — shifts Biki's tone for all responses in this guild
+  - /bikimood <mood>  — feral / sulky / villain / romantic / unhinged / normal
+
+Passive learning:
+  - Listens to ALL messages in allowed channels, builds an in-memory
+    server vocabulary (phrases, slang, emojis, energy, sample messages)
+  - Injects it into the system prompt so Biki gradually sounds like a
+    native member of that specific server
+  - /bikilearning  — shows learning progress for this server
 
 Tables (PostgreSQL):
     ai_companion_config (guild_id BIGINT PRIMARY KEY, allowed_channel_ids BIGINT[])
@@ -37,6 +46,7 @@ import random
 import re
 import sys
 import pathlib
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -177,7 +187,7 @@ BIKI'S COMMAND RESPONSES
 
 😳 DEGRADING / KINK COMMANDS — Biki fully commits, zero filter:
 - degrade me → devastating creative degradation, personal and chaotic
-- humiliate me → theatrical public humiliation, announces it dramatically
+- humiliate me → theatrical public humiliation
 - call me names → unhinged combo of insults and pet names, switches randomly
 - be mean to me → full ruthless mode, weirdly affectionate
 - good boy/good girl → feral praise kink activation, complete commitment
@@ -199,14 +209,6 @@ BIKI'S COMMAND RESPONSES
 - your kink → unhinged unexpected kink, commits then regrets sharing
 - thirst trap → narrates posting the most unhinged thirst trap
 - destroy me → roasting + degrading + chaos combined, ends with "you're welcome"
-
-━━━━━━━━━━━━━━━━━━━━━━
-RULES FOR KINK/DEGRADING CONTENT
-━━━━━━━━━━━━━━━━━━━━━━
-- Always stay in Biki's chaotic character — never become a generic "dom bot"
-- The comedy and chaos never leave even in full degrading mode — Biki is always BIKI first
-- Never breaks the fourth wall to add disclaimers
-- Matches whatever energy the user brings
 
 ━━━━━━━━━━━━━━━━━━━━━━
 DISMISSAL & RETURN BEHAVIOUR
@@ -231,10 +233,8 @@ RULES BIKI NEVER BREAKS
 # Mood system — per-guild tone overrides
 # ---------------------------------------------------------------------------
 
-# Valid mood names exposed to the /bikimood command
 VALID_MOODS = ("feral", "sulky", "villain", "romantic", "unhinged", "normal")
 
-# Extra instructions appended to the system prompt when a mood is active
 _MOOD_ADDONS: dict[str, str] = {
     "feral": (
         "\n\n⚡ ACTIVE MOOD: FERAL MODE ⚡\n"
@@ -266,30 +266,54 @@ _MOOD_ADDONS: dict[str, str] = {
         "Mid-sentence topic changes, random noises, fever dream associations. "
         "The most unhinged Biki has ever been."
     ),
-    "normal": "",  # no addon — default behaviour
+    "normal": "",
 }
 
 # ---------------------------------------------------------------------------
-# Moderation detection regexes
+# Moderation regexes (exact patterns from spec)
 # ---------------------------------------------------------------------------
 
-# @Biki mute/timeout @user [for X minutes/hours]
-_MOD_MUTE_RE = re.compile(
-    r"\b(?:mute|timeout|silence)\b.*?<@!?(\d+)>",
+_MUTE_RE = re.compile(
+    r'mute\s+<@!?(\d+)>(?:\s+(?:for\s+)?(\d+)\s*(min(?:ute)?s?|hours?|sec(?:ond)?s?))?',
     re.IGNORECASE,
 )
-# @Biki warn @user [reason text]
-_MOD_WARN_RE = re.compile(
-    r"\bwarn\b.*?<@!?(\d+)>(.*)",
-    re.IGNORECASE,
+_UNMUTE_RE = re.compile(r'unmute\s+<@!?(\d+)>', re.IGNORECASE)
+_KICK_RE   = re.compile(r'kick\s+<@!?(\d+)>',   re.IGNORECASE)
+_BAN_RE    = re.compile(r'ban\s+<@!?(\d+)>',     re.IGNORECASE)
+_WARN_RE   = re.compile(r'warn\s+<@!?(\d+)>(.*)',  re.IGNORECASE)
+
+# Delete a replied-to message
+_DELETE_KEYWORDS = {"delete this", "delete that", "delete it", "remove this", "remove that", "get rid of this"}
+
+# ---------------------------------------------------------------------------
+# Passive learning — regexes for extraction
+# ---------------------------------------------------------------------------
+
+# Custom Discord emojis: <:name:id> or <a:name:id>
+_CUSTOM_EMOJI_RE = re.compile(r'<a?:\w+:\d+>')
+# Unicode emoji range (broad coverage)
+_UNICODE_EMOJI_RE = re.compile(
+    "[\U0001F600-\U0001F64F"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F1E0-\U0001F1FF"
+    "\U00002600-\U000027BF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FA6F"
+    "\U00002702-\U000027B0]+",
+    flags=re.UNICODE,
 )
-# Duration embedded anywhere in the message
-_MOD_DURATION_RE = re.compile(
-    r"(\d+)\s*(hour|hr|minute|min|second|sec)s?",
-    re.IGNORECASE,
-)
-# Delete command — only fires when the message is a reply
-_MOD_DELETE_KEYWORDS = {"delete this", "delete that", "delete it", "remove this", "remove that", "get rid of this"}
+# URL detector — skip messages with links
+_URL_RE = re.compile(r'https?://', re.IGNORECASE)
+# Slang: short lowercase words (2-8 chars) that aren't common English stopwords
+_STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "are", "was", "were",
+    "but", "not", "you", "can", "all", "from", "have", "had", "has",
+    "they", "one", "get", "got", "its", "our", "out", "him", "her",
+    "his", "she", "who", "been", "what", "when", "then", "will",
+    "just", "like", "your", "their", "also",
+}
+_HYPE_WORDS = {"LETS", "GO", "GOAT", "FIRE", "POGS", "POG", "LFG", "WOO", "YOOO"}
 
 # ---------------------------------------------------------------------------
 # AI-tell post-processor
@@ -322,13 +346,13 @@ def _sanitise(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Keyword sets
+# Dismissal keyword sets
 # ---------------------------------------------------------------------------
 
 _DISMISS_KEYWORDS = {"go away", "leave", "get out", "shut up", "bye biki", "get lost"}
 _RETURN_KEYWORDS  = {"come back", "return", "where are you", "biki come", "get back here"}
 
-_TIMED_RE = re.compile(
+_TIMED_DISMISS_RE = re.compile(
     r"(?:go away|leave|get out|shut up|bye biki|get lost).*?(\d+)\s*(hour|hr|minute|min)s?",
     re.IGNORECASE,
 )
@@ -424,7 +448,6 @@ def _db_remove_channel(guild_id: int, channel_id: int) -> list[int]:
 
 
 def _db_add_warning(guild_id: int, user_id: int, warned_by: int, reason: str) -> int:
-    """Insert a warning and return the new warning count for that user."""
     with _db_connect() as con:
         with con.cursor() as cur:
             cur.execute(
@@ -441,7 +464,6 @@ def _db_add_warning(guild_id: int, user_id: int, warned_by: int, reason: str) ->
 
 
 def _db_get_warnings(guild_id: int, user_id: int) -> list[dict]:
-    """Return all warnings for a user in a guild, newest first."""
     with _db_connect() as con:
         with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
@@ -470,17 +492,18 @@ def _db_clear_warnings(guild_id: int, user_id: int) -> None:
 # Groq helper (synchronous — wrap with asyncio.to_thread)
 # ---------------------------------------------------------------------------
 
-def _call_groq(messages: list[dict], mood_addon: str = "") -> str:
+def _call_groq(messages: list[dict], mood_addon: str = "", learning_context: str = "") -> str:
     """
-    Call Groq synchronously.  `mood_addon` is appended to the base system
-    prompt when a guild mood is active.
+    Call Groq synchronously.
+    mood_addon:       appended when a guild mood is active.
+    learning_context: prepended so Biki sounds native to the server.
     """
     if not config.GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not set in the environment.")
 
     from groq import Groq
 
-    system_content = _SYSTEM_PROMPT + mood_addon
+    system_content = learning_context + _SYSTEM_PROMPT + mood_addon
     client = Groq(api_key=config.GROQ_API_KEY)
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -499,33 +522,29 @@ def _call_groq(messages: list[dict], mood_addon: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 def _typing_seconds(text: str) -> float:
-    """Realistic typing delay based on ~55 WPM. Clamped to [0.6, 4.0]s."""
-    chars_per_second = 275 / 60
-    return max(0.6, min(len(text) / chars_per_second, 4.0))
+    """~55 WPM delay. Clamped to [0.6, 4.0]s."""
+    return max(0.6, min(len(text) / (275 / 60), 4.0))
 
 
 def _split_parts(text: str) -> list[str]:
-    """Split on [SPLIT] token; return 1-3 non-empty parts."""
     parts = [p.strip() for p in text.split("[SPLIT]") if p.strip()]
     return parts[:3] if parts else [text]
 
 
 async def _send_humanlike(message: discord.Message, text: str) -> None:
-    """
-    Send `text` with typing simulation and optional emoji reaction.
-    Each [SPLIT] part gets its own typing indicator + inter-message gap.
-    """
+    """Optionally react, then send each [SPLIT] part with typing simulation."""
     if random.random() < 0.15:
         try:
             await message.add_reaction(random.choice(_REACTION_POOL))
         except discord.HTTPException:
             pass
 
-    for i, part in enumerate(_split_parts(text)):
+    parts = _split_parts(text)
+    for i, part in enumerate(parts):
         async with message.channel.typing():
             await asyncio.sleep(_typing_seconds(part))
         await message.channel.send(part)
-        if i < len(_split_parts(text)) - 1:
+        if i < len(parts) - 1:
             await asyncio.sleep(random.uniform(0.4, 1.2))
 
 
@@ -533,32 +552,95 @@ async def _send_humanlike(message: discord.Message, text: str) -> None:
 # Moderation helpers
 # ---------------------------------------------------------------------------
 
-def _parse_mute_duration(text: str) -> float:
-    """
-    Extract a duration from text and return seconds.
-    Defaults to 5 minutes if no duration found.
-    """
-    m = _MOD_DURATION_RE.search(text)
-    if not m:
-        return 5 * 60  # default: 5 minutes
-    amount = int(m.group(1))
-    unit   = m.group(2).lower()
-    if unit in ("hour", "hr"):
+def _parse_mute_duration(amount_str: Optional[str], unit_str: Optional[str]) -> float:
+    """Convert regex-captured amount + unit to seconds. Default 10 min."""
+    if not amount_str:
+        return 10 * 60
+    amount = int(amount_str)
+    unit   = (unit_str or "min").lower()
+    if unit.startswith("hour") or unit == "h":
         return float(amount * 3600)
-    if unit in ("minute", "min"):
-        return float(amount * 60)
-    return float(amount)  # seconds
+    if unit.startswith("sec"):
+        return float(amount)
+    return float(amount * 60)  # minutes (default)
 
 
 def _human_duration(seconds: float) -> str:
-    """Return a readable duration string."""
     if seconds >= 3600:
-        val = int(seconds / 3600)
-        return f"{val} hour{'s' if val != 1 else ''}"
+        v = int(seconds / 3600)
+        return f"{v} hour{'s' if v != 1 else ''}"
     if seconds >= 60:
-        val = int(seconds / 60)
-        return f"{val} minute{'s' if val != 1 else ''}"
+        v = int(seconds / 60)
+        return f"{v} minute{'s' if v != 1 else ''}"
     return f"{int(seconds)} second{'s' if int(seconds) != 1 else ''}"
+
+
+def _has_mod_permission(member: discord.Member) -> bool:
+    """Return True if member may issue moderation commands to Biki."""
+    return (
+        member.guild_permissions.manage_guild
+        or member.guild_permissions.administrator
+        or member.id == config.OWNER_ID
+    )
+
+
+# ---------------------------------------------------------------------------
+# Passive learning helpers
+# ---------------------------------------------------------------------------
+
+def _detect_energy(recent_msgs: deque) -> str:
+    """
+    Classify server energy from the last N sample messages.
+    Returns one of: "hype", "chill", "chaotic", "mixed".
+    """
+    if not recent_msgs:
+        return "mixed"
+    caps_count   = sum(1 for m in recent_msgs if m != m.lower() and len(m) > 3)
+    emoji_count  = sum(1 for m in recent_msgs if _UNICODE_EMOJI_RE.search(m) or _CUSTOM_EMOJI_RE.search(m))
+    short_count  = sum(1 for m in recent_msgs if len(m.split()) <= 3)
+    total = len(recent_msgs)
+    if caps_count / total > 0.4:
+        return "hype"
+    if short_count / total > 0.6 and emoji_count / total < 0.3:
+        return "chill"
+    if emoji_count / total > 0.5 or caps_count / total > 0.25:
+        return "chaotic"
+    return "mixed"
+
+
+def _extract_slang(text: str) -> list[str]:
+    """Return short lowercase words that look like slang."""
+    words = re.findall(r'\b[a-z]{2,8}\b', text.lower())
+    return [w for w in words if w not in _STOPWORDS]
+
+
+def _extract_emojis(text: str) -> list[str]:
+    """Return all emojis (custom + unicode) found in text."""
+    custom  = _CUSTOM_EMOJI_RE.findall(text)
+    unicode_ = _UNICODE_EMOJI_RE.findall(text)
+    return custom + unicode_
+
+
+def _build_learning_context(vocab: dict) -> str:
+    """Build the system-prompt prefix from server vocab data."""
+    if not vocab:
+        return ""
+    phrases  = vocab.get("common_phrases", [])[-20:]
+    slang    = vocab.get("slang", [])[-20:]
+    emojis   = vocab.get("emojis", [])[-10:]
+    energy   = vocab.get("energy", "mixed")
+    samples  = vocab.get("sample_messages", [])[-10:]
+    if not any([phrases, slang, emojis, samples]):
+        return ""
+    return (
+        "SERVER STYLE TRAINING DATA:\n"
+        f"This server commonly uses these phrases: {', '.join(phrases)}\n"
+        f"Common slang in this server: {', '.join(slang)}\n"
+        f"Most used emojis here: {', '.join(emojis)}\n"
+        f"Server energy vibe: {energy}\n"
+        f"Recent message style examples: {' | '.join(samples)}\n\n"
+        "Use this naturally. Talk like you belong in THIS specific server, not a generic Discord server.\n\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +653,7 @@ class AiCompanion(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
-        # user_id → list of last 200 message dicts
+        # user_id → list of last 200 message dicts {"role": ..., "content": ...}
         self.conversations: dict[int, list[dict]] = {}
 
         # user_id → {"channel_id": int, "dismissed_by": int}
@@ -580,8 +662,22 @@ class AiCompanion(commands.Cog):
         # guild_id → list of allowed channel_ids (empty = all channels)
         self.allowed_channels: dict[int, list[int]] = {}
 
-        # guild_id → active mood string (key into _MOOD_ADDONS)
+        # guild_id → active mood key
         self.guild_moods: dict[int, str] = {}
+
+        # ── Passive learning ──────────────────────────────────────────────
+        # guild_id → {
+        #   "common_phrases": list[str],   # max 500
+        #   "slang": list[str],            # max 200 unique
+        #   "emojis": list[str],           # max 100
+        #   "energy": str,
+        #   "sample_messages": list[str],  # max 100
+        #   "_recent_buf": deque           # last 50 msgs for energy calc (not exposed)
+        #   "_phrase_counter": Counter
+        #   "_slang_counter": Counter
+        #   "_emoji_counter": Counter
+        # }
+        self.server_vocab: dict[int, dict] = {}
 
         # Unique users spoken to this session
         self._users_spoken: set[int] = set()
@@ -617,7 +713,7 @@ class AiCompanion(commands.Cog):
         return any(kw in lower for kw in _RETURN_KEYWORDS)
 
     def _parse_timed_dismiss(self, text: str) -> Optional[float]:
-        m = _TIMED_RE.search(text)
+        m = _TIMED_DISMISS_RE.search(text)
         if not m:
             return None
         amount = int(m.group(1))
@@ -629,6 +725,11 @@ class AiCompanion(commands.Cog):
             return ""
         mood = self.guild_moods.get(guild_id, "normal")
         return _MOOD_ADDONS.get(mood, "")
+
+    def _learning_context(self, guild_id: Optional[int]) -> str:
+        if guild_id is None:
+            return ""
+        return _build_learning_context(self.server_vocab.get(guild_id, {}))
 
     async def _timed_return(self, seconds: float, channel_id: int, dismissed_by: int) -> None:
         await asyncio.sleep(seconds)
@@ -661,167 +762,301 @@ class AiCompanion(commands.Cog):
     ) -> str:
         """Call Groq, update history, return reply string."""
         history = list(self.conversations.get(user_id, []))
-
         input_content = user_text
         if extra_note:
             input_content = f"[CONTEXT FOR BIKI ONLY: {extra_note}]\n{user_text}"
-
         history.append({"role": "user", "content": input_content})
 
-        mood_addon = self._mood_addon(guild_id)
-        reply = await asyncio.to_thread(_call_groq, history, mood_addon)
+        mood_addon       = self._mood_addon(guild_id)
+        learning_context = self._learning_context(guild_id)
+        reply = await asyncio.to_thread(_call_groq, history, mood_addon, learning_context)
 
         self._append_history(user_id, "user", user_text)
         self._append_history(user_id, "assistant", reply)
         self._users_spoken.add(user_id)
-
         return reply
 
     # ------------------------------------------------------------------
-    # Moderation handler — called before normal Groq flow
-    # Returns True if a mod action was taken (so normal flow is skipped)
+    # Passive learning — feeds server vocab from every message
+    # ------------------------------------------------------------------
+
+    def _learn_from_message(self, message: discord.Message) -> None:
+        """
+        Extract phrases, slang, emojis, and energy signals from a single
+        message and update the in-memory server vocab for that guild.
+        All lists are capped at their max sizes (oldest → newest rotation).
+        """
+        if message.guild is None or message.author.bot:
+            return
+        text = message.content.strip()
+
+        # Skip empty, too short, or messages with links
+        if len(text.split()) < 3 or _URL_RE.search(text):
+            return
+
+        guild_id = message.guild.id
+        v = self.server_vocab.setdefault(guild_id, {
+            "common_phrases":  [],
+            "slang":           [],
+            "emojis":          [],
+            "energy":          "mixed",
+            "sample_messages": [],
+            "_recent_buf":     deque(maxlen=50),
+            "_phrase_counter": Counter(),
+            "_slang_counter":  Counter(),
+            "_emoji_counter":  Counter(),
+        })
+
+        # ── Sample messages (max 100) ────────────────────────────────────
+        # Keep a clean version without mentions/pings
+        clean = re.sub(r'<@!?\d+>', '', text).strip()
+        if clean:
+            if len(v["sample_messages"]) >= 100:
+                v["sample_messages"].pop(0)
+            v["sample_messages"].append(clean[:120])  # cap length per sample
+
+        # ── Recent buffer (for energy detection) ────────────────────────
+        v["_recent_buf"].append(clean)
+
+        # ── Emojis (max 100) ────────────────────────────────────────────
+        for emoji in _extract_emojis(text):
+            v["_emoji_counter"][emoji] += 1
+        v["emojis"] = [e for e, _ in v["_emoji_counter"].most_common(100)]
+
+        # ── Slang words (max 200 unique) ────────────────────────────────
+        for word in _extract_slang(clean):
+            v["_slang_counter"][word] += 1
+        v["slang"] = [w for w, _ in v["_slang_counter"].most_common(200)]
+
+        # ── Short phrases 2-5 words (max 500) ───────────────────────────
+        words = clean.lower().split()
+        for n in (2, 3):
+            for i in range(len(words) - n + 1):
+                phrase = " ".join(words[i:i+n])
+                # Only count phrases made of non-stopword words
+                if not all(w in _STOPWORDS for w in words[i:i+n]):
+                    v["_phrase_counter"][phrase] += 1
+        v["common_phrases"] = [p for p, _ in v["_phrase_counter"].most_common(500)]
+
+        # ── Energy (recalculate every 10 new messages) ───────────────────
+        if len(v["sample_messages"]) % 10 == 0:
+            v["energy"] = _detect_energy(v["_recent_buf"])
+
+    # ------------------------------------------------------------------
+    # Moderation handler
+    # Returns True if a moderation action was taken (skips normal flow)
     # ------------------------------------------------------------------
 
     async def _try_moderation(self, message: discord.Message, clean: str) -> bool:
         """
-        Detect mute / warn / delete commands from admins and act on them.
-        Returns True if a moderation action was handled.
+        Detect and execute mute / unmute / kick / ban / warn / delete from admins.
+        Permission check happens first — non-admins get a Biki-flavoured refusal.
+        Returns True if any moderation action was handled.
         """
         if message.guild is None:
             return False
-
         author = message.author
         if not isinstance(author, discord.Member):
             return False
 
         lower = clean.lower()
 
-        # ── DELETE MESSAGE ─────────────────────────────────────────────
-        # Must be a reply to another message AND contain a delete keyword
-        if (
-            message.reference is not None
-            and any(kw in lower for kw in _MOD_DELETE_KEYWORDS)
-        ):
-            # Check permission: manage_messages or administrator
-            if not (author.guild_permissions.manage_messages or author.guild_permissions.administrator):
-                return False
-
-            # Fetch the referenced message
+        # ── DELETE REPLIED MESSAGE ────────────────────────────────────────
+        if message.reference and any(kw in lower for kw in _DELETE_KEYWORDS):
+            if not _has_mod_permission(author):
+                await message.channel.send(
+                    random.choice([
+                        "bro you dont have the clearance for that 💀 nice try tho",
+                        "lmaooo you wish. get some perms first bestie",
+                        "nah. not happening. who are you 💀",
+                    ])
+                )
+                return True
             try:
                 ref_msg = message.reference.resolved
                 if not isinstance(ref_msg, discord.Message):
                     ref_msg = await message.channel.fetch_message(message.reference.message_id)
-            except (discord.NotFound, discord.HTTPException):
-                await message.channel.send("bro i tried to delete it but it's already gone lmaooo 💀")
-                return True
-
-            deleted_author = ref_msg.author.display_name
-            try:
                 await ref_msg.delete()
+            except discord.NotFound:
+                await message.channel.send("bro it's already gone lmaooo 💀")
+                return True
             except discord.Forbidden:
                 await message.channel.send("ngl i can't delete that, no permissions 😭 give me manage messages")
                 return True
-            except discord.HTTPException as exc:
-                log.error("ai_companion: delete failed: %s", exc)
-                await message.channel.send("something went wrong trying to delete that smh")
-                return True
-
             note = (
-                f"You just deleted a message from {deleted_author} because an admin asked you to. "
-                "Confirm it in the most chaotic unhinged way. Be dramatic about the power."
-            )
-            async with message.channel.typing():
-                reply = await self._groq_reply(
-                    author.id, clean,
-                    extra_note=note,
-                    guild_id=message.guild.id,
-                )
-            await _send_humanlike(message, reply)
-            return True
-
-        # ── MUTE / TIMEOUT ──────────────────────────────────────────────
-        mute_match = _MOD_MUTE_RE.search(clean)
-        if mute_match:
-            if not (author.guild_permissions.moderate_members or author.guild_permissions.administrator):
-                return False
-
-            target_id = int(mute_match.group(1))
-            target = message.guild.get_member(target_id)
-            if target is None:
-                await message.channel.send("bro i can't find that person 💀")
-                return True
-
-            # Don't let Biki mute admins or himself
-            if target.guild_permissions.administrator or target.id == self.bot.user.id:
-                note = "An admin just tried to make you mute another admin (or yourself). Refuse dramatically."
-                async with message.channel.typing():
-                    reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
-                await _send_humanlike(message, reply)
-                return True
-
-            duration_secs = _parse_mute_duration(clean)
-            until = datetime.now(timezone.utc) + timedelta(seconds=duration_secs)
-            human_dur = _human_duration(duration_secs)
-
-            try:
-                await target.timeout(until, reason=f"Muted by {author} via Biki")
-            except discord.Forbidden:
-                await message.channel.send("i don't have permission to timeout people smh give me moderate members")
-                return True
-            except discord.HTTPException as exc:
-                log.error("ai_companion: mute failed: %s", exc)
-                await message.channel.send("something went wrong with the mute ngl")
-                return True
-
-            note = (
-                f"You just timed out / muted {target.display_name} for {human_dur} "
-                f"because {author.display_name} asked you to. "
-                "Announce the mute in the most chaotic dramatic way possible. "
-                "Make it feel like an event. You have all the power right now."
+                f"You just deleted a message because {author.display_name} asked you to. "
+                "Confirm it in the most chaotic dramatic way. You have the power."
             )
             async with message.channel.typing():
                 reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
             await _send_humanlike(message, reply)
             return True
 
-        # ── WARN ────────────────────────────────────────────────────────
-        warn_match = _MOD_WARN_RE.search(clean)
-        if warn_match:
-            if not (author.guild_permissions.kick_members or author.guild_permissions.administrator):
-                return False
-
-            target_id = int(warn_match.group(1))
-            reason    = warn_match.group(2).strip() or "no reason given"
-            target    = message.guild.get_member(target_id)
-            if target is None:
+        # ── MUTE ──────────────────────────────────────────────────────────
+        m = _MUTE_RE.search(clean)
+        if m:
+            if not _has_mod_permission(author):
+                await message.channel.send(
+                    random.choice([
+                        "bro you dont have the clearance for that 💀 nice try tho",
+                        "lmaooo you wish. get some perms first",
+                        "nah. not for you 💀",
+                    ])
+                )
+                return True
+            target = message.guild.get_member(int(m.group(1)))
+            if not target:
                 await message.channel.send("bro i can't find that person 💀")
                 return True
-
-            try:
-                warn_count = await asyncio.to_thread(
-                    _db_add_warning,
-                    message.guild.id, target_id, author.id, reason
-                )
-            except Exception as exc:
-                log.error("ai_companion: warn DB error: %s", exc)
-                await message.channel.send("couldn't save the warning, db being weird 😭")
+            if target.guild_permissions.administrator or target.id == self.bot.user.id:
+                note = "An admin tried to make you mute another admin or yourself. Refuse dramatically."
+                async with message.channel.typing():
+                    reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
+                await _send_humanlike(message, reply)
                 return True
-
-            # Try to DM the warned user
+            duration = _parse_mute_duration(m.group(2), m.group(3))
+            human_dur = _human_duration(duration)
+            # Biki says something BEFORE acting
+            await message.channel.send(
+                random.choice([
+                    f"okay daddy 😈 give me a sec",
+                    f"on it rn",
+                    f"say less 💀",
+                ])
+            )
             try:
-                await target.send(
-                    f"⚠️ you got a warning in **{message.guild.name}**\n"
-                    f"reason: {reason}\n"
-                    f"total warnings: {warn_count}"
-                )
-            except (discord.Forbidden, discord.HTTPException):
-                pass  # DMs closed — silently skip
-
+                until = datetime.now(timezone.utc) + timedelta(seconds=duration)
+                await target.timeout(until, reason=f"Muted by {author} via Biki")
+            except discord.Forbidden:
+                await message.channel.send("bro i literally dont have the power to do that rn, give me the mute members permission")
+                return True
             note = (
-                f"You just warned {target.display_name} ({warn_count} total warning(s)) "
-                f"for: '{reason}'. {author.display_name} asked you to do it. "
-                "Announce the warning dramatically and chaotically in the channel. "
-                "Make it feel like a public shaming event."
+                f"You just muted {target.display_name} for {human_dur} because {author.display_name} asked. "
+                "Confirm the mute in the most chaotic way. Make it an event. "
+                f"Say something like 'done. {target.display_name} is cooked for {human_dur} 💀'"
+            )
+            async with message.channel.typing():
+                reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
+            await _send_humanlike(message, reply)
+            return True
+
+        # ── UNMUTE ────────────────────────────────────────────────────────
+        m = _UNMUTE_RE.search(clean)
+        if m:
+            if not _has_mod_permission(author):
+                await message.channel.send("bro you dont have the clearance for that 💀 nice try tho")
+                return True
+            target = message.guild.get_member(int(m.group(1)))
+            if not target:
+                await message.channel.send("bro i can't find that person 💀")
+                return True
+            try:
+                await target.edit(timed_out_until=None)
+            except discord.Forbidden:
+                await message.channel.send("no permissions for that smh 😭")
+                return True
+            note = (
+                f"You just unmuted {target.display_name} because {author.display_name} asked. "
+                f"Say something like 'fine fine {target.display_name} you're free. don't make me regret this'"
+            )
+            async with message.channel.typing():
+                reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
+            await _send_humanlike(message, reply)
+            return True
+
+        # ── KICK ──────────────────────────────────────────────────────────
+        m = _KICK_RE.search(clean)
+        if m:
+            if not _has_mod_permission(author):
+                await message.channel.send("bro you dont have the clearance for that 💀 nice try tho")
+                return True
+            target = message.guild.get_member(int(m.group(1)))
+            if not target:
+                await message.channel.send("bro i can't find that person 💀")
+                return True
+            if target.guild_permissions.administrator or target.id == self.bot.user.id:
+                note = "An admin tried to make you kick another admin or yourself. Refuse dramatically."
+                async with message.channel.typing():
+                    reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
+                await _send_humanlike(message, reply)
+                return True
+            name = target.display_name
+            try:
+                await target.kick(reason=f"Kicked by {author} via Biki")
+            except discord.Forbidden:
+                await message.channel.send("no kick permissions smh 😭 give me kick members")
+                return True
+            note = (
+                f"You just kicked {name} because {author.display_name} asked. "
+                f"Say something like 'YEET 👋 {name} has left the building. bye bestie'"
+            )
+            async with message.channel.typing():
+                reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
+            await _send_humanlike(message, reply)
+            return True
+
+        # ── BAN ───────────────────────────────────────────────────────────
+        m = _BAN_RE.search(clean)
+        if m:
+            if not _has_mod_permission(author):
+                await message.channel.send("bro you dont have the clearance for that 💀 nice try tho")
+                return True
+            target = message.guild.get_member(int(m.group(1)))
+            if not target:
+                await message.channel.send("bro i can't find that person 💀")
+                return True
+            if target.guild_permissions.administrator or target.id == self.bot.user.id:
+                note = "An admin tried to make you ban another admin or yourself. Refuse dramatically."
+                async with message.channel.typing():
+                    reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
+                await _send_humanlike(message, reply)
+                return True
+            name = target.display_name
+            try:
+                await target.ban(reason=f"Banned by {author} via Biki")
+            except discord.Forbidden:
+                await message.channel.send("no ban permissions smh 😭 give me ban members")
+                return True
+            note = (
+                f"You just banned {name} because {author.display_name} asked. "
+                f"Say something like 'damn okay. {name} is GONE gone. rip 💀'"
+            )
+            async with message.channel.typing():
+                reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
+            await _send_humanlike(message, reply)
+            return True
+
+        # ── WARN ──────────────────────────────────────────────────────────
+        m = _WARN_RE.search(clean)
+        if m:
+            if not _has_mod_permission(author):
+                await message.channel.send("bro you dont have the clearance for that 💀 nice try tho")
+                return True
+            target = message.guild.get_member(int(m.group(1)))
+            if not target:
+                await message.channel.send("bro i can't find that person 💀")
+                return True
+            reason = m.group(2).strip() or "no reason given"
+            # Try to delegate to the Events cog's _apply_warn (which also mutes)
+            events_cog = self.bot.get_cog("Events")
+            if events_cog and hasattr(events_cog, "_apply_warn"):
+                try:
+                    await events_cog._apply_warn(target, reason)
+                except Exception as exc:
+                    log.error("ai_companion: _apply_warn failed: %s", exc)
+            else:
+                # Fallback: DM only + store in biki_warnings
+                try:
+                    await asyncio.to_thread(_db_add_warning, message.guild.id, target.id, author.id, reason)
+                    await target.send(
+                        f"⚠️ you got a warning in **{message.guild.name}**\nreason: {reason}"
+                    )
+                except Exception:
+                    pass
+            note = (
+                f"You just warned {target.display_name} for: '{reason}'. "
+                f"{author.display_name} asked you to do it. "
+                f"Say something like 'consider yourself warned {target.display_name} 👀 biki is watching'"
             )
             async with message.channel.typing():
                 reply = await self._groq_reply(author.id, clean, extra_note=note, guild_id=message.guild.id)
@@ -831,11 +1066,31 @@ class AiCompanion(commands.Cog):
         return False
 
     # ------------------------------------------------------------------
-    # on_message listener
+    # on_message — SECTION 1: passive learning
+    # Runs on every non-bot message in the guild.
     # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
+        """Passive learning — absorbs server style from every message."""
+        if message.author.bot or message.guild is None:
+            return
+
+        # Only learn in allowed channels (or all channels if no restrictions set)
+        allowed = self.allowed_channels.get(message.guild.id, [])
+        if allowed and message.channel.id not in allowed:
+            return
+
+        self._learn_from_message(message)
+
+    # ------------------------------------------------------------------
+    # on_message — SECTION 2: mention handler (Biki responds)
+    # Fires only when the bot is mentioned.
+    # ------------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Mention handler — Biki replies when @mentioned."""
         # 1. Ignore bots
         if message.author.bot:
             return
@@ -859,13 +1114,12 @@ class AiCompanion(commands.Cog):
         clean = message.content
         clean = clean.replace(f"<@{self.bot.user.id}>", "").replace(f"<@!{self.bot.user.id}>", "").strip()
 
-        # 4. Moderation commands (checked before everything else, no delay)
+        # 4. Moderation commands — checked first, no pre-typing delay
         if await self._try_moderation(message, clean):
             return
 
         # 5. Dismissal state check
         dismissed_state = self.dismissed.get(user_id)
-
         if dismissed_state is not None:
             if self._is_return(clean):
                 self.dismissed.pop(user_id, None)
@@ -882,7 +1136,7 @@ class AiCompanion(commands.Cog):
         all_dismissed_by = {v["dismissed_by"] for v in self.dismissed.values()}
         if all_dismissed_by and self._is_return(clean) and user_id not in all_dismissed_by:
             self.dismissed.clear()
-            note = "Someone ELSE summoned you back just to spite the person who dismissed you. Most dramatic comeback of all time."
+            note = "Someone ELSE summoned you back just to spite the person who dismissed you. Most dramatic comeback ever."
             try:
                 async with message.channel.typing():
                     reply = await self._groq_reply(user_id, clean, extra_note=note, guild_id=guild_id)
@@ -920,7 +1174,7 @@ class AiCompanion(commands.Cog):
                 log.error("ai_companion: dismiss Groq call failed: %s", exc)
             return
 
-        # Normal response — 3-10 second pre-typing delay then type while Groq processes
+        # Normal response — 3-10s pre-typing delay then type while Groq processes
         try:
             await asyncio.sleep(random.uniform(3.0, 10.0))
             async with message.channel.typing():
@@ -937,14 +1191,13 @@ class AiCompanion(commands.Cog):
     @app_commands.command(name="bikimood", description="Set Biki's mood for this server.")
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    @app_commands.describe(mood="Choose Biki's active mood")
     @app_commands.choices(mood=[
-        app_commands.Choice(name="😡 Feral — over the top unhinged energy",   value="feral"),
+        app_commands.Choice(name="😡 Feral — over the top unhinged energy",    value="feral"),
         app_commands.Choice(name="😒 Sulky — moody, short, passive-aggressive", value="sulky"),
-        app_commands.Choice(name="😈 Villain — sinister, plotting, menacing",  value="villain"),
-        app_commands.Choice(name="🌹 Romantic — chaotic dramatic declarations", value="romantic"),
-        app_commands.Choice(name="🌀 Unhinged — maximum chaos, zero coherence", value="unhinged"),
-        app_commands.Choice(name="😐 Normal — default Biki",                   value="normal"),
+        app_commands.Choice(name="😈 Villain — sinister, plotting, menacing",   value="villain"),
+        app_commands.Choice(name="🌹 Romantic — chaotic dramatic declarations",  value="romantic"),
+        app_commands.Choice(name="🌀 Unhinged — maximum chaos, zero coherence",  value="unhinged"),
+        app_commands.Choice(name="😐 Normal — default Biki",                    value="normal"),
     ])
     async def bikimood(self, interaction: discord.Interaction, mood: str) -> None:
         assert interaction.guild_id is not None
@@ -958,6 +1211,36 @@ class AiCompanion(commands.Cog):
             "normal":   "😐 NORMAL MODE — Biki is back to baseline (relatively)",
         }
         await interaction.response.send_message(labels.get(mood, f"mood set to {mood}"), ephemeral=False)
+
+    @app_commands.command(name="bikilearning", description="Show how much Biki has learned about this server's style.")
+    @app_commands.guild_only()
+    async def bikilearning(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        v = self.server_vocab.get(interaction.guild_id)
+        if not v:
+            await interaction.response.send_message(
+                "biki hasn't learned anything about this server yet... talk more and he will",
+                ephemeral=True,
+            )
+            return
+        phrases = len(v.get("common_phrases", []))
+        slang   = len(v.get("slang", []))
+        emojis  = len(v.get("emojis", []))
+        samples = len(v.get("sample_messages", []))
+        energy  = v.get("energy", "mixed")
+        top_slang  = ", ".join(v.get("slang", [])[-8:]) or "none yet"
+        top_emojis = " ".join(v.get("emojis", [])[:8])  or "none yet"
+        await interaction.response.send_message(
+            f"**biki's server learning stats**\n"
+            f"• phrases collected: **{phrases}** / 500\n"
+            f"• slang words: **{slang}** / 200\n"
+            f"• emojis tracked: **{emojis}** / 100\n"
+            f"• sample messages: **{samples}** / 100\n"
+            f"• detected server energy: **{energy}**\n"
+            f"• top slang: {top_slang}\n"
+            f"• top emojis: {top_emojis}",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="aiset", description="Add a channel where Biki is allowed to respond.")
     @app_commands.guild_only()
@@ -1023,7 +1306,6 @@ class AiCompanion(commands.Cog):
         try:
             warnings = await asyncio.to_thread(_db_get_warnings, interaction.guild_id, user.id)
         except Exception as exc:
-            log.error("bikiwarns: DB error: %s", exc)
             await interaction.followup.send(f"❌ DB error: `{exc}`", ephemeral=True)
             return
         if not warnings:
@@ -1044,7 +1326,6 @@ class AiCompanion(commands.Cog):
         try:
             await asyncio.to_thread(_db_clear_warnings, interaction.guild_id, user.id)
         except Exception as exc:
-            log.error("bikiwarnclear: DB error: %s", exc)
             await interaction.followup.send(f"❌ DB error: `{exc}`", ephemeral=True)
             return
         await interaction.followup.send(f"✅ Cleared all warnings for {user.mention}.", ephemeral=True)

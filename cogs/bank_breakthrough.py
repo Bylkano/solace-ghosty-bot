@@ -1,7 +1,7 @@
 """
 cogs/bank_breakthrough.py
 ─────────────────────────────────────────────────────────────────────────────
-Breakthrough — Champion Edition  (v3 · 15×15 grid · UI Buttons)
+Breakthrough — Champion Edition  (v4 · 15×15 grid · UI Buttons)
 ─────────────────────────────────────────────────────────────────────────────
 
 Admin commands:
@@ -13,28 +13,22 @@ Admin commands:
 
 Player interaction — Discord UI Buttons on the board message:
   [🔼] [🔽] [◀️] [▶️]   — Queue 1 tile of movement for this round
-  [⚡ Activate Boost]   — Spend 20 EP to unlock a second direction press
   [🔓 Unlock Door]      — Queue a door-unlock action instead of movement
   [🔒 Lock In Turn]     — Submit your choices; round resolves when all lock in
-  [🎒 Select Gadget ▾]  — Dropdown: Smoke / EMP (×4 targets) / Decoy (×4 dirs)
+  [🎒 Select Gadget ▾]  — Dropdown: Boost / Freeze / Shuffle
 
   /breakthrough-status        — private board view
   /breakthrough-leaderboard   — all-time Heist Coin rankings
 
 Gadgets (Energy Pool: 100 EP max · +10 EP/round regen):
-  smoke  (30 EP) — hides coordinates for 2 rounds (Fog of War on board)
-  emp    (40 EP) — stuns an adjacent champion for 1 round
-  decoy  (50 EP) — places a fake clone on an adjacent tile
-
-Boost:
-  [⚡ Activate Boost] costs 20 EP (deducted at resolution).
-  Unlocks a second directional button press for this turn.
-  Cannot boost while carrying the Diamond Briefcase.
+  boost   (20 EP) — unlocks a second directional press this round (blocked if carrying Diamond)
+  freeze  (40 EP) — stuns an adjacent opponent for 1 full round; EP refunded on miss
+  shuffle (60 EP) — teleport to a random safe empty tile; 1 use per player per match
 
 Map (15×15):
   • Spawns at corners: [0,0] [0,14] [14,0] [14,14]
   • Central Vault: 2×2 block [7,7]–[8,8] · needs 3 Breach Points
-  • Security Walls: randomly scattered; BFS-validated open paths
+  • Security Walls [🧱]: 30-wall permanent structural skeleton + BFS-validated random extras
   • Security Doors: guard all 4 vault approaches
   • Common Loot (💵): +100 🪙
   • Diamond Briefcase (💎): spawns round 3 · +500 🪙 · blocks Boost
@@ -43,7 +37,7 @@ Map (15×15):
 Round Flow:
   1. Planning Phase — 30 s max countdown
      TIME-SKIP: immediately resolves the moment all players lock in
-  2. Resolution — Gadgets → Boosts → Movements → Traps
+  2. Resolution — Boost EP → Gadgets → Movements → Loot → Traps
   3. Ranking — Breach Points + Loot; tiebreaker = fewest tiles traveled
 """
 
@@ -55,7 +49,7 @@ import os
 from collections import deque
 from io import BytesIO
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -70,20 +64,18 @@ GRID_SIZE           = 15
 VAULT_TILES         = frozenset({(7, 7), (7, 8), (8, 7), (8, 8)})
 VAULT_POINTS_REQ    = 3
 ROUND_TIMER         = 30
-MAX_EP                 = 100
-EP_REGEN               = 10
-EP_REGEN_OVERDRIVE     = 15
-BOOST_EP_COST          = 20
-BOOST_EP_COST_OVERDRIVE = 10
+MAX_EP              = 100
+EP_REGEN            = 10
+BOOST_EP_COST       = 20
 DIAMOND_SPAWN_ROUND = 3
 
 LOOT_REWARD_COMMON  = 100
 LOOT_REWARD_DIAMOND = 500
 BREACH_COIN_REWARD  = 300
 
-NUM_RANDOM_WALLS    = 28
-NUM_LOOT_TILES      = 10
-NUM_TRAPS           = 6
+NUM_EXTRA_RANDOM_WALLS = 8   # random extras stacked on top of structural skeleton each match
+NUM_LOOT_TILES         = 10
+NUM_TRAPS              = 6
 
 CHAMPION_STARTS = [(0, 0), (0, 14), (14, 0), (14, 14)]
 
@@ -94,7 +86,60 @@ FIXED_DOORS: frozenset[tuple[int, int]] = frozenset({
     (7, 9), (8, 9),
 })
 
-SEP = "─" * 40
+# ── Permanent structural wall skeleton ────────────────────────────────────────
+# These walls are NEVER removed or regenerated — they are placed once and stay
+# for the entire match. They form L-barriers, corridor chokepoints, and funnel
+# pillars that block direct straight-line paths from corner spawns to the vault,
+# forcing players to navigate bends and tactical corridors.
+STRUCTURAL_WALLS: frozenset[tuple[int, int]] = frozenset({
+    # Top-left L-barrier — blocks direct NW → center straight line
+    (2, 2), (3, 2), (4, 2),
+    (4, 3), (4, 4),
+
+    # Top-right L-barrier (mirror)
+    (2, 12), (3, 12), (4, 12),
+    (4, 10), (4, 11),
+
+    # Bottom-left L-barrier (mirror)
+    (10, 2), (10, 3), (10, 4),
+    (11, 2), (12, 2),
+
+    # Bottom-right L-barrier (mirror)
+    (10, 10), (10, 11), (10, 12),
+    (11, 12), (12, 12),
+
+    # Left mid-corridor chokepoint — forces side approach to west vault door
+    (6, 3), (7, 3), (8, 3),
+
+    # Right mid-corridor chokepoint (mirror)
+    (6, 11), (7, 11), (8, 11),
+
+    # Top-center funnel pillars — narrows the northern approach to the vault
+    (3, 5), (3, 9),
+
+    # Bottom-center funnel pillars (mirror)
+    (11, 5), (11, 9),
+
+    # Inner approach screens — forces passage through vault doors
+    (5, 4), (5, 10),
+    (9, 4), (9, 10),
+})
+
+# Registered gadgets — ONLY these 3 are allowed in the system
+VALID_GADGETS: dict[str, tuple[str, int]] = {
+    "boost":   ("Movement Boost",  BOOST_EP_COST),
+    "freeze":  ("Freeze Charge",   40),
+    "shuffle": ("Board Shuffle",   60),
+}
+
+_DIR_DELTA: dict[str, tuple[int, int]] = {
+    "up":     (-1,  0),
+    "down":   ( 1,  0),
+    "left":   ( 0, -1),
+    "right":  ( 0,  1),
+    "hold":   ( 0,  0),
+    "action": ( 0,  0),
+}
 
 # ─────────────────────────── Display ──────────────────────────────────────────
 
@@ -108,22 +153,7 @@ C_TEAM   = 0x818CF8
 C_ERROR  = 0xEF4444
 C_LB     = 0xA78BFA
 
-VALID_GADGETS: dict[str, tuple[str, int]] = {
-    "smoke":     ("Smoke Grenade",    30),
-    "overdrive": ("Overdrive",        30),
-    "emp":       ("EMP Charge",       40),
-    "decoy":     ("Decoy Hologram",   50),
-    "hijack":    ("Direction Hijack", 50),
-}
-
-_DIR_DELTA: dict[str, tuple[int, int]] = {
-    "up":     (-1,  0),
-    "down":   ( 1,  0),
-    "left":   ( 0, -1),
-    "right":  ( 0,  1),
-    "hold":   ( 0,  0),
-    "action": ( 0,  0),
-}
+SEP = "─" * 40
 
 # ═══════════════════════════════ DATABASE LAYER ═══════════════════════════════
 
@@ -235,30 +265,15 @@ class Champion:
     loot_claimed:          int  = 0
     carrying_diamond:      bool = False
 
-    frozen_rounds:   int = 0
-    smoked_rounds:   int = 0
-    overdrive_rounds: int = 0
-
-    has_decoy:  bool = False
-    decoy_row:  int  = -1
-    decoy_col:  int  = -1
-
-    # Previous tile (captured at round start — used by Decoy Hologram)
-    prev_row: int = -1
-    prev_col: int = -1
+    frozen_rounds: int  = 0
+    shuffle_used:  bool = False   # Board Shuffle: one use per player per match
 
     # Per-round planning inputs (reset each round)
     move_queue:         list          = field(default_factory=list)
     boost_requested:    bool          = False
     gadget:             Optional[str] = None
-    gadget_target_slot: Optional[int] = None   # EMP / Hijack target slot
-    hijacked_by_slot:   Optional[int] = None   # set by Direction Hijack during resolution
+    gadget_target_slot: Optional[int] = None   # Freeze Charge target slot
     submitted:          bool          = False
-
-    @property
-    def boost_ep_cost(self) -> int:
-        """Actual Boost EP cost — reduced to 10 when Overdrive is active."""
-        return BOOST_EP_COST_OVERDRIVE if self.overdrive_rounds > 0 else BOOST_EP_COST
 
     @property
     def display_name(self) -> str:
@@ -269,14 +284,10 @@ class Champion:
         return EMOJI_CHAMP[self.slot]
 
     def reset_round(self) -> None:
-        # Snapshot current position as "previous" (used by Decoy Hologram)
-        self.prev_row           = self.row
-        self.prev_col           = self.col
         self.move_queue         = []
         self.boost_requested    = False
         self.gadget             = None
         self.gadget_target_slot = None
-        self.hijacked_by_slot   = None
         self.submitted          = False
 
 
@@ -340,42 +351,45 @@ def _all_corners_reach_vault(
     return True
 
 
-def _generate_random_walls(
-    size: int,
-    vault: frozenset[tuple[int, int]],
-    doors: frozenset[tuple[int, int]],
-    starts: list[tuple[int, int]],
-    n: int = NUM_RANDOM_WALLS,
-) -> frozenset[tuple[int, int]]:
-    forbidden = set(starts) | vault | doors
+def _generate_map(state: GameState) -> None:
+    """
+    Build the map:
+      1. Start with the permanent STRUCTURAL_WALLS skeleton (never removed).
+      2. Add up to NUM_EXTRA_RANDOM_WALLS additional BFS-validated random walls
+         for per-match variety.
+      3. Place loot tiles and traps in remaining open space.
+    """
+    walls: set[tuple[int, int]] = set(STRUCTURAL_WALLS)
+
+    # Extra random walls layered on top of the skeleton
+    forbidden = set(CHAMPION_STARTS) | VAULT_TILES | FIXED_DOORS | STRUCTURAL_WALLS
     candidates = [
-        (r, c) for r in range(size) for c in range(size) if (r, c) not in forbidden
+        (r, c) for r in range(GRID_SIZE) for c in range(GRID_SIZE)
+        if (r, c) not in forbidden
     ]
     random.shuffle(candidates)
-    walls: set[tuple[int, int]] = set()
+    extras_added = 0
     for pos in candidates:
-        if len(walls) >= n:
+        if extras_added >= NUM_EXTRA_RANDOM_WALLS:
             break
         test = walls | {pos}
-        if _all_corners_reach_vault(test, doors, starts, vault, size):
+        if _all_corners_reach_vault(test, FIXED_DOORS, CHAMPION_STARTS, VAULT_TILES, GRID_SIZE):
             walls.add(pos)
-    return frozenset(walls)
+            extras_added += 1
 
+    state.walls = frozenset(walls)
 
-def _generate_map(state: GameState) -> None:
-    state.walls = _generate_random_walls(
-        GRID_SIZE, VAULT_TILES, FIXED_DOORS, CHAMPION_STARTS, NUM_RANDOM_WALLS
-    )
+    # Place loot tiles and traps in open space
     taken: set[tuple[int, int]] = (
         set(CHAMPION_STARTS) | VAULT_TILES | state.walls | state.doors
     )
-    candidates = [
+    open_tiles = [
         (r, c) for r in range(GRID_SIZE) for c in range(GRID_SIZE) if (r, c) not in taken
     ]
-    random.shuffle(candidates)
-    for pos in candidates[:NUM_LOOT_TILES]:
+    random.shuffle(open_tiles)
+    for pos in open_tiles[:NUM_LOOT_TILES]:
         state.loot_tiles[pos] = "common"
-    state.traps = set(candidates[NUM_LOOT_TILES : NUM_LOOT_TILES + NUM_TRAPS])
+    state.traps = set(open_tiles[NUM_LOOT_TILES : NUM_LOOT_TILES + NUM_TRAPS])
 
 
 def _spawn_diamond(state: GameState) -> Optional[tuple[int, int]]:
@@ -396,6 +410,7 @@ def _spawn_diamond(state: GameState) -> Optional[tuple[int, int]]:
 
 
 def _is_adjacent(r1: int, c1: int, r2: int, c2: int) -> bool:
+    """True for all 8 surrounding tiles (orthogonal + diagonal)."""
     return abs(r1 - r2) <= 1 and abs(c1 - c2) <= 1 and (r1, c1) != (r2, c2)
 
 
@@ -423,11 +438,24 @@ def _walk_one_step(
     return True
 
 
+def _random_safe_tile(state: GameState, exclude_slot: int) -> Optional[tuple[int, int]]:
+    """Pick a random open floor tile for Board Shuffle — avoids walls, vault, doors, and occupied tiles."""
+    occupied = {
+        (c.row, c.col) for s, c in state.champions.items() if s != exclude_slot
+    }
+    forbidden = VAULT_TILES | state.walls | state.doors | occupied | state.triggered_traps
+    pool = [
+        (r, c) for r in range(GRID_SIZE) for c in range(GRID_SIZE)
+        if (r, c) not in forbidden
+    ]
+    return random.choice(pool) if pool else None
+
+
 # ═══════════════════════════ GRID RENDERER (PNG) ══════════════════════════════
 
 
 def _render_grid_image(state: GameState) -> Optional[BytesIO]:
-    """Render a styled 15×15 board PNG with advanced visual effects."""
+    """Render a styled 15×15 board PNG."""
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError:
@@ -466,7 +494,6 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
         (35,  190,  75),
         (215,  50,  50),
     ]
-    DECOY_COL   = (105, 105, 170)
     ICE_RING    = (95,  180, 255)
     TEXT_BRIGHT = (240, 245, 255)
     TEXT_DIM    = (55,  85, 125)
@@ -486,10 +513,9 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
     bx1 = bx0 + GRID_SIZE * CELL
     by1 = by0 + GRID_SIZE * CELL
 
-    # Board panel background
     draw.rectangle([bx0 - 3, by0 - 3, bx1 + 3, by1 + 3], fill=BOARD_BG)
 
-    # Neon metallic border (layered glow)
+    # Neon border glow
     for thick, alpha in [(10, 25), (6, 55), (3, 120), (1, 220)]:
         layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         ld = ImageDraw.Draw(layer)
@@ -501,7 +527,7 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
         img = Image.alpha_composite(img, layer)
         draw = ImageDraw.Draw(img)
 
-    # Inner corner accents
+    # Corner accents
     acc_len = 12
     for (ax, ay), (dx1, dy1), (dx2, dy2) in [
         ((bx0 - 5, by0 - 5), (acc_len, 0), (0, acc_len)),
@@ -512,32 +538,20 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
         draw.line([(ax, ay), (ax + dx1, ay + dy1)], fill=(0, 240, 255), width=2)
         draw.line([(ax, ay), (ax + dx2, ay + dy2)], fill=(0, 240, 255), width=2)
 
-    # Coordinate labels (0–14) — fixed-width futuristic look
+    # Coordinate labels
     for i in range(GRID_SIZE):
         cx = bx0 + i * CELL + CELL // 2
         cy = by0 + i * CELL + CELL // 2
         draw.text((cx, by0 - 13), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
         draw.text((bx0 - 13, cy), str(i), fill=TEXT_DIM, font=f_sm, anchor="mm")
 
-    # Champion & decoy lookups
     champ_at: dict[tuple[int, int], int] = {
         (c.row, c.col): slot for slot, c in state.champions.items()
     }
-    decoy_at: set[tuple[int, int]] = {
-        (c.decoy_row, c.decoy_col) for c in state.champions.values() if c.has_decoy
-    }
-    smoked_slots: set[int] = {
-        slot for slot, c in state.champions.items() if c.smoked_rounds > 0
-    }
-    smoke_positions: set[tuple[int, int]] = {
-        (c.row, c.col) for c in state.champions.values() if c.smoked_rounds > 0
-    }
-
-    # Vault center pixel coords
     vault_cx = bx0 + 7 * CELL + CELL
     vault_cy = by0 + 7 * CELL + CELL
 
-    # ── Drop shadow layer (walls + closed doors) ──────────────────────────────
+    # Drop shadow for walls and closed doors
     shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow_layer)
     for row in range(GRID_SIZE):
@@ -550,7 +564,7 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
     img = Image.alpha_composite(img, shadow_layer)
     draw = ImageDraw.Draw(img)
 
-    # ── Draw each cell ────────────────────────────────────────────────────────
+    # Draw each cell
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
             x0 = bx0 + col * CELL + 1
@@ -561,16 +575,13 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
             cy = (y0 + y1) // 2
             pos = (row, col)
 
-            is_vault      = pos in VAULT_TILES
-            is_wall       = pos in state.walls
+            is_vault       = pos in VAULT_TILES
+            is_wall        = pos in state.walls
             is_door_closed = pos in state.doors and pos not in state.opened_doors
-            is_door_open  = pos in state.opened_doors
-            loot_kind     = state.loot_tiles.get(pos)
-            is_trap_vis   = pos in state.triggered_traps
-            is_decoy      = pos in decoy_at
-            slot          = champ_at.get(pos)
-            if slot in smoked_slots:
-                slot = None
+            is_door_open   = pos in state.opened_doors
+            loot_kind      = state.loot_tiles.get(pos)
+            is_trap_vis    = pos in state.triggered_traps
+            slot           = champ_at.get(pos)
 
             if is_wall:
                 draw.rectangle([x0, y0, x1, y1], fill=WALL_BG)
@@ -603,7 +614,7 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
                 base = CELL_A if (row + col) % 2 == 0 else CELL_B
                 draw.rectangle([x0, y0, x1, y1], fill=base, outline=GRID_LINE, width=1)
 
-            # Tile overlays
+            # Overlays
             if loot_kind == "common":
                 draw.rectangle([x0 + 4, y0 + 4, x1 - 4, y1 - 4], fill=LOOT_BG, outline=LOOT_FG, width=1)
                 draw.text((cx, cy), "$", fill=LOOT_FG, font=f_md, anchor="mm")
@@ -613,12 +624,6 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
             if is_trap_vis:
                 draw.rectangle([x0 + 4, y0 + 4, x1 - 4, y1 - 4], fill=TRAP_BG, outline=TRAP_FG, width=1)
                 draw.text((cx, cy), "!", fill=TRAP_FG, font=f_md, anchor="mm")
-
-            # Decoy token
-            if is_decoy and slot is None:
-                rr = 11
-                draw.ellipse([cx - rr, cy - rr, cx + rr, cy + rr], fill=DECOY_COL, outline=(200, 200, 255), width=1)
-                draw.text((cx, cy), "?", fill=(200, 200, 255), font=f_md, anchor="mm")
 
             # Champion token
             if slot is not None:
@@ -630,12 +635,14 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
                 if champ.carrying_diamond:
                     draw.text((cx + rr - 5, cy - rr + 4), "◆", fill=DIAM_FG, font=f_sm, anchor="mm")
                 if champ.frozen_rounds > 0:
-                    draw.ellipse([cx - rr - 3, cy - rr - 3, cx + rr + 3, cy + rr + 3],
-                                 outline=ICE_RING, width=2)
+                    draw.ellipse(
+                        [cx - rr - 3, cy - rr - 3, cx + rr + 3, cy + rr + 3],
+                        outline=ICE_RING, width=2,
+                    )
                 if champ.submitted:
                     draw.text((cx, cy + 5), "✓", fill=(80, 255, 120), font=f_sm, anchor="mm")
 
-    # ── Vault radial glow overlay ─────────────────────────────────────────────
+    # Vault radial glow
     glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd   = ImageDraw.Draw(glow)
     for radius, alpha in [(75, 15), (58, 30), (42, 50), (28, 75), (16, 100)]:
@@ -646,23 +653,7 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
     img = Image.alpha_composite(img, glow)
     draw = ImageDraw.Draw(img)
 
-    # ── Fog of War — smoke grenade coverage ───────────────────────────────────
-    fog = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    fd  = ImageDraw.Draw(fog)
-    for (sr, sc) in smoke_positions:
-        fx0, fy0 = bx0 + sc * CELL + 1, by0 + sr * CELL + 1
-        fx1, fy1 = fx0 + CELL - 2, fy0 + CELL - 2
-        fd.rectangle([fx0, fy0, fx1, fy1], fill=(75, 35, 115, 145))
-        for dr2, dc2 in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nr2, nc2 = sr + dr2, sc + dc2
-            if 0 <= nr2 < GRID_SIZE and 0 <= nc2 < GRID_SIZE:
-                ax0 = bx0 + nc2 * CELL + 1
-                ay0 = by0 + nr2 * CELL + 1
-                fd.rectangle([ax0, ay0, ax0 + CELL - 2, ay0 + CELL - 2], fill=(75, 35, 115, 55))
-    img = Image.alpha_composite(img, fog)
-    draw = ImageDraw.Draw(img)
-
-    # ── Bottom legend (EP bars) ───────────────────────────────────────────────
+    # Bottom legend
     legend_y = by1 + 8
     seg_w    = (bx1 - bx0) // 4
     for slot, champ in state.champions.items():
@@ -673,7 +664,7 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
         if champ.boost_requested:   parts.append("⚡")
         if champ.carrying_diamond:  parts.append("◆")
         if champ.frozen_rounds > 0: parts.append(f"❄{champ.frozen_rounds}r")
-        if champ.smoked_rounds > 0: parts.append(f"💨{champ.smoked_rounds}r")
+        if champ.shuffle_used:      parts.append("🔀✓")
         if champ.submitted:         parts.append("🔒")
         draw.text((lx + 12, legend_y + 4), " ".join(parts), fill=TEXT_DIM, font=f_sm, anchor="lm")
 
@@ -685,14 +676,13 @@ def _render_grid_image(state: GameState) -> Optional[BytesIO]:
 
 def _render_grid_text(state: GameState) -> str:
     champ_at = {(c.row, c.col): slot for slot, c in state.champions.items()}
-    smoked   = {slot for slot, c in state.champions.items() if c.smoked_rounds > 0}
     rows = []
     for r in range(GRID_SIZE):
         row = []
         for c in range(GRID_SIZE):
             pos  = (r, c)
             slot = champ_at.get(pos)
-            if slot is not None and slot not in smoked:
+            if slot is not None:
                 row.append(EMOJI_CHAMP[slot])
             elif pos in VAULT_TILES:   row.append("🏦")
             elif pos in state.walls:   row.append("🧱")
@@ -707,7 +697,7 @@ def _render_grid_text(state: GameState) -> str:
 
 
 def _status_table(state: GameState) -> str:
-    col_w = [12, 9, 5, 10, 22]
+    col_w = [12, 9, 5, 10, 24]
     header = (
         f"{'Champion':<{col_w[0]}} {'Pos':<{col_w[1]}} {'EP':>{col_w[2]}} "
         f"{'Carrying':<{col_w[3]}} Status"
@@ -715,14 +705,13 @@ def _status_table(state: GameState) -> str:
     sep = "─" * (sum(col_w) + 4)
     rows = [header, sep]
     for slot, c in state.champions.items():
-        pos      = f"[{c.row},{c.col}]" if c.smoked_rounds == 0 else "[?,?]"
+        pos      = f"[{c.row},{c.col}]"
         carrying = "💎 Diamond" if c.carrying_diamond else "—"
         tags: list[str] = []
-        if c.frozen_rounds > 0:   tags.append(f"❄️ Frozen({c.frozen_rounds}r)")
-        if c.smoked_rounds > 0:   tags.append(f"💨 Smoked({c.smoked_rounds}r)")
-        if c.overdrive_rounds > 0: tags.append(f"⚡ OD({c.overdrive_rounds}r)")
-        if c.submitted:            tags.append("🔒 Locked")
-        if c.boost_requested:      tags.append("⚡ Boost")
+        if c.frozen_rounds > 0: tags.append(f"❄️ Frozen({c.frozen_rounds}r)")
+        if c.boost_requested:   tags.append("⚡ Boost")
+        if c.shuffle_used:      tags.append("🔀 Used")
+        if c.submitted:         tags.append("🔒 Locked")
         status = " ".join(tags) if tags else "Active"
         name   = f"{c.emoji} C{slot+1} {c.team.title()[:6]}"
         rows.append(
@@ -778,46 +767,6 @@ class DirectionButton(discord.ui.Button["BreakthroughView"]):
             )
 
 
-class BoostButton(discord.ui.Button["BreakthroughView"]):
-    def __init__(self) -> None:
-        super().__init__(label="⚡ Activate Boost", style=discord.ButtonStyle.blurple, row=1)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-        assert view is not None
-        champ = view._get_champ(interaction.user.id)
-        if champ is None:
-            await interaction.response.send_message("❌ Not in this match.", ephemeral=True)
-            return
-        if champ.submitted:
-            await interaction.response.send_message("❌ Already locked in.", ephemeral=True)
-            return
-        if champ.frozen_rounds > 0:
-            await interaction.response.send_message("❄️ Frozen — can't boost.", ephemeral=True)
-            return
-        if champ.carrying_diamond:
-            await interaction.response.send_message(
-                "❌ Can't boost while carrying the Diamond Briefcase.", ephemeral=True
-            )
-            return
-        if champ.boost_requested:
-            await interaction.response.send_message("⚡ Boost already activated this round.", ephemeral=True)
-            return
-        actual_cost = champ.boost_ep_cost
-        if champ.ep < actual_cost:
-            await interaction.response.send_message(
-                f"❌ Need **{actual_cost} EP** for Boost — you have **{champ.ep} EP**.", ephemeral=True
-            )
-            return
-        champ.boost_requested = True
-        od_note = "  _(Overdrive discount active!)_" if champ.overdrive_rounds > 0 else ""
-        await interaction.response.send_message(
-            f"⚡ **Boost activated!** Press a second direction arrow.\n"
-            f"Cost: **{actual_cost} EP**{od_note} (deducted at resolution).",
-            ephemeral=True,
-        )
-
-
 class UnlockButton(discord.ui.Button["BreakthroughView"]):
     def __init__(self) -> None:
         super().__init__(label="🔓 Unlock Door", style=discord.ButtonStyle.grey, row=1)
@@ -835,7 +784,7 @@ class UnlockButton(discord.ui.Button["BreakthroughView"]):
         if champ.frozen_rounds > 0:
             await interaction.response.send_message("❄️ Frozen — can't act.", ephemeral=True)
             return
-        champ.move_queue    = ["action"]
+        champ.move_queue      = ["action"]
         champ.boost_requested = False
         await interaction.response.send_message(
             "🔓 **Unlock Door** queued — will attempt to open an adjacent locked door.",
@@ -863,7 +812,7 @@ class LockInButton(discord.ui.Button["BreakthroughView"]):
 
         move_desc   = " → ".join(champ.move_queue) if champ.move_queue else "hold"
         gadget_desc = champ.gadget if champ.gadget else "none"
-        boost_desc  = f"yes (−{champ.boost_ep_cost} EP)" if champ.boost_requested else "no"
+        boost_desc  = f"yes (−{BOOST_EP_COST} EP)" if champ.boost_requested else "no"
 
         await interaction.response.send_message(
             f"🔒 **Locked in!**\n"
@@ -887,24 +836,16 @@ class GadgetSelect(discord.ui.Select["BreakthroughView"]):
     def __init__(self) -> None:
         options = [
             discord.SelectOption(
-                label="💨 Smoke Grenade  (30 EP) — Fog of War on your tile for 2 rounds",
-                value="smoke",
+                label="⚡ Movement Boost  (20 EP) — Unlock a second direction press this round",
+                value="boost",
             ),
             discord.SelectOption(
-                label="⚡ Overdrive  (30 EP) — +15 EP regen · Boost costs 10 EP for 2 rounds",
-                value="overdrive",
+                label="🥶 Freeze Charge  (40 EP) — Stun an adjacent opponent for 1 full round",
+                value="freeze",
             ),
             discord.SelectOption(
-                label="🔋 EMP Charge  (40 EP) — Stun adjacent opponent → pick target",
-                value="emp",
-            ),
-            discord.SelectOption(
-                label="👻 Decoy Hologram  (50 EP) — Clone appears on your previous position",
-                value="decoy",
-            ),
-            discord.SelectOption(
-                label="🎯 Direction Hijack  (50 EP) — Override opponent's move direction → pick target",
-                value="hijack",
+                label="🔀 Board Shuffle  (60 EP) — Teleport to a random safe tile  [1×/game]",
+                value="shuffle",
             ),
             discord.SelectOption(label="🚫 Cancel — Remove gadget selection", value="none"),
         ]
@@ -924,89 +865,82 @@ class GadgetSelect(discord.ui.Select["BreakthroughView"]):
         val = self.values[0]
 
         if val == "none":
-            champ.gadget = None
+            # If boost was previously queued via this dropdown, undo it
+            if champ.gadget == "boost":
+                champ.boost_requested = False
+                if len(champ.move_queue) > 1:
+                    champ.move_queue = champ.move_queue[:1]
+            champ.gadget             = None
             champ.gadget_target_slot = None
             await interaction.response.send_message("🚫 Gadget selection cleared.", ephemeral=True)
             return
 
-        if val == "smoke":
-            g_name, g_cost = VALID_GADGETS["smoke"]
-            if champ.ep < g_cost:
+        if val == "boost":
+            if champ.frozen_rounds > 0:
+                await interaction.response.send_message("❄️ Frozen — can't boost.", ephemeral=True)
+                return
+            if champ.carrying_diamond:
                 await interaction.response.send_message(
-                    f"❌ Not enough EP — need **{g_cost}**, have **{champ.ep}**.", ephemeral=True
+                    "❌ Can't boost while carrying the Diamond Briefcase.", ephemeral=True
                 )
                 return
-            champ.gadget             = "smoke"
-            champ.gadget_target_slot = None
+            if champ.ep < BOOST_EP_COST:
+                await interaction.response.send_message(
+                    f"❌ Need **{BOOST_EP_COST} EP** — you have **{champ.ep} EP**.", ephemeral=True
+                )
+                return
+            champ.gadget          = "boost"
+            champ.boost_requested = True
             await interaction.response.send_message(
-                f"💨 **Smoke Grenade** queued (−{g_cost} EP at resolution).\n"
-                f"Fog of War will cover your current position for 2 rounds.",
+                f"⚡ **Movement Boost** queued! (−{BOOST_EP_COST} EP at resolution)\n"
+                "Now press a **second direction arrow** for your bonus move.",
                 ephemeral=True,
             )
 
-        elif val == "overdrive":
-            g_name, g_cost = VALID_GADGETS["overdrive"]
+        elif val == "freeze":
+            _, g_cost = VALID_GADGETS["freeze"]
             if champ.ep < g_cost:
                 await interaction.response.send_message(
-                    f"❌ Not enough EP — need **{g_cost}**, have **{champ.ep}**.", ephemeral=True
+                    f"❌ Need **{g_cost} EP** — you have **{champ.ep} EP**.", ephemeral=True
                 )
                 return
-            champ.gadget             = "overdrive"
-            champ.gadget_target_slot = None
+            # Open target picker
+            target_view = FreezeTargetView(view.cog, view.guild_id, champ.slot)
             await interaction.response.send_message(
-                f"⚡ **Overdrive** queued (−{g_cost} EP at resolution).\n"
-                f"Next 2 rounds: +{EP_REGEN_OVERDRIVE} EP/regen · Boost costs {BOOST_EP_COST_OVERDRIVE} EP.",
-                ephemeral=True,
-            )
-
-        elif val == "decoy":
-            g_name, g_cost = VALID_GADGETS["decoy"]
-            if champ.ep < g_cost:
-                await interaction.response.send_message(
-                    f"❌ Not enough EP — need **{g_cost}**, have **{champ.ep}**.", ephemeral=True
-                )
-                return
-            champ.gadget             = "decoy"
-            champ.gadget_target_slot = None
-            prev = f"[{champ.prev_row},{champ.prev_col}]" if champ.prev_row >= 0 else "your previous tile"
-            await interaction.response.send_message(
-                f"👻 **Decoy Hologram** queued (−{g_cost} EP at resolution).\n"
-                f"Clone will appear on your previous position {prev}.",
-                ephemeral=True,
-            )
-
-        elif val in ("emp", "hijack"):
-            # Show dynamic target sub-menu with active opponents
-            g_name, g_cost = VALID_GADGETS[val]
-            if champ.ep < g_cost:
-                await interaction.response.send_message(
-                    f"❌ Not enough EP — need **{g_cost}**, have **{champ.ep}**.", ephemeral=True
-                )
-                return
-            state = view.cog._games.get(view.guild_id)
-            target_view = TargetSelectView(view.cog, view.guild_id, champ.slot, val)
-            label = "⚡ EMP Charge" if val == "emp" else "🎯 Direction Hijack"
-            await interaction.response.send_message(
-                f"{label} — select your target champion:",
+                "🥶 **Freeze Charge** — select your target champion:",
                 view=target_view,
                 ephemeral=True,
             )
 
+        elif val == "shuffle":
+            _, g_cost = VALID_GADGETS["shuffle"]
+            if champ.shuffle_used:
+                await interaction.response.send_message(
+                    "❌ **Board Shuffle** already used this match — each player gets **1 use** per game.",
+                    ephemeral=True,
+                )
+                return
+            if champ.ep < g_cost:
+                await interaction.response.send_message(
+                    f"❌ Need **{g_cost} EP** — you have **{champ.ep} EP**.", ephemeral=True
+                )
+                return
+            champ.gadget             = "shuffle"
+            champ.gadget_target_slot = None
+            await interaction.response.send_message(
+                f"🔀 **Board Shuffle** queued! (−{g_cost} EP at resolution)\n"
+                "You will be teleported to a random safe empty tile at resolution.",
+                ephemeral=True,
+            )
 
-class TargetSelect(discord.ui.Select["TargetSelectView"]):
-    """Ephemeral dropdown used by EMP and Direction Hijack to pick an active opponent."""
 
-    def __init__(
-        self,
-        cog: "BankBreakthroughCog",
-        guild_id: int,
-        requester_slot: int,
-        gadget_key: str,
-    ) -> None:
+class FreezeTargetSelect(discord.ui.Select["FreezeTargetView"]):
+    """Ephemeral dropdown for picking a Freeze Charge target."""
+
+    def __init__(self, cog: "BankBreakthroughCog", guild_id: int, requester_slot: int) -> None:
         self.cog            = cog
         self.guild_id       = guild_id
         self.requester_slot = requester_slot
-        self.gadget_key     = gadget_key
 
         state   = cog._games.get(guild_id)
         options: list[discord.SelectOption] = []
@@ -1023,8 +957,7 @@ class TargetSelect(discord.ui.Select["TargetSelectView"]):
         if not options:
             options = [discord.SelectOption(label="No valid targets", value="none")]
 
-        g_label = "⚡ EMP" if gadget_key == "emp" else "🎯 Hijack"
-        super().__init__(placeholder=f"🎯 Target for {g_label}…", options=options)
+        super().__init__(placeholder="🎯 Choose target to freeze…", options=options)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         state = self.cog._games.get(self.guild_id)
@@ -1034,16 +967,12 @@ class TargetSelect(discord.ui.Select["TargetSelectView"]):
 
         requester = state.champions.get(self.requester_slot)
         if requester is None or interaction.user.id != requester.user_id:
-            await interaction.response.send_message(
-                "❌ This targeting menu is not yours.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ This targeting menu is not yours.", ephemeral=True)
             return
 
         val = self.values[0]
         if val == "none":
-            await interaction.response.send_message(
-                "❌ No valid targets available.", ephemeral=True
-            )
+            await interaction.response.send_message("❌ No valid targets available.", ephemeral=True)
             return
 
         target_slot = int(val)
@@ -1052,47 +981,30 @@ class TargetSelect(discord.ui.Select["TargetSelectView"]):
             await interaction.response.send_message("❌ Target not found.", ephemeral=True)
             return
 
-        g_name, g_cost = VALID_GADGETS[self.gadget_key]
+        _, g_cost = VALID_GADGETS["freeze"]
         if requester.ep < g_cost:
             await interaction.response.send_message(
                 f"❌ Not enough EP — need **{g_cost}**, have **{requester.ep}**.", ephemeral=True
             )
             return
 
-        requester.gadget             = self.gadget_key
+        requester.gadget             = "freeze"
         requester.gadget_target_slot = target_slot
 
-        if self.gadget_key == "emp":
-            await interaction.response.send_message(
-                f"⚡ **EMP Charge → {target.display_name}** queued "
-                f"(−{g_cost} EP at resolution).\n"
-                f"Will stun if adjacent at resolution.",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                f"🎯 **Direction Hijack → {target.display_name}** queued "
-                f"(−{g_cost} EP at resolution).\n"
-                f"Their first move direction will be randomly overridden.",
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            f"🥶 **Freeze Charge → {target.display_name}** queued (−{g_cost} EP at resolution).\n"
+            "Will freeze for 1 full round if adjacent at resolution. EP refunded on miss.",
+            ephemeral=True,
+        )
 
         if self.view is not None:
             self.view.stop()
 
 
-class TargetSelectView(discord.ui.View):
-    """Ephemeral view housing a TargetSelect dropdown."""
-
-    def __init__(
-        self,
-        cog: "BankBreakthroughCog",
-        guild_id: int,
-        requester_slot: int,
-        gadget_key: str,
-    ) -> None:
+class FreezeTargetView(discord.ui.View):
+    def __init__(self, cog: "BankBreakthroughCog", guild_id: int, requester_slot: int) -> None:
         super().__init__(timeout=60.0)
-        self.add_item(TargetSelect(cog, guild_id, requester_slot, gadget_key))
+        self.add_item(FreezeTargetSelect(cog, guild_id, requester_slot))
 
 
 class BreakthroughView(discord.ui.View):
@@ -1105,7 +1017,6 @@ class BreakthroughView(discord.ui.View):
         self.add_item(DirectionButton("down",  "🔽", row=0))
         self.add_item(DirectionButton("left",  "◀️", row=0))
         self.add_item(DirectionButton("right", "▶️", row=0))
-        self.add_item(BoostButton())
         self.add_item(UnlockButton())
         self.add_item(LockInButton())
         self.add_item(GadgetSelect())
@@ -1239,7 +1150,7 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             for i in range(4)
         )
         em = discord.Embed(
-            title="🏦  Breakthrough v3 — Match Starting!",
+            title="🏦  Breakthrough v4 — Match Starting!",
             colour=C_VAULT,
             description=(
                 f"{SEP}\n**Champions have entered the building.**\n"
@@ -1247,12 +1158,23 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                 f"{SEP}\n\n{roster}"
             ),
         )
-        em.add_field(name="🗺️ Grid",      value=f"15×15 — {NUM_RANDOM_WALLS} random walls · A* validated", inline=True)
-        em.add_field(name="⚡ Energy",    value="100 EP · +10/round regen", inline=True)
-        em.add_field(name="⚡ Boost",     value=f"{BOOST_EP_COST} EP → second direction press this round", inline=False)
-        em.add_field(name="🎮 Gadgets",  value="💨 Smoke (30 EP) · ⚡ EMP (40 EP) · 👻 Decoy (50 EP)", inline=False)
+        em.add_field(
+            name="🗺️ Grid",
+            value=f"15×15 — {len(state.walls)} permanent walls · BFS validated",
+            inline=True,
+        )
+        em.add_field(name="⚡ Energy", value="100 EP · +10/round regen", inline=True)
+        em.add_field(
+            name="🎒 Gadget Kit (3 only)",
+            value=(
+                "⚡ Movement Boost (20 EP)\n"
+                "🥶 Freeze Charge (40 EP)\n"
+                "🔀 Board Shuffle (60 EP · 1×/game)"
+            ),
+            inline=False,
+        )
         em.add_field(name="🎮 Controls", value="Use the **buttons on the board message** each round.", inline=False)
-        em.set_footer(text="Breakthrough · Champion Edition v3")
+        em.set_footer(text="Breakthrough · Champion Edition v4")
         await interaction.followup.send(embed=em)
         await self._post_round(guild_id)
 
@@ -1293,69 +1215,47 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             em.description = f"```\n{_render_grid_text(state)}\n```"
             await interaction.response.send_message(embed=em, ephemeral=True)
 
-    @app_commands.command(name="gadgethelp", description="Show a private reference card for all Breakthrough gadgets.")
+    @app_commands.command(name="gadgethelp", description="Show the Breakthrough gadget reference card.")
     @app_commands.guild_only()
     async def gadget_help(self, interaction: discord.Interaction) -> None:
         em = discord.Embed(
             title="🎒  Breakthrough — Gadget Reference",
             colour=C_TEAM,
             description=(
-                "All gadgets are selected from the **🎒 Select Gadget…** dropdown during the planning phase.\n"
+                "Select gadgets from the **🎒 Select Gadget…** dropdown during the planning phase.\n"
                 "EP is deducted at resolution — not when you queue the gadget.\n"
+                "**Only 3 gadgets are registered in the system.** All others are permanently disabled.\n"
             ),
         )
 
         em.add_field(
-            name="💨  Smoke Grenade  —  30 EP",
+            name="⚡  Movement Boost  —  20 EP  |  Self-cast",
             value=(
-                "**Self-cast.** Blankets your current tile in Fog of War for **2 rounds**. "
-                "Your `[row, col]` shows as `[?,?]` in the status table and you are hidden "
-                "from opponents on the rendered board."
-            ),
-            inline=False,
-        )
-
-        em.add_field(
-            name="⚡  Overdrive  —  30 EP",
-            value=(
-                "**Self-cast.** Activates for **2 rounds** starting from the end of the current round.\n"
-                f"• EP regen: **+{EP_REGEN_OVERDRIVE}/round** (normally +{EP_REGEN})\n"
-                f"• Boost cost: **{BOOST_EP_COST_OVERDRIVE} EP** (normally {BOOST_EP_COST})\n"
-                "Status shows as `⚡ OD(Xr)` in the champion table."
+                "Unlocks a **second directional arrow click** this turn, letting you move 2 tiles in one round.\n"
+                "**Cannot be used while carrying the Diamond Briefcase.**\n"
+                "Select it from the gadget dropdown, then press a second direction button.\n"
+                "EP is deducted at resolution; if you can't afford it, the second move is cancelled."
             ),
             inline=False,
         )
 
         em.add_field(
-            name="🔋  EMP Charge  —  40 EP",
+            name="🥶  Freeze Charge  —  40 EP  |  Sabotage — target via dropdown",
             value=(
-                "**Targets an opponent** (picked via pop-up dropdown after selecting EMP).\n"
-                "At resolution, if the target is **orthogonally adjacent**, they are "
-                "**stunned for 1 round** — their move is cancelled and they can't act next turn.\n"
-                "If the target is *not* adjacent the EP cost is **refunded** in full."
+                "Select a target champion from the pop-up picker after choosing this gadget.\n"
+                "At resolution, if the target is **adjacent** (orthogonal or diagonal), they are "
+                "**frozen and rooted for 1 full round** — their move is cancelled and they skip their entire next turn.\n"
+                "If the target is **not adjacent** at resolution, **40 EP is refunded in full**."
             ),
             inline=False,
         )
 
         em.add_field(
-            name="👻  Decoy Hologram  —  50 EP",
+            name="🔀  Board Shuffle  —  60 EP  |  Self-cast  |  ⚠️ 1 use per player per match",
             value=(
-                "**Self-cast.** Places a holographic clone on the tile you occupied at the "
-                "**start of this round** (your previous position). Fails if you haven't moved "
-                "yet (first round) or the previous tile is a wall / vault cell.\n"
-                "The decoy appears as your champion emoji on the board, potentially drawing "
-                "opponent attention."
-            ),
-            inline=False,
-        )
-
-        em.add_field(
-            name="🎯  Direction Hijack  —  50 EP",
-            value=(
-                "**Targets an opponent** (picked via pop-up dropdown after selecting Hijack).\n"
-                "At resolution, the target's **first queued move direction is replaced** with "
-                "a random orthogonal direction (not their intended one). "
-                "Boosted second moves are unaffected — only the first step is hijacked."
+                "Instantly teleports you to a **completely random, safe empty floor tile** anywhere on the map.\n"
+                "**Each player may only use this once per match.** The `🔀✓` marker appears in the board legend when spent.\n"
+                "Useful for escaping chokepoints, resetting position, or surprising opponents."
             ),
             inline=False,
         )
@@ -1363,16 +1263,15 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         em.add_field(
             name="📌  General Rules",
             value=(
-                "• You can only queue **one gadget per round** — selecting a new one replaces the previous.\n"
-                "• Select **🚫 Cancel** from the dropdown to clear your queued gadget.\n"
-                "• EP is checked again at resolution — if you've spent EP elsewhere and no longer "
-                "have enough, the gadget is cancelled (no cost).\n"
-                f"• Max EP cap: **{MAX_EP}**."
+                "• Only **one gadget** may be queued per round — a new selection replaces the previous.\n"
+                "• Select **🚫 Cancel** to clear your gadget (also undoes a Boost if it was queued).\n"
+                "• EP is verified again at resolution — if insufficient, the gadget is cancelled at no charge.\n"
+                f"• Max EP cap: **{MAX_EP}** · Passive regen: **+{EP_REGEN} EP/round**."
             ),
             inline=False,
         )
 
-        em.set_footer(text="Breakthrough · Gadget Reference Card · All costs deducted at resolution")
+        em.set_footer(text="Breakthrough v4 · Gadget Reference · All costs deducted at resolution")
         await interaction.response.send_message(embed=em, ephemeral=True)
 
     @app_commands.command(name="breakthrough-leaderboard", description="Show the all-time Heist Coin leaderboard.")
@@ -1410,14 +1309,14 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             if isinstance(channel, discord.TextChannel) and pos:
                 await channel.send(
                     f"💎  **Round {state.round_number}!** The Diamond Briefcase appeared at "
-                    f"`[{pos[0]},{pos[1]}]` — +500 🪙 but blocks the Boost ability!"
+                    f"`[{pos[0]},{pos[1]}]` — +500 🪙 but blocks the Boost gadget while carrying!"
                 )
 
         channel = self.bot.get_channel(state.channel_id)
         if not isinstance(channel, discord.TextChannel):
             return
 
-        # Reset round inputs; frozen champions are auto-submitted on hold
+        # Reset round inputs; frozen champions are auto-submitted (hold)
         for champ in state.champions.values():
             champ.reset_round()
             if champ.frozen_rounds > 0:
@@ -1470,22 +1369,23 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         for champ in state.champions.values():
             if not champ.submitted and champ.frozen_rounds == 0:
                 champ.move_queue = []
-                resolution_log.append(f"⏰ **{champ.display_name}** timed out — defaulting to **hold**.")
+                resolution_log.append(
+                    f"⏰ **{champ.display_name}** timed out — defaulting to **hold**."
+                )
 
         # ════════════════════════════════════════════════════════════════════
         # PHASE 0 — BOOST EP DEDUCTION
         # ════════════════════════════════════════════════════════════════════
         for champ in state.champions.values():
             if champ.boost_requested:
-                actual_cost = champ.boost_ep_cost
-                if champ.ep >= actual_cost:
-                    champ.ep -= actual_cost
-                    od_note = " _(Overdrive discount)_" if champ.overdrive_rounds > 0 else ""
+                if champ.ep >= BOOST_EP_COST:
+                    champ.ep -= BOOST_EP_COST
                     resolution_log.append(
-                        f"⚡ **{champ.display_name}** used Boost "
-                        f"(−{actual_cost} EP → {champ.ep} EP remaining){od_note}."
+                        f"⚡ **{champ.display_name}** used Movement Boost "
+                        f"(−{BOOST_EP_COST} EP → {champ.ep} EP remaining)."
                     )
                 else:
+                    champ.boost_requested = False
                     if len(champ.move_queue) > 1:
                         champ.move_queue = champ.move_queue[:1]
                     resolution_log.append(
@@ -1496,7 +1396,7 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
         # PHASE 1 — GADGETS
         # ════════════════════════════════════════════════════════════════════
 
-        # Decrement frozen counters first
+        # Tick down freeze counters first
         for champ in state.champions.values():
             if champ.frozen_rounds > 0:
                 champ.frozen_rounds -= 1
@@ -1504,87 +1404,65 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                     resolution_log.append(f"🌡️ **{champ.display_name}** thawed — free next round.")
 
         for champ in state.champions.values():
-            if not champ.gadget:
-                continue
-            key      = champ.gadget
+            key = champ.gadget
+            if not key or key == "boost":
+                continue   # "boost" already handled in PHASE 0
+
             g_name, g_cost = VALID_GADGETS[key]
 
+            # EP affordability check (re-verify at resolution)
             if champ.ep < g_cost:
                 resolution_log.append(
-                    f"⚡ **{champ.display_name}** tried **{g_name}** but has insufficient EP ({champ.ep}/{g_cost})."
+                    f"⚡ **{champ.display_name}** tried **{g_name}** but has insufficient EP "
+                    f"({champ.ep}/{g_cost}) — cancelled at no cost."
                 )
                 continue
 
-            champ.ep -= g_cost
-
-            if key == "smoke":
-                champ.smoked_rounds = 2
-                resolution_log.append(
-                    f"💨 **{champ.display_name}** deployed **Smoke Grenade** — "
-                    f"position hidden for 2 rounds. Fog of War active. (−{g_cost} EP)"
-                )
-
-            elif key == "overdrive":
-                champ.overdrive_rounds = 2
-                resolution_log.append(
-                    f"⚡ **{champ.display_name}** activated **Overdrive**! "
-                    f"+{EP_REGEN_OVERDRIVE} EP/round regen · Boost costs {BOOST_EP_COST_OVERDRIVE} EP "
-                    f"for the next 2 rounds. (−{g_cost} EP)"
-                )
-
-            elif key == "emp":
+            # ── 🥶 Freeze Charge ──────────────────────────────────────────
+            if key == "freeze":
                 ts     = champ.gadget_target_slot
                 target = state.champions.get(ts) if ts is not None else None
                 if target and _is_adjacent(champ.row, champ.col, target.row, target.col):
+                    champ.ep -= g_cost
                     target.frozen_rounds = max(target.frozen_rounds, 1)
                     target.move_queue    = []
                     target.submitted     = True
                     resolution_log.append(
-                        f"⚡ **{champ.display_name}** hit **{target.display_name}** with EMP! "
-                        f"Stunned 1 round. (−{g_cost} EP)"
+                        f"🥶 **{champ.display_name}** froze **{target.display_name}** with "
+                        f"Freeze Charge! Rooted for **1 full round**. (−{g_cost} EP)"
                     )
                 else:
-                    t_name = state.champions[ts].display_name if ts in state.champions else "?"
-                    resolution_log.append(
-                        f"⚡ **{champ.display_name}**'s EMP missed — **{t_name}** not adjacent. (−{g_cost} EP refunded)"
+                    t_name = (
+                        state.champions[ts].display_name
+                        if ts is not None and ts in state.champions else "?"
                     )
-                    champ.ep += g_cost  # refund — missed EMP costs nothing
+                    resolution_log.append(
+                        f"🥶 **{champ.display_name}**'s Freeze Charge missed — "
+                        f"**{t_name}** was not adjacent. EP fully refunded."
+                    )
+                    # No EP deducted on miss
 
-            elif key == "decoy":
-                # Deploy on previous position (where the champion was at the start of this round)
-                pr, pc = champ.prev_row, champ.prev_col
-                if (
-                    pr >= 0
-                    and 0 <= pr < GRID_SIZE and 0 <= pc < GRID_SIZE
-                    and (pr, pc) not in state.walls
-                    and (pr, pc) not in VAULT_TILES
-                    and (pr, pc) != (champ.row, champ.col)
-                ):
-                    champ.has_decoy = True
-                    champ.decoy_row = pr
-                    champ.decoy_col = pc
+            # ── 🔀 Board Shuffle ──────────────────────────────────────────
+            elif key == "shuffle":
+                if champ.shuffle_used:
                     resolution_log.append(
-                        f"👻 **{champ.display_name}** left a **Decoy Hologram** on their "
-                        f"previous position `[{pr},{pc}]`. (−{g_cost} EP)"
+                        f"🔀 **{champ.display_name}**'s Board Shuffle already spent — cancelled."
+                    )
+                    continue
+                dest = _random_safe_tile(state, champ.slot)
+                if dest:
+                    champ.ep -= g_cost
+                    old_pos = (champ.row, champ.col)
+                    champ.row, champ.col = dest
+                    champ.shuffle_used   = True
+                    resolution_log.append(
+                        f"🔀 **{champ.display_name}** activated Board Shuffle! "
+                        f"Teleported `{old_pos}` → `[{dest[0]},{dest[1]}]`. "
+                        f"(−{g_cost} EP · 1 use permanently consumed)"
                     )
                 else:
                     resolution_log.append(
-                        f"👻 **{champ.display_name}**'s Decoy failed — "
-                        f"previous position unavailable or same tile. (−{g_cost} EP)"
-                    )
-
-            elif key == "hijack":
-                ts     = champ.gadget_target_slot
-                target = state.champions.get(ts) if ts is not None else None
-                if target:
-                    target.hijacked_by_slot = champ.slot
-                    resolution_log.append(
-                        f"🎯 **{champ.display_name}** placed a **Direction Hijack** on "
-                        f"**{target.display_name}**! Their first move will be overridden. (−{g_cost} EP)"
-                    )
-                else:
-                    resolution_log.append(
-                        f"🎯 **{champ.display_name}**'s Direction Hijack has no valid target."
+                        f"🔀 **{champ.display_name}**'s Board Shuffle found no safe landing tile — cancelled."
                     )
 
         # ════════════════════════════════════════════════════════════════════
@@ -1613,22 +1491,6 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             s: (c.row, c.col) for s, c in state.champions.items()
         }
 
-        # Apply Direction Hijack overrides — redirect the hijacked champion's first move
-        _all_dirs = ["up", "down", "left", "right"]
-        for champ in state.champions.values():
-            if champ.hijacked_by_slot is not None and champ.move_queue:
-                first = champ.move_queue[0]
-                if first not in ("action", "hold", ""):
-                    alt_dirs = [d for d in _all_dirs if d != first]
-                    forced   = random.choice(alt_dirs)
-                    champ.move_queue[0] = forced
-                    hijacker = state.champions.get(champ.hijacked_by_slot)
-                    h_name   = hijacker.display_name if hijacker else "?"
-                    resolution_log.append(
-                        f"🎯 **{champ.display_name}**'s first move was hijacked by **{h_name}**! "
-                        f"**{first}** → **{forced}**."
-                    )
-
         # Walk each step in the move queue
         for slot, champ in state.champions.items():
             if champ.frozen_rounds > 0:
@@ -1642,7 +1504,7 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                         f"🚶 **{champ.display_name}** moved **{direction}** → `[{champ.row},{champ.col}]`."
                     )
 
-        # Collision detection — bounce back on same tile
+        # Collision detection — bounce back on shared tile
         dest_map: dict[tuple[int, int], list[int]] = {}
         for slot, champ in state.champions.items():
             dest_map.setdefault((champ.row, champ.col), []).append(slot)
@@ -1714,15 +1576,9 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
                         "Stunned for **1 round**."
                     )
 
-        # End-of-round EP regen + status ticks
+        # End-of-round EP regen
         for champ in state.champions.values():
-            if champ.smoked_rounds > 0:
-                champ.smoked_rounds -= 1
-            # Overdrive: boosted regen for 2 rounds, then expire
-            regen = EP_REGEN_OVERDRIVE if champ.overdrive_rounds > 0 else EP_REGEN
-            champ.ep = min(MAX_EP, champ.ep + regen)
-            if champ.overdrive_rounds > 0:
-                champ.overdrive_rounds -= 1
+            champ.ep = min(MAX_EP, champ.ep + EP_REGEN)
 
         # ── Game over ──────────────────────────────────────────────────────
         if game_over and winner_team:
@@ -1782,7 +1638,10 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             inline=True,
         )
         em.set_footer(
-            text=f"Breakthrough v3 · 15×15 · Doors: {len(state.opened_doors)}/{len(FIXED_DOORS)} opened"
+            text=(
+                f"Breakthrough v4 · 15×15 · {len(state.walls)} walls · "
+                f"Doors: {len(state.opened_doors)}/{len(FIXED_DOORS)} opened"
+            )
         )
         return em
 
@@ -1805,7 +1664,7 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             state.champions.values(),
             key=lambda c: (-c.breach_points_contrib, -c.loot_claimed, c.tiles_traveled),
         )
-        medals    = ["🥇", "🥈", "🥉", "4️⃣"]
+        medals     = ["🥇", "🥈", "🥉", "4️⃣"]
         rank_lines = [
             f"{medals[i]} **{c.team.title()}** — "
             f"{c.breach_points_contrib} BP · {c.loot_claimed} loot · {c.tiles_traveled} tiles"
@@ -1835,7 +1694,7 @@ class BankBreakthroughCog(commands.Cog, name="BankBreakthrough"):
             )
         em.add_field(name="📊 Match Ranking", value="\n".join(rank_lines), inline=False)
         em.add_field(name="🏦 Vault", value=f"**{state.breach_points}/{VAULT_POINTS_REQ}** — Cracked", inline=True)
-        em.set_footer(text="Breakthrough · Champion Edition v3 · Match Over")
+        em.set_footer(text="Breakthrough · Champion Edition v4 · Match Over")
 
         if img_buf:
             img_buf.seek(0)

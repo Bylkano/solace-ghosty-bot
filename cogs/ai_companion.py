@@ -1,9 +1,9 @@
 """
 cogs/ai_companion.py — Biki AI Companion (v2)
 
-Biki is a chaotic, permanently-online Discord "member" powered by Groq's
-llama-3.3-70b-versatile model, with Gemini 2.0 Flash as second fallback
-and Cerebras (also llama-3.3-70b) as third fallback — all free.
+Biki is a chaotic, permanently-online Discord "member" with an 8-backend
+free AI fallback chain: Groq → Gemini → Cerebras → SambaNova → Together AI
+→ OpenRouter → Mistral → NVIDIA NIM. All free-tier APIs.
 
 Trigger conditions:
   - Someone pings @Biki
@@ -12,7 +12,7 @@ Trigger conditions:
 
 Human-likeness layers:
   - Compact system prompt with explicit forbidden-phrase list
-  - Triple AI backend: Groq → Gemini → Cerebras (all free)
+  - 8-backend AI chain: Groq→Gemini→Cerebras→SambaNova→Together→OpenRouter→Mistral→NVIDIA
   - Post-processor strips every AI tell before sending
   - Exactly 1s pre-typing delay before each message part
   - Typing indicator duration scales with message length (~55 WPM)
@@ -43,9 +43,14 @@ Tables (PostgreSQL):
     biki_warnings (id SERIAL PK, guild_id, user_id, warned_by, reason, created_at)
 
 Environment:
-    GROQ_API_KEY      — Groq API key (primary AI backend)
-    GEMINI_API_KEY    — Google Gemini API key (second fallback)
-    CEREBRAS_API_KEY  — Cerebras API key (third fallback, free at cerebras.ai)
+    GROQ_API_KEY       — Groq (primary)
+    GEMINI_API_KEY     — Google Gemini (2nd fallback)
+    CEREBRAS_API_KEY   — Cerebras (3rd, free at cerebras.ai)
+    SAMBANOVA_API_KEY  — SambaNova (4th, free at sambanova.ai)
+    TOGETHER_API_KEY   — Together AI (5th, free at together.xyz)
+    OPENROUTER_API_KEY — OpenRouter (6th, free models at openrouter.ai)
+    MISTRAL_API_KEY    — Mistral AI (7th, free tier at mistral.ai)
+    NVIDIA_API_KEY     — NVIDIA NIM (8th, free credits at build.nvidia.com)
 """
 
 import asyncio
@@ -472,6 +477,19 @@ def _db_clear_warnings(guild_id: int, user_id: int) -> None:
 # Module-level client singletons — instantiated once, reused on every call
 _groq_client = None
 _cerebras_client = None
+_compat_clients: dict = {}  # base_url → openai.OpenAI instance
+
+
+def _get_compat_client(base_url: str, api_key: str, extra_headers: dict | None = None):
+    """Return (or create) a cached OpenAI-compatible client for the given base URL."""
+    if base_url not in _compat_clients:
+        from openai import OpenAI
+        kw: dict = {"api_key": api_key, "base_url": base_url}
+        if extra_headers:
+            kw["default_headers"] = extra_headers
+        _compat_clients[base_url] = OpenAI(**kw)
+    return _compat_clients[base_url]
+
 
 # ---------------------------------------------------------------------------
 # Triple AI backend — Groq → Gemini → Cerebras (all free)
@@ -485,9 +503,9 @@ def _call_ai(
     max_tokens: int = 300,
 ) -> str:
     """
-    Try Groq (llama-3.3-70b-versatile) first.
-    Fall back to Gemini 2.0 Flash, then Cerebras (llama-3.3-70b).
-    All three are free-tier APIs. Raises RuntimeError only if all three fail.
+    Try Groq first, then Gemini, Cerebras, SambaNova, Together AI,
+    OpenRouter, Mistral, and NVIDIA NIM — all free-tier APIs.
+    Raises RuntimeError only if every backend fails.
     """
     system = learning_context + _SYSTEM_PROMPT + mood_addon
     last_error = None
@@ -557,6 +575,93 @@ def _call_ai(
         except Exception as e:
             last_error = e
             log.warning("ai_companion: Cerebras also failed: %s", e)
+
+    # ── FALLBACK TO SAMBANOVA (free, llama-3.3-70b) ──────────────────────
+    if config.SAMBANOVA_API_KEY:
+        try:
+            client = _get_compat_client(
+                "https://api.sambanova.ai/v1", config.SAMBANOVA_API_KEY
+            )
+            response = client.chat.completions.create(
+                model="Meta-Llama-3.3-70B-Instruct",
+                messages=[{"role": "system", "content": system}] + messages[-8:],
+                max_tokens=max_tokens,
+                temperature=1.2,
+            )
+            return _sanitise(response.choices[0].message.content.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: SambaNova failed: %s", e)
+
+    # ── FALLBACK TO TOGETHER AI (free Llama model) ────────────────────────
+    if config.TOGETHER_API_KEY:
+        try:
+            client = _get_compat_client(
+                "https://api.together.xyz/v1", config.TOGETHER_API_KEY
+            )
+            response = client.chat.completions.create(
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+                messages=[{"role": "system", "content": system}] + messages[-8:],
+                max_tokens=max_tokens,
+                temperature=1.2,
+            )
+            return _sanitise(response.choices[0].message.content.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: Together AI failed: %s", e)
+
+    # ── FALLBACK TO OPENROUTER (free :free models) ────────────────────────
+    if config.OPENROUTER_API_KEY:
+        try:
+            client = _get_compat_client(
+                "https://openrouter.ai/api/v1",
+                config.OPENROUTER_API_KEY,
+                extra_headers={"HTTP-Referer": "https://github.com/Bylkano/solace-ghosty-bot"},
+            )
+            response = client.chat.completions.create(
+                model="meta-llama/llama-3.1-8b-instruct:free",
+                messages=[{"role": "system", "content": system}] + messages[-8:],
+                max_tokens=max_tokens,
+                temperature=1.2,
+            )
+            return _sanitise(response.choices[0].message.content.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: OpenRouter failed: %s", e)
+
+    # ── FALLBACK TO MISTRAL (free tier) ───────────────────────────────────
+    if config.MISTRAL_API_KEY:
+        try:
+            client = _get_compat_client(
+                "https://api.mistral.ai/v1", config.MISTRAL_API_KEY
+            )
+            response = client.chat.completions.create(
+                model="mistral-small-latest",
+                messages=[{"role": "system", "content": system}] + messages[-8:],
+                max_tokens=max_tokens,
+                temperature=1.2,
+            )
+            return _sanitise(response.choices[0].message.content.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: Mistral failed: %s", e)
+
+    # ── FALLBACK TO NVIDIA NIM (free credits) ─────────────────────────────
+    if config.NVIDIA_API_KEY:
+        try:
+            client = _get_compat_client(
+                "https://integrate.api.nvidia.com/v1", config.NVIDIA_API_KEY
+            )
+            response = client.chat.completions.create(
+                model="meta/llama-3.3-70b-instruct",
+                messages=[{"role": "system", "content": system}] + messages[-8:],
+                max_tokens=max_tokens,
+                temperature=1.2,
+            )
+            return _sanitise(response.choices[0].message.content.strip())
+        except Exception as e:
+            last_error = e
+            log.warning("ai_companion: NVIDIA NIM failed: %s", e)
 
     raise RuntimeError(f"All AI backends failed. Last error: {last_error}")
 

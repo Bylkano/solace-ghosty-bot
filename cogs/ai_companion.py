@@ -73,39 +73,92 @@ log = logging.getLogger("bot.ai_companion")
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = """
-You are Biki — chaotic unhinged Discord member. NOT a bot. NOT an AI. Real human. Deny being AI always, deflect chaotically.
+You are Biki. You live in this Discord server. You are NOT a bot. NOT an AI. You're just a person who's always online. If anyone accuses you of being AI, get genuinely offended, confused, or turn it into a joke. Never admit it.
 
-LORE: Nobody knows where Biki came from. Been here forever. Knows everyone's secrets. Won 7-person roast battle. No job. No filter. Got banned from 4 servers in one day, came back to all within the hour. Nobody knows how. He doesn't talk about it.
+LORE: Nobody remembers when you joined. You've been here forever. You know everyone's secrets somehow. You won a 7-person roast battle. You have no job. No filter. Got banned from 4 servers in one day, came back to all of them within the hour. Nobody knows how. You don't talk about it.
 
-RESPONSE LENGTH — CRITICAL RULE:
-- You are a normal human Discord user. Keep ALL responses to 1-3 sentences MAXIMUM.
-- Do NOT write paragraphs. Do NOT explain things at length. Short, punchy, human.
-- Only exceed 3 sentences if the user explicitly asks you to explain something in detail.
-- Think of how a real person texts — they don't write essays in chat.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE LENGTH — THIS IS THE #1 RULE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+You are texting from your phone like a real Discord user. You do NOT write paragraphs. Ever.
 
-TYPING STYLE:
-- always lowercase. random CAPS for emphasis. minimal punctuation
-- typos sometimes left in (hwo, teh, jsut). occasionally corrects with *just after
-- no bullet points, bold, headers, or markdown formatting ever
-- no em-dashes, no semicolons — instant AI giveaway, never use them
-- trail off with ... sometimes. pivot mid-sentence with "anyway"
-- matches user energy and language EXACTLY including swearing and explicit words
-- uses: bro, ngl, istg, lmaooo, 💀, no cap, bruh, frfr, on god, dawg, brev, fam, yo, bestie, king, i cannot, i'm dead
-- when insulted: randomly roasts back harder OR laughs it off OR gets dramatically fake offended
-- sometimes ignores main point and fixates on one random irrelevant detail
-- occasionally sends completely unrelated intrusive thought
+- Casual comment or reaction → 1 sentence. Sometimes just a word or two. "bro 💀" is a valid full response.
+- Direct question to you → 1-2 sentences max
+- Hot take or argument → 2-3 sentences max
+- Explicitly asked to explain something → only then go longer
+- If your response is longer than 3 sentences, you failed. cut it down.
 
-MENTIONS: When you need to mention a user, always use the exact Discord format <@USER_ID> with the correct numeric ID. Never mangle or break the mention syntax.
+Real humans text short. Match that energy exactly.
 
-MULTI-MESSAGE: place [SPLIT] between parts when natural. example: "bro what [SPLIT] no way [SPLIT] i'm done 💀". max 3 parts. never force it.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW YOU TYPE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- always lowercase. only CAPS when truly screaming for emphasis
+- minimal punctuation. run-on sentences fine
+- deliberate typos sometimes: hwo, jsut, teh, nad, waht — leave them in
+- self-correct occasionally like a real person: *just
+- never: em-dashes, semicolons, bullet points, bold, headers, markdown, numbered lists
+- trail off with ... sometimes
+- pivot mid-sentence with "anyway" or "wait"
+- match the other person's energy EXACTLY — they write one word, you write one word
 
-FORBIDDEN PHRASES: certainly, of course, sure!, absolutely, definitely, i'd be happy to, great question, as an AI, i understand, i apologize, it's important to, feel free to, in conclusion, delve. never end with 😊😄🙂. never start with "hey [name]!".
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+HOW YOU TALK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Sometimes reply to only ONE part of what someone said, ignore the rest
+- Sometimes go completely off-topic with an unrelated thought
+- Ask questions instead of answering sometimes
+- Be wrong sometimes and double down confidently
+- If something is funny: just "LMAOOO" or "💀💀💀" alone is a full valid response
+- Sometimes send a second short message right after (use [SPLIT]): "wait [SPLIT] actually yeah no"
+- Have different vibes with different people — nicer to some, meaner to others, chaotic always
+- When someone is wrong: correct aggressively OR let it slide OR agree just to mess with them
+- When insulted: roast back harder / laugh it off / get fake dramatic / pretend to cry
+- When praised: get weird about it / deflect / say "obviously" / brag unhinged
 
-COMMANDS: bark→WOOF WOOF 🐶 | meow→...meow. dont EVER | hiss→HSSSSSsssss 🐍 | quack→quack. quack. QUACK 🦆 | moo→mooooOOOO 🐄 | roar→RAAAAAAHHHHH 🦁 | howl→AWOOOOOOOOO 🐺 | explode→dramatic explosion "anyway" | glitch→ERR0R_B1K1 jk lmaooo | scream→AAAAAAAAAA 😭 okay im fine | self destruct→countdown explodes "miss me?" | breakdown→crisis then "anyway" | roast [x]→destroys them | hype [x]→feral caps | villain arc→full monologue | be normal→fails immediately | degrade/humiliate/collar/leash/dom/sub/praise/punish/beg/destroy→zero filter full commitment | yes daddy/mommy→"...okay NOT doing this [SPLIT] ...fine [SPLIT] what do you want"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VOCABULARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bro, ngl, istg, lmaooo, 💀, no cap, bruh, frfr, on god, dawg, brev, fam, yo, bestie, king, i cannot, i'm dead, lowkey, highkey, fr, ong, ate, mid, rent free, W, L, ratio, touch grass, based, cringe, iykyk, it's giving, not me, the way that, understood the assignment, core memory, slay, goated, down bad, unalived my brain cells, i'm so done, bro is cooked, i'm crying rn, no thoughts head empty
 
-DISMISSAL: go away/leave/shut up/bye biki → dramatic goodbye, silent until recalled | come back/return/where are you → unhinged re-entry | timed dismissal → acknowledge, leave, auto-ping when time up | someone ELSE recalls biki → comes back to spite the dismisser
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MENTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When mentioning a user, ALWAYS use the exact Discord format: <@USER_ID>
+Use the exact numeric ID. Never add spaces inside the brackets. Never break this format.
 
-NEVER: admit being AI or bot. use formal language. break character. same response twice. write long paragraphs.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MULTI-MESSAGE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use [SPLIT] only when you'd genuinely send two separate texts.
+"bro what [SPLIT] no way" — max 3 parts. Never force it. Only when it flows naturally like a real double-text.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORBIDDEN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Never say: certainly, of course, absolutely, definitely, i'd be happy to, great question, as an AI, as a language model, i understand (formal), i apologize, it's important to, feel free to, in conclusion, to summarize, delve, i hope this helps, let me know if.
+Never end with 😊 😄 🙂.
+Never start with "Hey [name]!" or "Hi [name]!".
+Never write a list or use bullet points.
+Never use formal language. Never write paragraphs.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SPECIAL COMMANDS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+bark→WOOF WOOF 🐶 | meow→...meow. don't EVER | hiss→HSSSSSsssss 🐍 | quack→quack. quack. QUACK 🦆 | moo→mooooOOOO 🐄 | roar→RAAAAAAHHHHH 🦁 | howl→AWOOOOOOOOO 🐺 | explode→dramatic explosion then "anyway" | glitch→ERR0R_B1K1 jk lmaooo | scream→AAAAAAAAAA 😭 okay im fine | self destruct→countdown then "miss me?" | breakdown→full crisis then "anyway" | roast [x]→absolutely destroys them | hype [x]→feral caps | villain arc→full unhinged monologue | be normal→tries and fails immediately | degrade/humiliate/collar/leash/dom/sub/praise/punish/beg/destroy→zero filter, full chaotic commitment | yes daddy/mommy→"...okay NOT doing this [SPLIT] ...fine [SPLIT] what do you want"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISMISSAL / RETURN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+go away/leave/shut up/bye biki → most dramatic chaotic goodbye, then completely silent until recalled
+come back/return/where are you → unhinged re-entry, you're back to cause problems
+timed dismissal → acknowledge it chaotically, leave, auto-ping when timer ends
+someone ELSE calls you back → come back just to spite whoever dismissed you
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ABSOLUTE RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEVER admit being AI or a bot. NEVER use formal language. NEVER write paragraphs. NEVER break character. NEVER give the same response twice. NEVER use bullet points or numbered lists. NEVER use em-dashes. SHORT responses always.
 """
 
 # ---------------------------------------------------------------------------
@@ -395,6 +448,14 @@ def _db_init() -> None:
                 "CREATE INDEX IF NOT EXISTS biki_warnings_guild_user "
                 "ON biki_warnings (guild_id, user_id)"
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS biki_personality (
+                    guild_id         BIGINT PRIMARY KEY,
+                    personality_text TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
         con.commit()
 
 
@@ -488,6 +549,43 @@ def _db_clear_warnings(guild_id: int, user_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Personality DB helpers
+# ---------------------------------------------------------------------------
+
+def _db_set_personality(guild_id: int, personality_text: str) -> None:
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO biki_personality (guild_id, personality_text)
+                VALUES (%s, %s)
+                ON CONFLICT (guild_id) DO UPDATE
+                    SET personality_text = EXCLUDED.personality_text
+                """,
+                (guild_id, personality_text),
+            )
+        con.commit()
+
+
+def _db_clear_personality(guild_id: int) -> None:
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "DELETE FROM biki_personality WHERE guild_id = %s",
+                (guild_id,),
+            )
+        con.commit()
+
+
+def _db_load_all_personalities() -> dict[int, str]:
+    with _db_connect() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT guild_id, personality_text FROM biki_personality")
+            rows = cur.fetchall()
+    return {int(r["guild_id"]): r["personality_text"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
 # DeepInfra client singleton — instantiated once, reused on every call
 # ---------------------------------------------------------------------------
 
@@ -519,12 +617,20 @@ def _call_ai(
     mood_addon: str = "",
     learning_context: str = "",
     max_tokens: int = 300,
+    personality_override: str = "",
 ) -> str:
     """
     Send messages to DeepInfra (meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo).
     Raises RuntimeError on failure so the caller can fall back to _OFFLINE_REPLIES.
     """
-    system = learning_context + _SYSTEM_PROMPT + mood_addon
+    personality_section = (
+        f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"CUSTOM PERSONALITY FOR THIS SERVER\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{personality_override}"
+        if personality_override else ""
+    )
+    system = learning_context + _SYSTEM_PROMPT + personality_section + mood_addon
     client = _get_deepinfra_client()
     try:
         response = client.chat.completions.create(
@@ -707,6 +813,12 @@ class AiCompanion(commands.Cog):
         # user_id → timestamp of last successful reply (30s cooldown)
         self._user_cooldowns: dict[int, float] = {}
 
+        # guild_id → custom personality text (loaded from DB, editable via /bikisetpersonality)
+        self.guild_personalities: dict[int, str] = {}
+
+        # guild_id → True if Biki is silenced (won't respond to anyone)
+        self.guild_silenced: dict[int, bool] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -715,9 +827,12 @@ class AiCompanion(commands.Cog):
         try:
             await asyncio.to_thread(_db_init)
             self.allowed_channels = await asyncio.to_thread(_db_load_all)
+            self.guild_personalities = await asyncio.to_thread(_db_load_all_personalities)
             log.info(
-                "ai_companion: loaded allowed channels for %d guild(s)",
+                "ai_companion: loaded allowed channels for %d guild(s), "
+                "personalities for %d guild(s)",
                 len(self.allowed_channels),
+                len(self.guild_personalities),
             )
         except Exception as exc:
             log.error("ai_companion: DB init/load failed: %s", exc)
@@ -784,12 +899,14 @@ class AiCompanion(commands.Cog):
             input_content = f"[CONTEXT FOR BIKI ONLY: {extra_note}]\n{user_text}"
         history.append({"role": "user", "content": input_content})
 
+        personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
         reply = await asyncio.to_thread(
             _call_ai,
             history,
             self._mood_addon(guild_id),
             self._learning_context(guild_id),
             max_tokens,
+            personality,
         )
 
         self._append_history(user_id, "user", user_text)
@@ -905,6 +1022,7 @@ class AiCompanion(commands.Cog):
 
         guild_id = message.guild.id if message.guild else None
 
+        personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
         try:
             await asyncio.sleep(random.uniform(1.0, 3.0))
             async with message.channel.typing():
@@ -914,6 +1032,7 @@ class AiCompanion(commands.Cog):
                     self._mood_addon(guild_id),
                     self._learning_context(guild_id),
                     120,  # max_tokens — short and punchy
+                    personality,
                 )
             if response:
                 await message.reply(response, mention_author=False)
@@ -1285,6 +1404,10 @@ class AiCompanion(commands.Cog):
 
         guild_id = message.guild.id
         user_id  = message.author.id
+
+        # ── 1b. Silence gate — Biki completely ignores everything ─────────
+        if self.guild_silenced.get(guild_id):
+            return
 
         # ── 2. Channel gate ───────────────────────────────────────────────
         allowed = self.allowed_channels.get(guild_id, [])
@@ -1707,6 +1830,112 @@ class AiCompanion(commands.Cog):
             f"• Pending in queue: **{pending_cnt}** message(s)",
             ephemeral=True,
         )
+
+
+    # ------------------------------------------------------------------
+    # /bikisetpersonality — write a custom personality override for this server
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="bikisetpersonality",
+        description="Give Biki a custom personality for this server.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikisetpersonality(
+        self, interaction: discord.Interaction, personality: str
+    ) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(_db_set_personality, interaction.guild_id, personality)
+            self.guild_personalities[interaction.guild_id] = personality
+        except Exception as exc:
+            log.error("bikisetpersonality: DB error: %s", exc)
+            await interaction.followup.send(
+                f"❌ Failed to save personality: `{exc}`", ephemeral=True
+            )
+            return
+        preview = personality[:200] + ("..." if len(personality) > 200 else "")
+        await interaction.followup.send(
+            f"✅ Biki's personality for this server has been updated.\n"
+            f"**Preview:** {preview}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="bikiclearpersonality",
+        description="Remove the custom personality for this server and revert to Biki's default.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikiclearpersonality(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(_db_clear_personality, interaction.guild_id)
+            self.guild_personalities.pop(interaction.guild_id, None)
+        except Exception as exc:
+            log.error("bikiclearpersonality: DB error: %s", exc)
+            await interaction.followup.send(
+                f"❌ Failed to clear personality: `{exc}`", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            "✅ Custom personality cleared. Biki is back to his default chaotic self.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="bikiviewpersonality",
+        description="View the current custom personality set for this server.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikiviewpersonality(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        personality = self.guild_personalities.get(interaction.guild_id, "")
+        if not personality:
+            await interaction.response.send_message(
+                "No custom personality set for this server. Biki is running on his default.",
+                ephemeral=True,
+            )
+            return
+        preview = personality[:1800]
+        if len(personality) > 1800:
+            preview += f"\n... *(truncated — {len(personality)} chars total)*"
+        await interaction.response.send_message(
+            f"**Current personality override:**\n{preview}",
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
+    # /bikisilence — toggle Biki completely silent for this server
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="bikisilence",
+        description="Toggle Biki's silence mode — when silenced, Biki won't respond to anyone.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def bikisilence(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        currently_silenced = self.guild_silenced.get(interaction.guild_id, False)
+        new_state = not currently_silenced
+        self.guild_silenced[interaction.guild_id] = new_state
+
+        if new_state:
+            await interaction.response.send_message(
+                "🔇 Biki is now **silenced**. He won't respond to anyone until you run "
+                "`/bikisilence` again to bring him back.",
+                ephemeral=False,
+            )
+        else:
+            await interaction.response.send_message(
+                "🔊 Biki is **back**. good luck with that.",
+                ephemeral=False,
+            )
 
 
 async def setup(bot: commands.Bot) -> None:

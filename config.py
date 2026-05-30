@@ -13,9 +13,10 @@ DEV_GUILD_ID: int | None = int(guild_id) if (guild_id := os.getenv("DEV_GUILD_ID
 # Database
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
-# AI backends (Groq is primary, Gemini is automatic fallback)
+# AI backends (Groq → Gemini → Cerebras fallback chain)
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+CEREBRAS_API_KEY: str = os.getenv("CEREBRAS_API_KEY", "")
 
 if not BOT_TOKEN:
     raise ValueError(

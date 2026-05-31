@@ -2708,6 +2708,99 @@ class AiCompanion(commands.Cog):
         )
 
     # ------------------------------------------------------------------
+    # /bikirecall — show everything Biki knows about a member (owner only)
+    # ------------------------------------------------------------------
+
+    @app_commands.command(
+        name="bikirecall",
+        description="Show everything Biki knows about a member. Ping them.",
+    )
+    @app_commands.guild_only()
+    @app_commands.describe(member="The server member to look up — ping/mention them.")
+    async def bikirecall(
+        self, interaction: discord.Interaction, member: discord.Member
+    ) -> None:
+        assert interaction.guild_id is not None
+        gid = interaction.guild_id
+
+        await interaction.response.defer(ephemeral=True)
+
+        # ── 1. User memory profile ────────────────────────────────────────
+        profile = self.user_memory.get(gid, {}).get(member.id)
+
+        # If not in memory, try loading from DB
+        if profile is None:
+            try:
+                rows = await asyncio.to_thread(_db_load_all_user_memory, gid)
+                profile = rows.get(member.id)
+                if profile:
+                    self.user_memory.setdefault(gid, {})[member.id] = profile
+            except Exception:
+                profile = None
+
+        profile_lines: list[str] = []
+        if profile:
+            dn    = profile.get("display_name") or member.display_name
+            uname = profile.get("username") or member.name
+            count = profile.get("message_count", 0)
+            notes = profile.get("notes") or []
+            profile_lines.append(f"**Display name:** {dn} (`@{uname}`)")
+            profile_lines.append(f"**Times talked to Biki:** {count}")
+            if notes:
+                profile_lines.append("**Self-stated facts:**")
+                for n in notes[-10:]:
+                    profile_lines.append(f"  • {n}")
+        else:
+            profile_lines.append("_(No direct conversation profile yet)_")
+
+        # ── 2. Passive server knowledge ───────────────────────────────────
+        # Check in-memory first, then DB
+        first_name = member.display_name.split()[0]
+        kb_facts = (
+            self.server_knowledge.get(gid, {}).get(first_name)
+            or self.server_knowledge.get(gid, {}).get(member.display_name)
+            or self.server_knowledge.get(gid, {}).get(member.name.split()[0])
+        )
+
+        if kb_facts is None:
+            try:
+                db_facts = await asyncio.to_thread(
+                    _db_get_knowledge_about, gid, first_name
+                )
+                if not db_facts and first_name != member.display_name:
+                    db_facts = await asyncio.to_thread(
+                        _db_get_knowledge_about, gid, member.display_name
+                    )
+                kb_facts = db_facts or []
+                if kb_facts:
+                    self.server_knowledge.setdefault(gid, {})[first_name] = kb_facts
+            except Exception:
+                kb_facts = []
+
+        knowledge_lines: list[str] = []
+        if kb_facts:
+            knowledge_lines.append("**Passively picked up from server chat:**")
+            for f in kb_facts[-15:]:
+                knowledge_lines.append(f"  • {f}")
+        else:
+            knowledge_lines.append("_(Nothing picked up from server chat yet)_")
+
+        # ── 3. Build reply ────────────────────────────────────────────────
+        header = f"🧠 **Biki's file on {member.display_name}** (`{member.name}`)\n"
+        body = (
+            "\n".join(profile_lines)
+            + "\n\n"
+            + "\n".join(knowledge_lines)
+        )
+
+        # Discord message cap safety
+        full = header + body
+        if len(full) > 1900:
+            full = full[:1897] + "…"
+
+        await interaction.followup.send(full, ephemeral=True)
+
+    # ------------------------------------------------------------------
     # /bikisetpersonality — write a custom personality override for this server
     # ------------------------------------------------------------------
 

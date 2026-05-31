@@ -167,6 +167,7 @@ NEVER give the same response twice.
 NEVER use bullet points, lists, numbered lists, or markdown.
 NEVER end a sentence with a period unless it's sarcastic or for effect.
 NEVER stack slang — one natural use is max.
+Type like a casual Discord user in lowercase. Avoid massive multi-paragraph walls of text, but give full, punchy, multi-sentence responses when roasting or engaging in bantering context.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EXAMPLES — THIS IS EXACTLY HOW YOU TALK
@@ -1517,6 +1518,10 @@ class AiCompanion(commands.Cog):
             "Say as much or as little as the moment calls for. Be yourself."
         )
 
+        # Ignore keyboard smashes / single reactions — not worth a response
+        if len(message.content.split()) < 3:
+            return
+
         guild_id = message.guild.id if message.guild else None
 
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
@@ -1528,7 +1533,7 @@ class AiCompanion(commands.Cog):
                 [{"role": "user", "content": prompt}],
                 self._mood_addon(guild_id),
                 self._learning_context(guild_id),
-                400,  # full token budget — let him talk
+                400,  # full token budget
                 personality,
                 facts or None,
             )
@@ -1942,7 +1947,7 @@ class AiCompanion(commands.Cog):
                     except discord.HTTPException:
                         pass
 
-            if random.random() < 0.85:
+            if random.random() < random.uniform(0.05, 0.08):
                 asyncio.create_task(self._proactive_reply(message))
             return
 
@@ -1964,10 +1969,10 @@ class AiCompanion(commands.Cog):
                 f"\"{message.reference.resolved.content[:200]}\"]"
             )
 
-        # ── Per-user cooldown (5 seconds — just enough to prevent spam) ────
+        # ── Per-user cooldown (10–15 seconds) — skip silently, no API call ──
         now = time.time()
         last_reply = self._user_cooldowns.get(user_id, 0)
-        if now - last_reply < 5.0:
+        if now - last_reply < random.uniform(10.0, 15.0):
             return
 
         # c. Conversation lock check ─────────────────────────────────────

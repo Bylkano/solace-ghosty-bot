@@ -14,7 +14,7 @@ DEV_GUILD_ID: int | None = int(guild_id) if (guild_id := os.getenv("DEV_GUILD_ID
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 
 # AI backend — DeepInfra (exclusive)
-DEEPINFRA_TOKEN: str = os.getenv("DEEPINFRA_TOKEN", "")
+DEEPINFRA_API_KEY: str = os.getenv("DEEPINFRA_API_KEY", "")
 
 if not BOT_TOKEN:
     raise ValueError(

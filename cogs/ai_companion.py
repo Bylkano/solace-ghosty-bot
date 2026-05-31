@@ -1309,6 +1309,9 @@ class AiCompanion(commands.Cog):
         # channel_id → deque of last 5 raw message strings (channel context memory)
         self.channel_history: dict[int, deque] = {}
 
+        # guild_id → chime-in rate (0.0–1.0). Default 0.06 (6%)
+        self.guild_chime_rate: dict[int, float] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -1947,7 +1950,8 @@ class AiCompanion(commands.Cog):
                     except discord.HTTPException:
                         pass
 
-            if random.random() < random.uniform(0.05, 0.08):
+            chime_rate = self.guild_chime_rate.get(guild_id, 0.06)
+            if random.random() < chime_rate:
                 asyncio.create_task(self._proactive_reply(message))
             return
 
@@ -1969,10 +1973,10 @@ class AiCompanion(commands.Cog):
                 f"\"{message.reference.resolved.content[:200]}\"]"
             )
 
-        # ── Per-user cooldown (10–15 seconds) — skip silently, no API call ──
+        # ── Per-user cooldown (5 seconds) — skip silently, no API call ──────
         now = time.time()
         last_reply = self._user_cooldowns.get(user_id, 0)
-        if now - last_reply < random.uniform(10.0, 15.0):
+        if now - last_reply < 5.0:
             return
 
         # c. Conversation lock check ─────────────────────────────────────
@@ -2702,6 +2706,70 @@ class AiCompanion(commands.Cog):
         await interaction.response.send_message(
             f"**Things Biki knows about this server ({len(facts)} facts):**\n{body}\n\n"
             f"Use `/bikiforget <id>` to remove one.",
+            ephemeral=True,
+        )
+
+
+    # /bikirate — view or set the passive chime-in rate for this server
+    @app_commands.command(
+        name="bikirate",
+        description="View or set how often Biki jumps into unpinged messages (0–100%).",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(percent="Chime-in chance 0–100. Leave blank to just view current rate.")
+    async def bikirate(
+        self,
+        interaction: discord.Interaction,
+        percent: Optional[int] = None,
+    ) -> None:
+        assert interaction.guild_id is not None
+        current = self.guild_chime_rate.get(interaction.guild_id, 0.06)
+        current_pct = round(current * 100, 1)
+
+        if percent is None:
+            bar_filled = int(current_pct / 5)
+            bar = "█" * bar_filled + "░" * (20 - bar_filled)
+            await interaction.response.send_message(
+                f"**Biki's current chime-in rate for this server:**\n"
+                f"`[{bar}]` **{current_pct}%**\n\n"
+                f"• At **0%** — Biki only replies when directly @mentioned\n"
+                f"• At **6%** *(default)* — jumps in occasionally, feels natural\n"
+                f"• At **25%** — very chatty, active in almost every convo\n"
+                f"• At **100%** — replies to literally everything\n\n"
+                f"To change: `/bikirate percent:<0–100>`",
+                ephemeral=True,
+            )
+            return
+
+        if not 0 <= percent <= 100:
+            await interaction.response.send_message(
+                "percent must be between 0 and 100.", ephemeral=True
+            )
+            return
+
+        new_rate = percent / 100.0
+        self.guild_chime_rate[interaction.guild_id] = new_rate
+        bar_filled = int(percent / 5)
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+
+        if percent == 0:
+            flavour = "silent mode — only responds to pings"
+        elif percent <= 5:
+            flavour = "barely lurking"
+        elif percent <= 15:
+            flavour = "natural, jumps in occasionally"
+        elif percent <= 35:
+            flavour = "chatty, hard to ignore"
+        elif percent <= 60:
+            flavour = "very active, almost always there"
+        else:
+            flavour = "CHAOS MODE — replying to everything"
+
+        await interaction.response.send_message(
+            f"✅ Biki's chime-in rate set to **{percent}%** — *{flavour}*\n"
+            f"`[{bar}]`\n\n"
+            f"He'll still reply **100%** of the time when directly @mentioned.",
             ephemeral=True,
         )
 

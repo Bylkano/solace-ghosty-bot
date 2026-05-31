@@ -446,6 +446,28 @@ _TRIGGER_REACTION_WORDS: frozenset[str] = frozenset({
 
 _CHAOTIC_REACTION_POOL = ["💀", "😭", "💯", "🫡", "👀", "🤣", "🔥", "🫠", "😤", "👁️"]
 
+# ── Passive fact-extraction regex ─────────────────────────────────────────────
+# Matches third-person statements like "Sony loves this girl" or "Riz is into monkeys"
+_FACT_SUBJECT_RE = re.compile(
+    r'\b([A-Z][a-z]{1,20})\b\s+'
+    r'((?:is|are|was|were|loves?|hates?|likes?|dislikes?|works?|worked|has|had|'
+    r'goes?|went|got|plays?|played|lives?|moved|joined|left|started|stopped|'
+    r'thinks?|believes?|seems?|owns?|wants?|said|told|\'?s\s+(?:into|a|an|the|in\b))'
+    r'\s.{4,80}?)(?:\s*[.!?,\n]|$)',
+    re.MULTILINE,
+)
+# Words that look like proper nouns but aren't member names
+_NOT_A_NAME: frozenset[str] = frozenset({
+    "He", "She", "It", "They", "We", "You", "The", "A", "An",
+    "This", "That", "These", "Those", "My", "His", "Her", "Their",
+    "Our", "Your", "Some", "Any", "All", "No", "Not", "If", "But",
+    "And", "Or", "So", "When", "While", "After", "Before", "Also",
+    "Biki", "Discord", "Server", "God", "Jesus", "Ok", "Okay",
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+    "January", "February", "March", "April", "June", "July",
+    "August", "September", "October", "November", "December",
+})
+
 # ---------------------------------------------------------------------------
 # Database helpers (synchronous — wrap with asyncio.to_thread)
 # ---------------------------------------------------------------------------
@@ -536,6 +558,22 @@ def _db_init() -> None:
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS biki_conversations_gu "
                 "ON biki_conversations (guild_id, user_id, created_at)"
+            )
+            # Passive server knowledge — facts Biki silently picks up about members
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS biki_server_knowledge (
+                    id          SERIAL PRIMARY KEY,
+                    guild_id    BIGINT NOT NULL,
+                    subject     TEXT   NOT NULL,
+                    fact        TEXT   NOT NULL,
+                    created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS biki_server_knowledge_gs "
+                "ON biki_server_knowledge (guild_id, subject)"
             )
         con.commit()
 
@@ -892,6 +930,40 @@ def _db_load_user_conv(guild_id: int, user_id: int, limit: int = _CONV_KEEP) -> 
             )
             rows = cur.fetchall()
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def _db_store_knowledge(guild_id: int, subject: str, fact: str) -> None:
+    """Persist a passive server fact. Silently deduplicates on (guild, subject, fact)."""
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO biki_server_knowledge (guild_id, subject, fact)
+                SELECT %s, %s, %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM biki_server_knowledge
+                    WHERE guild_id = %s AND subject = %s AND fact = %s
+                )
+                """,
+                (guild_id, subject, fact, guild_id, subject, fact),
+            )
+        con.commit()
+
+
+def _db_get_knowledge_about(guild_id: int, subject: str, limit: int = 10) -> list[str]:
+    """Return stored facts about a subject name in a guild."""
+    with _db_connect() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT fact FROM biki_server_knowledge
+                WHERE guild_id = %s AND LOWER(subject) = LOWER(%s)
+                ORDER BY id DESC LIMIT %s
+                """,
+                (guild_id, subject, limit),
+            )
+            rows = cur.fetchall()
+    return [r["fact"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1261,6 +1333,8 @@ class AiCompanion(commands.Cog):
 
         # guild_id → {user_id → profile dict} — persistent user memory
         self.user_memory: dict[int, dict[int, dict]] = {}
+        # guild_id → {subject_name → [fact, ...]}
+        self.server_knowledge: dict[int, dict[str, list[str]]] = {}
 
         # (guild_id, user_id) → guild_id mapping for persistence calls
         # kept so _append_history can persist without knowing guild_id
@@ -1387,6 +1461,20 @@ class AiCompanion(commands.Cog):
                 if notes:
                     mem_lines.append("What you remember about them: " + " | ".join(notes[-8:]))
                 extra_note = (extra_note + "\n" if extra_note else "") + " ".join(mem_lines)
+
+            # ── Inject server knowledge Biki passively collected ──────────────
+            # Look up facts about the person by their display name / username
+            _profile_name = (profile or {}).get("display_name") or (profile or {}).get("username")
+            _kb = self.server_knowledge.get(guild_id, {})
+            _kb_facts: list[str] = []
+            if _profile_name:
+                first = _profile_name.split()[0]
+                _kb_facts = _kb.get(first, _kb.get(_profile_name, []))
+            if _kb_facts:
+                extra_note = (extra_note + "\n" if extra_note else "") + (
+                    "Things you've quietly picked up about this person from server chat: "
+                    + " | ".join(_kb_facts[-6:])
+                )
 
         # ── Inject recent channel context ─────────────────────────────────────
         if channel_context:
@@ -1629,6 +1717,64 @@ class AiCompanion(commands.Cog):
                 asyncio.to_thread(_db_upsert_user_memory, g, u, dn, un, True)
             )
         )
+
+    # ------------------------------------------------------------------
+    # Passive fact extraction — runs on every message, even when silenced
+    # ------------------------------------------------------------------
+
+    def _passive_fact_extract(self, message: discord.Message) -> None:
+        """
+        Silently scan every message for third-person factual statements about
+        server members (e.g. "Sony loves this girl", "Riz is into monkeys").
+        Stores distilled facts in server_knowledge and persists to DB async.
+        Never needs an AI call — pure regex, zero latency.
+        """
+        if not message.guild:
+            return
+        guild_id = message.guild.id
+        text = message.content
+
+        # Build a quick name → display_name lookup from current members
+        member_names: set[str] = set()
+        for m in message.guild.members:
+            if m.display_name:
+                member_names.add(m.display_name.split()[0])  # first word only
+            if m.name:
+                member_names.add(m.name.split()[0])
+
+        guild_kb = self.server_knowledge.setdefault(guild_id, {})
+
+        for match in _FACT_SUBJECT_RE.finditer(text):
+            subject_raw = match.group(1).strip()
+            fact_raw    = match.group(2).strip()
+
+            # Skip non-names and very short facts
+            if subject_raw in _NOT_A_NAME or len(fact_raw) < 5:
+                continue
+            # Optional: only store facts about people we've seen (reduces noise)
+            # Comment this out if you want to store facts about anyone mentioned
+            if member_names and subject_raw not in member_names:
+                continue
+
+            # Clean up the fact string
+            fact = f"{subject_raw} {fact_raw}".rstrip(".,!? ")
+            if len(fact) > 120:
+                fact = fact[:120]
+
+            facts_for = guild_kb.setdefault(subject_raw, [])
+            if fact not in facts_for:
+                if len(facts_for) < 30:
+                    facts_for.append(fact)
+                else:
+                    facts_for.pop(0)   # evict oldest when cap reached
+                    facts_for.append(fact)
+
+                # Persist async, best-effort
+                asyncio.get_event_loop().call_soon(
+                    lambda g=guild_id, s=subject_raw, f=fact: asyncio.create_task(
+                        asyncio.to_thread(_db_store_knowledge, g, s, f)
+                    )
+                )
 
     # ------------------------------------------------------------------
     # Moderation — 3-priority target resolution
@@ -1949,7 +2095,10 @@ class AiCompanion(commands.Cog):
         # ── 3. Passive learning + user memory ────────────────────────────
         self._learn_from_message(message)
 
-        # ── 3b. Wire user → guild so _append_history can persist async ───
+        # ── 3b. Passive fact extraction — always runs, even when silenced ─
+        self._passive_fact_extract(message)
+
+        # ── 3c. Wire user → guild so _append_history can persist async ───
         self._user_guild[user_id] = guild_id
 
         # ── 3c. Channel context memory (last 8 messages per channel) ─────

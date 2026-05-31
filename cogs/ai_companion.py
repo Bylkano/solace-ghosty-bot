@@ -447,6 +447,14 @@ _REACTION_POOL = [
     "😤", "🤔", "👁️", "💅", "🫠", "😮", "🧐", "🫶",
 ]
 
+# Words that trigger a passive silent emoji reaction (5% chance, no ping needed)
+_TRIGGER_REACTION_WORDS: frozenset[str] = frozenset({
+    "lmao", "lol", "bot", "bruh", "💀", "😭", "based",
+    "ratio", "ded", "ngl", "fr", "gg", "omg", "wtf", "bro",
+})
+
+_CHAOTIC_REACTION_POOL = ["💀", "😭", "💯", "🫡", "👀", "🤣", "🔥", "🫠", "😤", "👁️"]
+
 # ---------------------------------------------------------------------------
 # Database helpers (synchronous — wrap with asyncio.to_thread)
 # ---------------------------------------------------------------------------
@@ -1077,6 +1085,9 @@ class AiCompanion(commands.Cog):
         # guild_id → list of {id, fact_text} dicts (loaded from DB, editable via /bikiremember)
         self.guild_facts: dict[int, list[dict]] = {}
 
+        # channel_id → deque of last 5 raw message strings (channel context memory)
+        self.channel_history: dict[int, deque] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -1152,13 +1163,20 @@ class AiCompanion(commands.Cog):
         extra_note: Optional[str] = None,
         guild_id: Optional[int] = None,
         max_tokens: int = 300,
+        channel_context: str = "",
     ) -> str:
         """Call _call_ai with full conversation history, update history, return reply."""
         user_text = user_text[:400]  # cap input tokens
         history = list(self.conversations.get(user_id, []))
         input_content = user_text
+        # Inject recent channel context so Biki can follow the broader convo
+        if channel_context:
+            input_content = (
+                f"[RECENT CHANNEL CONTEXT — what others just said before this message:\n"
+                f"{channel_context}]\n{input_content}"
+            )
         if extra_note:
-            input_content = f"[CONTEXT FOR BIKI ONLY: {extra_note}]\n{user_text}"
+            input_content = f"[CONTEXT FOR BIKI ONLY: {extra_note}]\n{input_content}"
         history.append({"role": "user", "content": input_content})
 
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
@@ -1240,8 +1258,9 @@ class AiCompanion(commands.Cog):
         parts     = _split_parts(text)
         use_reply = force_reply or random.random() < 0.40
 
-        # Brief glance pause before typing — keeps it feeling human but snappy
-        await asyncio.sleep(random.uniform(0.2, 0.5))
+        # Reading pause scales with incoming message length — longer msg = Biki "reads" it longer
+        _read_pause = min(1.5, 0.25 + len(trigger.content) / 250)
+        await asyncio.sleep(_read_pause + random.uniform(-0.05, 0.15))
 
         for i, part in enumerate(parts):
             typing_duration = _typing_seconds(part)
@@ -1675,6 +1694,14 @@ class AiCompanion(commands.Cog):
         # ── 3. Passive learning ───────────────────────────────────────────
         self._learn_from_message(message)
 
+        # ── 3b. Channel context memory (last 5 messages per channel) ─────
+        _ch_hist = self.channel_history.setdefault(
+            message.channel.id, deque(maxlen=5)
+        )
+        _ch_hist.append(
+            f"{message.author.display_name}: {message.content[:150]}"
+        )
+
         # ── 4. Detect trigger ─────────────────────────────────────────────
         assert self.bot.user is not None
 
@@ -1686,8 +1713,19 @@ class AiCompanion(commands.Cog):
         )
         triggered = bot_mentioned or replied_to_bot
 
-        # ── 5. Proactive jump-in (3% chance, only when NOT triggered) ─────
+        # ── 5. Proactive jump-in + passive trigger-word reaction ──────────
         if not triggered:
+            # 5% silent emoji reaction when a trigger word is in the message
+            msg_lower = message.content.lower()
+            if any(w in msg_lower for w in _TRIGGER_REACTION_WORDS):
+                if random.random() < 0.05:
+                    try:
+                        await message.add_reaction(
+                            random.choice(_CHAOTIC_REACTION_POOL)
+                        )
+                    except discord.HTTPException:
+                        pass
+
             if random.random() < 0.01:
                 asyncio.create_task(self._proactive_reply(message))
             return
@@ -1832,9 +1870,15 @@ class AiCompanion(commands.Cog):
 
             # j. Normal reply ─────────────────────────────────────────────
             # Generate silently, then _send_biki_reply handles:
-            #   1s reading pause → WPM-scaled typing → send
+            #   reading pause → WPM-scaled typing → send
             try:
-                reply = await self._ai_reply(user_id, clean, guild_id=guild_id)
+                # Build channel context from the last 5 messages (excluding the current one)
+                _ctx_deque = self.channel_history.get(channel_id)
+                _ctx_lines = list(_ctx_deque)[:-1] if _ctx_deque else []
+                _channel_ctx = "\n".join(_ctx_lines)
+                reply = await self._ai_reply(
+                    user_id, clean, guild_id=guild_id, channel_context=_channel_ctx
+                )
                 self._user_cooldowns[user_id] = time.time()
                 await self._send_biki_reply(message, reply)
             except Exception as exc:

@@ -447,26 +447,46 @@ _TRIGGER_REACTION_WORDS: frozenset[str] = frozenset({
 _CHAOTIC_REACTION_POOL = ["💀", "😭", "💯", "🫡", "👀", "🤣", "🔥", "🫠", "😤", "👁️"]
 
 # ── Passive fact-extraction regex ─────────────────────────────────────────────
-# Matches third-person statements like "Sony loves this girl" or "Riz is into monkeys"
+# Matches third-person statements like "sony loves this girl", "riz is into monkeys"
+# Case-insensitive so lowercase Discord nicknames are captured.
 _FACT_SUBJECT_RE = re.compile(
-    r'\b([A-Z][a-z]{1,20})\b\s+'
+    r'\b([A-Za-z][a-zA-Z\'\-]{1,20})\b\s+'
     r'((?:is|are|was|were|loves?|hates?|likes?|dislikes?|works?|worked|has|had|'
     r'goes?|went|got|plays?|played|lives?|moved|joined|left|started|stopped|'
-    r'thinks?|believes?|seems?|owns?|wants?|said|told|\'?s\s+(?:into|a|an|the|in\b))'
-    r'\s.{4,80}?)(?:\s*[.!?,\n]|$)',
-    re.MULTILINE,
+    r'thinks?|believes?|seems?|owns?|wants?|said|told|\'s?\s+(?:into|a|an|the|in\b)|'
+    r'(?:is|was|been)\s+(?:into|a|an|the|in\b))'
+    r'\s.{3,100}?)(?:\s*[.!?,\n]|$)',
+    re.MULTILINE | re.IGNORECASE,
 )
-# Words that look like proper nouns but aren't member names
+# Stop-words that should never be treated as a member name (lowercased for comparison)
 _NOT_A_NAME: frozenset[str] = frozenset({
-    "He", "She", "It", "They", "We", "You", "The", "A", "An",
-    "This", "That", "These", "Those", "My", "His", "Her", "Their",
-    "Our", "Your", "Some", "Any", "All", "No", "Not", "If", "But",
-    "And", "Or", "So", "When", "While", "After", "Before", "Also",
-    "Biki", "Discord", "Server", "God", "Jesus", "Ok", "Okay",
-    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
-    "January", "February", "March", "April", "June", "July",
-    "August", "September", "October", "November", "December",
+    "he", "she", "it", "they", "we", "you", "the", "a", "an",
+    "this", "that", "these", "those", "my", "his", "her", "their",
+    "our", "your", "some", "any", "all", "no", "not", "if", "but",
+    "and", "or", "so", "when", "while", "after", "before", "also",
+    "biki", "discord", "server", "god", "jesus", "ok", "okay",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "june", "july",
+    "august", "september", "october", "november", "december",
+    "everyone", "someone", "nobody", "anybody", "somebody", "anyone",
+    "i", "me", "mine", "myself",
 })
+
+# Self-referential fact pattern — compiled once at module level
+_SELF_RE = re.compile(
+    r'\b(i(?:\'?m| am| was| got| have| had| work| love| hate| like| play| live|'
+    r' went| started| joined) [^.!?\n]{5,80}|'
+    r'my (?:name|job|age|hobby|favourite|fav|pronouns|boyfriend|girlfriend|crush|'
+    r'bestie|sister|brother|mom|dad|cat|dog)[^.!?\n]{3,80})',
+    re.IGNORECASE,
+)
+
+# First-person verb pattern for passive attribution — compiled once
+_FIRST_PERSON_RE = re.compile(
+    r'\bi(?:\'?m| am| was| got| have| had| works?| loves?| hates?| likes?|'
+    r' plays?| lives?| went| started| joined)\b(.{4,100}?)(?:[.!?,\n]|$)',
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Database helpers (synchronous — wrap with asyncio.to_thread)
@@ -1247,22 +1267,31 @@ def _extract_emojis(text: str) -> list[str]:
 def _build_learning_context(vocab: dict) -> str:
     if not vocab:
         return ""
-    phrases = vocab.get("common_phrases", [])[-20:]
-    slang   = vocab.get("slang", [])[-20:]
-    emojis  = vocab.get("emojis", [])[-10:]
+    phrases = vocab.get("common_phrases", [])[-25:]
+    slang   = vocab.get("slang", [])[-25:]
+    emojis  = vocab.get("emojis", [])[-12:]
     energy  = vocab.get("energy", "mixed")
-    samples = vocab.get("sample_messages", [])[-10:]
+    samples = vocab.get("sample_messages", [])[-15:]
     if not any([phrases, slang, emojis, samples]):
         return ""
+
+    sample_block = "\n".join(f'  "{s}"' for s in samples[-8:]) if samples else ""
+
     return (
-        "SERVER STYLE TRAINING DATA:\n"
-        f"This server commonly uses these phrases: {', '.join(phrases)}\n"
-        f"Common slang in this server: {', '.join(slang)}\n"
-        f"Most used emojis here: {', '.join(emojis)}\n"
-        f"Server energy vibe: {energy}\n"
-        f"Recent message style examples: {' | '.join(samples)}\n\n"
-        "Use this naturally. Talk like you belong in THIS specific server, "
-        "not a generic Discord server.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "THIS SERVER'S REAL COMMUNICATION STYLE — COPY IT EXACTLY\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Energy vibe: {energy}\n"
+        f"Their slang (weave in naturally): {', '.join(slang)}\n"
+        f"Their common phrases: {', '.join(phrases)}\n"
+        f"Their most used emojis: {' '.join(emojis)}\n"
+        + (f"Real messages from this server — match this exact style:\n{sample_block}\n" if sample_block else "")
+        + "\nYou are FROM this server. You talk EXACTLY like them — same vocabulary, "
+        "same energy, same abbreviations, same emoji usage. "
+        "If they're formal, be formal. If they're chaotic, be chaotic. "
+        "If they use specific inside phrases, use them. "
+        "Never sound like a bot trying to fit in — you ARE one of them.\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
 
@@ -1696,10 +1725,6 @@ class AiCompanion(commands.Cog):
         profile["message_count"] = profile.get("message_count", 0) + 1
 
         # Auto-extract simple self-referential facts ("i am", "i work", "my name", etc.)
-        _SELF_RE = re.compile(
-            r'\b(i(?:\'?m| am) [^.!?\n]{5,60}|my (?:name|job|age|hobby|favourite|fav|pronouns)[^.!?\n]{3,60})',
-            re.IGNORECASE,
-        )
         for match in _SELF_RE.findall(clean):
             fact = match.strip()
             if fact and fact not in profile.get("notes", []):
@@ -1724,57 +1749,86 @@ class AiCompanion(commands.Cog):
 
     def _passive_fact_extract(self, message: discord.Message) -> None:
         """
-        Silently scan every message for third-person factual statements about
-        server members (e.g. "Sony loves this girl", "Riz is into monkeys").
-        Stores distilled facts in server_knowledge and persists to DB async.
-        Never needs an AI call — pure regex, zero latency.
+        Silently scan every message for factual statements about server members.
+        Three sources:
+          1. Third-person: "sony is into monkeys" / "riz loves this girl"
+          2. First-person: "i'm in love" → stored as "{author} is in love"
+          3. @mention subject: "@Sony is obsessed with cats" → stored for Sony
+        Case-insensitive. Zero API calls.
         """
         if not message.guild:
             return
-        guild_id = message.guild.id
-        text = message.content
+        guild_id  = message.guild.id
+        author_dn = message.author.display_name
+        text      = message.content
 
-        # Build a quick name → display_name lookup from current members
-        member_names: set[str] = set()
+        # Build case-insensitive name → canonical name lookup
+        member_lower: dict[str, str] = {}  # lowercase first-word → canonical display name
         for m in message.guild.members:
-            if m.display_name:
-                member_names.add(m.display_name.split()[0])  # first word only
-            if m.name:
-                member_names.add(m.name.split()[0])
+            dn = m.display_name or m.name
+            key = dn.split()[0].lower()
+            member_lower[key] = dn
+            key2 = m.name.split()[0].lower()
+            member_lower[key2] = dn
 
         guild_kb = self.server_knowledge.setdefault(guild_id, {})
 
-        for match in _FACT_SUBJECT_RE.finditer(text):
+        def _store(subject: str, fact_body: str) -> None:
+            """Normalise and persist a single fact."""
+            fact_body = fact_body.strip().rstrip(".,!? ")
+            if len(fact_body) < 3:
+                return
+            fact = f"{subject} {fact_body}"[:120]
+            bucket = guild_kb.setdefault(subject, [])
+            if fact in bucket:
+                return
+            if len(bucket) >= 30:
+                bucket.pop(0)
+            bucket.append(fact)
+            asyncio.get_event_loop().call_soon(
+                lambda g=guild_id, s=subject, f=fact: asyncio.create_task(
+                    asyncio.to_thread(_db_store_knowledge, g, s, f)
+                )
+            )
+
+        # ── 1. Resolve @mentions in the message as explicit subjects ──────
+        mention_map: dict[str, str] = {}  # mention text → display name
+        for mentioned in message.mentions:
+            mention_map[f"<@{mentioned.id}>"]  = mentioned.display_name
+            mention_map[f"<@!{mentioned.id}>"] = mentioned.display_name
+
+        # Replace @mention tokens with the person's display name for regex pass
+        text_resolved = text
+        for token, dn in mention_map.items():
+            text_resolved = text_resolved.replace(token, dn)
+
+        # ── 2. First-person → third-person conversion ─────────────────────
+        # "i'm in love with this girl" → "sony is in love with this girl"
+        for m in _FIRST_PERSON_RE.finditer(text_resolved):
+            verb_and_body = m.group(0).strip()
+            # Convert "i'm X" → "author is X", "i was X" → "author was X"
+            converted = re.sub(r"^i'?m\b", f"{author_dn} is", verb_and_body, flags=re.IGNORECASE)
+            converted = re.sub(r"^i am\b", f"{author_dn} is", converted, flags=re.IGNORECASE)
+            converted = re.sub(r"^i was\b", f"{author_dn} was", converted, flags=re.IGNORECASE)
+            converted = re.sub(r"^i\b", author_dn, converted, flags=re.IGNORECASE)
+            if converted != verb_and_body and len(converted) > len(author_dn) + 5:
+                # Store under the author's first name as key
+                key = author_dn.split()[0]
+                body = converted[len(key):].strip()
+                _store(key, body)
+
+        # ── 3. Third-person regex scan ────────────────────────────────────
+        for match in _FACT_SUBJECT_RE.finditer(text_resolved):
             subject_raw = match.group(1).strip()
             fact_raw    = match.group(2).strip()
+            subject_lo  = subject_raw.lower()
 
-            # Skip non-names and very short facts
-            if subject_raw in _NOT_A_NAME or len(fact_raw) < 5:
-                continue
-            # Optional: only store facts about people we've seen (reduces noise)
-            # Comment this out if you want to store facts about anyone mentioned
-            if member_names and subject_raw not in member_names:
+            if subject_lo in _NOT_A_NAME or len(fact_raw) < 3:
                 continue
 
-            # Clean up the fact string
-            fact = f"{subject_raw} {fact_raw}".rstrip(".,!? ")
-            if len(fact) > 120:
-                fact = fact[:120]
-
-            facts_for = guild_kb.setdefault(subject_raw, [])
-            if fact not in facts_for:
-                if len(facts_for) < 30:
-                    facts_for.append(fact)
-                else:
-                    facts_for.pop(0)   # evict oldest when cap reached
-                    facts_for.append(fact)
-
-                # Persist async, best-effort
-                asyncio.get_event_loop().call_soon(
-                    lambda g=guild_id, s=subject_raw, f=fact: asyncio.create_task(
-                        asyncio.to_thread(_db_store_knowledge, g, s, f)
-                    )
-                )
+            # Resolve to canonical display name if possible, else use as-is
+            canonical = member_lower.get(subject_lo, subject_raw)
+            _store(canonical.split()[0], fact_raw)
 
     # ------------------------------------------------------------------
     # Moderation — 3-priority target resolution

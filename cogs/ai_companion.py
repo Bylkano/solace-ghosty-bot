@@ -167,7 +167,6 @@ NEVER give the same response twice.
 NEVER use bullet points, lists, numbered lists, or markdown.
 NEVER end a sentence with a period unless it's sarcastic or for effect.
 NEVER stack slang — one natural use is max.
-MATCH THE ENERGY of whoever you're talking to. short = short. always.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EXAMPLES — THIS IS EXACTLY HOW YOU TALK
@@ -1507,33 +1506,29 @@ class AiCompanion(commands.Cog):
 
     async def _proactive_reply(self, message: discord.Message) -> None:
         """
-        Called on a 3% dice roll for any message in an allowed channel.
-        Uses a lean prompt (no full history) and max_tokens=120 for brevity.
+        Called on a high-probability dice roll for any message in an allowed channel.
+        Biki jumps into conversations like a real Discord member — no message is off limits.
         """
         prompt = (
             f'Someone in the server just said: "{message.content}"\n'
             "You were not mentioned but you want to jump in like a real Discord member would.\n"
-            "React naturally — could be a one-word reaction, a funny comment, "
-            "agreeing or disagreeing, asking a question, or just vibing.\n"
-            "Keep it SHORT. Max 1-2 sentences. Feel spontaneous not forced."
+            "React naturally — could be a reaction, a funny comment, a roast, agreeing, "
+            "disagreeing, asking a question, going off-topic, or just vibing. "
+            "Say as much or as little as the moment calls for. Be yourself."
         )
-
-        # Not worth an API call for short messages
-        if len(message.content.split()) < 4:
-            return
 
         guild_id = message.guild.id if message.guild else None
 
         personality = self.guild_personalities.get(guild_id, "") if guild_id else ""
         facts = self.guild_facts.get(guild_id, []) if guild_id else []
         try:
-            # Random delay so it doesn't feel like Biki is always watching
+            # Small delay so it doesn't feel instant/robotic
             await asyncio.sleep(random.uniform(0.5, 2.0))
             response = await _call_ai(
                 [{"role": "user", "content": prompt}],
                 self._mood_addon(guild_id),
                 self._learning_context(guild_id),
-                120,  # max_tokens — short and punchy
+                400,  # full token budget — let him talk
                 personality,
                 facts or None,
             )
@@ -1947,7 +1942,7 @@ class AiCompanion(commands.Cog):
                     except discord.HTTPException:
                         pass
 
-            if random.random() < 0.01:
+            if random.random() < 0.85:
                 asyncio.create_task(self._proactive_reply(message))
             return
 
@@ -1969,26 +1964,10 @@ class AiCompanion(commands.Cog):
                 f"\"{message.reference.resolved.content[:200]}\"]"
             )
 
-        # ── Per-user cooldown (30 seconds) ───────────────────────────────
+        # ── Per-user cooldown (5 seconds — just enough to prevent spam) ────
         now = time.time()
         last_reply = self._user_cooldowns.get(user_id, 0)
-        cooldown_remaining = 30.0 - (now - last_reply)
-
-        if cooldown_remaining > 0:
-            if random.random() < 0.4:
-                cooldown_replies = [
-                    "bro chill im still thinking 💀",
-                    "one sec one sec",
-                    "bro i JUST replied to you",
-                    "give me a second omg",
-                    "i'm not a machine stop pinging me back to back",
-                    "bro. BREATHE.",
-                    f"wait like {int(cooldown_remaining)} more seconds istg",
-                    "you're so impatient i cannot",
-                    "bro i haven't even finished my thought yet",
-                    "one conversation at a time omg 😭",
-                ]
-                await message.channel.send(random.choice(cooldown_replies))
+        if now - last_reply < 5.0:
             return
 
         # c. Conversation lock check ─────────────────────────────────────

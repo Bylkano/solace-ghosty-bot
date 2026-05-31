@@ -1312,6 +1312,9 @@ class AiCompanion(commands.Cog):
         # guild_id → chime-in rate (0.0–1.0). Default 0.06 (6%)
         self.guild_chime_rate: dict[int, float] = {}
 
+        # guild_id → per-user reply cooldown in seconds. Default 5s
+        self.guild_cooldown: dict[int, float] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -1973,10 +1976,11 @@ class AiCompanion(commands.Cog):
                 f"\"{message.reference.resolved.content[:200]}\"]"
             )
 
-        # ── Per-user cooldown (5 seconds) — skip silently, no API call ──────
+        # ── Per-user cooldown — skip silently, no API call ───────────────────
         now = time.time()
         last_reply = self._user_cooldowns.get(user_id, 0)
-        if now - last_reply < 5.0:
+        cooldown_secs = self.guild_cooldown.get(guild_id, 5.0)
+        if now - last_reply < cooldown_secs:
             return
 
         # c. Conversation lock check ─────────────────────────────────────
@@ -2770,6 +2774,60 @@ class AiCompanion(commands.Cog):
             f"✅ Biki's chime-in rate set to **{percent}%** — *{flavour}*\n"
             f"`[{bar}]`\n\n"
             f"He'll still reply **100%** of the time when directly @mentioned.",
+            ephemeral=True,
+        )
+
+
+    # /bikicooldown — view or set the per-user reply cooldown for this server
+    @app_commands.command(
+        name="bikicooldown",
+        description="View or set how long (in seconds) before Biki can reply to the same user again.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(seconds="Cooldown in seconds (0–300). Leave blank to view current value.")
+    async def bikicooldown(
+        self,
+        interaction: discord.Interaction,
+        seconds: Optional[int] = None,
+    ) -> None:
+        assert interaction.guild_id is not None
+        current = self.guild_cooldown.get(interaction.guild_id, 5.0)
+
+        if seconds is None:
+            await interaction.response.send_message(
+                f"**Biki's current per-user cooldown:** `{current:.0f}s`\n\n"
+                f"• **0s** — no cooldown, replies instantly every ping\n"
+                f"• **5s** *(default)* — short gap, prevents spam\n"
+                f"• **30s** — one reply per half-minute per user\n"
+                f"• **300s** — max, one reply per 5 minutes per user\n\n"
+                f"To change: `/bikicooldown seconds:<0–300>`",
+                ephemeral=True,
+            )
+            return
+
+        if not 0 <= seconds <= 300:
+            await interaction.response.send_message(
+                "seconds must be between 0 and 300.", ephemeral=True
+            )
+            return
+
+        self.guild_cooldown[interaction.guild_id] = float(seconds)
+
+        if seconds == 0:
+            flavour = "no cooldown — he'll reply every single ping"
+        elif seconds <= 5:
+            flavour = "very fast, just blocks spam"
+        elif seconds <= 15:
+            flavour = "balanced — short breather between replies"
+        elif seconds <= 60:
+            flavour = "relaxed pace, one reply per minute per user"
+        else:
+            flavour = "strict — very limited replies per user"
+
+        await interaction.response.send_message(
+            f"✅ Per-user cooldown set to **{seconds}s** — *{flavour}*\n\n"
+            f"Biki will ignore repeat pings from the same user within `{seconds}s` of his last reply to them.",
             ephemeral=True,
         )
 

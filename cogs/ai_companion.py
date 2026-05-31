@@ -507,6 +507,36 @@ def _db_init() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS biki_user_memory (
+                    guild_id      BIGINT NOT NULL,
+                    user_id       BIGINT NOT NULL,
+                    display_name  TEXT   NOT NULL DEFAULT '',
+                    username      TEXT   NOT NULL DEFAULT '',
+                    notes         TEXT[] NOT NULL DEFAULT '{}',
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    last_seen     TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, user_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS biki_conversations (
+                    id         SERIAL PRIMARY KEY,
+                    guild_id   BIGINT NOT NULL,
+                    user_id    BIGINT NOT NULL,
+                    role       TEXT   NOT NULL,
+                    content    TEXT   NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS biki_conversations_gu "
+                "ON biki_conversations (guild_id, user_id, created_at)"
+            )
         con.commit()
 
 
@@ -735,6 +765,136 @@ def _db_load_all_moods() -> dict[int, str]:
 
 
 # ---------------------------------------------------------------------------
+# User memory DB helpers
+# ---------------------------------------------------------------------------
+
+def _db_upsert_user_memory(
+    guild_id: int,
+    user_id: int,
+    display_name: str,
+    username: str,
+    bump_count: bool = True,
+) -> None:
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO biki_user_memory (guild_id, user_id, display_name, username, message_count, last_seen)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, user_id) DO UPDATE
+                    SET display_name  = EXCLUDED.display_name,
+                        username      = EXCLUDED.username,
+                        message_count = CASE WHEN %s
+                                             THEN biki_user_memory.message_count + 1
+                                             ELSE biki_user_memory.message_count
+                                        END,
+                        last_seen     = NOW()
+                """,
+                (guild_id, user_id, display_name, username, 1, bump_count),
+            )
+        con.commit()
+
+
+def _db_add_user_note(guild_id: int, user_id: int, note: str) -> None:
+    """Append a note about a user, keeping only the last 20."""
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE biki_user_memory
+                SET notes = array_append(notes, %s::TEXT)
+                WHERE guild_id = %s AND user_id = %s
+                """,
+                (note[:300], guild_id, user_id),
+            )
+            cur.execute(
+                """
+                UPDATE biki_user_memory
+                SET notes = notes[array_length(notes,1)-19:array_length(notes,1)]
+                WHERE guild_id = %s AND user_id = %s
+                  AND array_length(notes, 1) > 20
+                """,
+                (guild_id, user_id),
+            )
+        con.commit()
+
+
+def _db_get_user_memory(guild_id: int, user_id: int) -> dict | None:
+    with _db_connect() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT display_name, username, notes, message_count, last_seen
+                FROM biki_user_memory
+                WHERE guild_id = %s AND user_id = %s
+                """,
+                (guild_id, user_id),
+            )
+            row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def _db_load_all_user_memory(guild_id: int) -> dict[int, dict]:
+    with _db_connect() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT user_id, display_name, username, notes, message_count, last_seen
+                FROM biki_user_memory
+                WHERE guild_id = %s
+                """,
+                (guild_id,),
+            )
+            rows = cur.fetchall()
+    return {int(r["user_id"]): dict(r) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Persistent conversations DB helpers
+# ---------------------------------------------------------------------------
+
+_CONV_KEEP = 40  # max messages stored per user per guild
+
+
+def _db_save_conv_message(guild_id: int, user_id: int, role: str, content: str) -> None:
+    with _db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "INSERT INTO biki_conversations (guild_id, user_id, role, content) VALUES (%s, %s, %s, %s)",
+                (guild_id, user_id, role, content[:600]),
+            )
+            # Trim to last _CONV_KEEP messages
+            cur.execute(
+                """
+                DELETE FROM biki_conversations
+                WHERE guild_id = %s AND user_id = %s
+                  AND id NOT IN (
+                      SELECT id FROM biki_conversations
+                      WHERE guild_id = %s AND user_id = %s
+                      ORDER BY id DESC LIMIT %s
+                  )
+                """,
+                (guild_id, user_id, guild_id, user_id, _CONV_KEEP),
+            )
+        con.commit()
+
+
+def _db_load_user_conv(guild_id: int, user_id: int, limit: int = _CONV_KEEP) -> list[dict]:
+    with _db_connect() as con:
+        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT role, content FROM biki_conversations
+                WHERE guild_id = %s AND user_id = %s
+                ORDER BY id DESC LIMIT %s
+                """,
+                (guild_id, user_id, limit),
+            )
+            rows = cur.fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+# ---------------------------------------------------------------------------
 # Daily token budget tracker — fully in-memory, file only for persistence
 # ---------------------------------------------------------------------------
 
@@ -892,7 +1052,7 @@ async def _call_ai(
     try:
         response = await client.chat.completions.create(
             model=_DEEPINFRA_MODEL,
-            messages=[{"role": "system", "content": system}] + messages[-8:],
+            messages=[{"role": "system", "content": system}] + messages[-15:],
             max_tokens=400,
             temperature=0.9,
             frequency_penalty=0.7,
@@ -1099,6 +1259,13 @@ class AiCompanion(commands.Cog):
         # guild_id → per-user reply cooldown in seconds. Default 5s
         self.guild_cooldown: dict[int, float] = {}
 
+        # guild_id → {user_id → profile dict} — persistent user memory
+        self.user_memory: dict[int, dict[int, dict]] = {}
+
+        # (guild_id, user_id) → guild_id mapping for persistence calls
+        # kept so _append_history can persist without knowing guild_id
+        self._user_guild: dict[int, int] = {}
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -1106,10 +1273,10 @@ class AiCompanion(commands.Cog):
     async def cog_load(self) -> None:
         try:
             await asyncio.to_thread(_db_init)
-            self.allowed_channels = await asyncio.to_thread(_db_load_all)
+            self.allowed_channels   = await asyncio.to_thread(_db_load_all)
             self.guild_personalities = await asyncio.to_thread(_db_load_all_personalities)
-            self.guild_facts = await asyncio.to_thread(_db_load_all_facts)
-            self.guild_moods = await asyncio.to_thread(_db_load_all_moods)
+            self.guild_facts        = await asyncio.to_thread(_db_load_all_facts)
+            self.guild_moods        = await asyncio.to_thread(_db_load_all_moods)
             log.info(
                 "ai_companion: loaded channels for %d guild(s), "
                 "personalities for %d, facts for %d, moods for %d",
@@ -1122,14 +1289,32 @@ class AiCompanion(commands.Cog):
             log.error("ai_companion: DB init/load failed: %s", exc)
 
     # ------------------------------------------------------------------
+    # Owner-only gate — blocks all slash commands to non-owners
+    # ------------------------------------------------------------------
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == config.OWNER_ID:
+            return True
+        await interaction.response.send_message(
+            "nah this isn't for you 💀", ephemeral=True
+        )
+        return False
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _append_history(self, user_id: int, role: str, content: str) -> None:
         history = self.conversations.setdefault(user_id, [])
         history.append({"role": role, "content": content})
-        if len(history) > 20:
-            self.conversations[user_id] = history[-20:]
+        if len(history) > 40:
+            self.conversations[user_id] = history[-40:]
+        # Persist to DB asynchronously (best-effort, non-blocking)
+        guild_id = self._user_guild.get(user_id)
+        if guild_id:
+            asyncio.create_task(
+                asyncio.to_thread(_db_save_conv_message, guild_id, user_id, role, content)
+            )
 
     def _is_dismiss(self, text: str) -> bool:
         lower = text.lower()
@@ -1178,9 +1363,32 @@ class AiCompanion(commands.Cog):
     ) -> str:
         """Call _call_ai with full conversation history, update history, return reply."""
         user_text = user_text[:400]  # cap input tokens
+
+        # If no in-memory history yet, try loading from DB (first reply after restart)
+        if user_id not in self.conversations and guild_id:
+            try:
+                past = await asyncio.to_thread(_db_load_user_conv, guild_id, user_id)
+                if past:
+                    self.conversations[user_id] = past
+            except Exception as exc:
+                log.warning("_ai_reply: failed to load conv from DB: %s", exc)
+
         history = list(self.conversations.get(user_id, []))
         input_content = user_text
-        # Inject recent channel context so Biki can follow the broader convo
+
+        # ── Inject user memory so Biki knows who they're talking to ──────────
+        if guild_id:
+            profile = self.user_memory.get(guild_id, {}).get(user_id)
+            if profile:
+                name   = profile.get("display_name") or profile.get("username") or "them"
+                count  = profile.get("message_count", 1)
+                notes  = profile.get("notes") or []
+                mem_lines = [f"You're talking to {name}. They've pinged you {count} time(s) before."]
+                if notes:
+                    mem_lines.append("What you remember about them: " + " | ".join(notes[-8:]))
+                extra_note = (extra_note + "\n" if extra_note else "") + " ".join(mem_lines)
+
+        # ── Inject recent channel context ─────────────────────────────────────
         if channel_context:
             input_content = (
                 f"[RECENT CHANNEL CONTEXT — what others just said before this message:\n"
@@ -1256,8 +1464,8 @@ class AiCompanion(commands.Cog):
             2. Show typing indicator for WPM-scaled duration
             3. Send message immediately after typing ends
             4. If more parts, pause 0.8-1.8s between them
-        - 40% chance the FIRST part uses message.reply() (quote-reply).
-        - force_reply=True always uses reply (used for proactive jump-ins).
+        - ALWAYS replies (quote-replies) to the triggering message.
+        - force_reply=True is kept for compatibility (always replies anyway).
         """
         # Optional emoji reaction on the trigger message
         if random.random() < 0.15:
@@ -1266,8 +1474,7 @@ class AiCompanion(commands.Cog):
             except discord.HTTPException:
                 pass
 
-        parts     = _split_parts(text)
-        use_reply = force_reply or random.random() < 0.40
+        parts = _split_parts(text)
 
         # Reading pause scales with incoming message length — longer msg = Biki "reads" it longer
         _read_pause = min(1.5, 0.25 + len(trigger.content) / 250)
@@ -1278,12 +1485,13 @@ class AiCompanion(commands.Cog):
             async with trigger.channel.typing():
                 await asyncio.sleep(typing_duration)
 
-            # Send the message immediately after typing ends
-            if i == 0 and use_reply:
+            # Always quote-reply to the triggering message so it's clear who Biki is talking to.
+            # If that fails (message deleted, etc.), fall back to a plain @mention send.
+            if i == 0:
                 try:
-                    await trigger.reply(part, mention_author=False)
+                    await trigger.reply(part, mention_author=True)
                 except discord.HTTPException:
-                    await trigger.channel.send(part)
+                    await trigger.channel.send(f"<@{trigger.author.id}> {part}")
             else:
                 await trigger.channel.send(part)
 
@@ -1385,6 +1593,42 @@ class AiCompanion(commands.Cog):
         if len(v["sample_messages"]) % 10 == 0:
             v["energy"] = _detect_energy(v["_recent_buf"])
             self._learning_ctx_cache.pop(guild_id, None)  # invalidate cache
+
+        # ── User memory — update profile in memory and persist async ──────────
+        user_id = message.author.id
+        guild_mem = self.user_memory.setdefault(guild_id, {})
+        profile = guild_mem.setdefault(user_id, {
+            "display_name": message.author.display_name,
+            "username": message.author.name,
+            "notes": [],
+            "message_count": 0,
+        })
+        profile["display_name"] = message.author.display_name
+        profile["username"]     = message.author.name
+        profile["message_count"] = profile.get("message_count", 0) + 1
+
+        # Auto-extract simple self-referential facts ("i am", "i work", "my name", etc.)
+        _SELF_RE = re.compile(
+            r'\b(i(?:\'?m| am) [^.!?\n]{5,60}|my (?:name|job|age|hobby|favourite|fav|pronouns)[^.!?\n]{3,60})',
+            re.IGNORECASE,
+        )
+        for match in _SELF_RE.findall(clean):
+            fact = match.strip()
+            if fact and fact not in profile.get("notes", []):
+                if len(profile.setdefault("notes", [])) < 20:
+                    profile["notes"].append(fact)
+                    asyncio.get_event_loop().call_soon(
+                        lambda g=guild_id, u=user_id, f=fact: asyncio.create_task(
+                            asyncio.to_thread(_db_add_user_note, g, u, f)
+                        )
+                    )
+
+        # Persist basic profile update (non-blocking)
+        asyncio.get_event_loop().call_soon(
+            lambda g=guild_id, u=user_id, dn=message.author.display_name, un=message.author.name: asyncio.create_task(
+                asyncio.to_thread(_db_upsert_user_memory, g, u, dn, un, True)
+            )
+        )
 
     # ------------------------------------------------------------------
     # Moderation — 3-priority target resolution
@@ -1702,12 +1946,15 @@ class AiCompanion(commands.Cog):
         if allowed and message.channel.id not in allowed:
             return
 
-        # ── 3. Passive learning ───────────────────────────────────────────
+        # ── 3. Passive learning + user memory ────────────────────────────
         self._learn_from_message(message)
 
-        # ── 3b. Channel context memory (last 5 messages per channel) ─────
+        # ── 3b. Wire user → guild so _append_history can persist async ───
+        self._user_guild[user_id] = guild_id
+
+        # ── 3c. Channel context memory (last 8 messages per channel) ─────
         _ch_hist = self.channel_history.setdefault(
-            message.channel.id, deque(maxlen=5)
+            message.channel.id, deque(maxlen=8)
         )
         _ch_hist.append(
             f"{message.author.display_name}: {message.content[:150]}"
@@ -1869,12 +2116,32 @@ class AiCompanion(commands.Cog):
             # Generate silently, then _send_biki_reply handles:
             #   reading pause → WPM-scaled typing → send
             try:
-                # Build channel context from the last 5 messages (excluding the current one)
+                # Build channel context — exclude the triggering message itself
+                # and filter out messages from the same user (prevents queue bleed)
                 _ctx_deque = self.channel_history.get(channel_id)
-                _ctx_lines = list(_ctx_deque)[:-1] if _ctx_deque else []
-                _channel_ctx = "\n".join(_ctx_lines)
+                _ctx_lines = [
+                    line for line in (list(_ctx_deque)[:-1] if _ctx_deque else [])
+                    if not line.startswith(f"{message.author.display_name}:")
+                ]
+                _channel_ctx = "\n".join(_ctx_lines[-5:])  # last 5 other-user lines
+
+                # Server context — who this is and what their server looks like
+                _guild = message.guild
+                _member_count = _guild.member_count or "?"
+                _channel_names = ", ".join(
+                    c.name for c in _guild.text_channels[:8]
+                ) if _guild.text_channels else "unknown"
+                _server_note = (
+                    f"Server: '{_guild.name}' · {_member_count} members · "
+                    f"channels: {_channel_names}. "
+                    f"You are responding ONLY to {message.author.display_name} "
+                    f"(user ID {user_id}). Ignore any other conversation threads."
+                )
+
                 reply = await self._ai_reply(
-                    user_id, clean, guild_id=guild_id, channel_context=_channel_ctx
+                    user_id, clean, guild_id=guild_id,
+                    channel_context=_channel_ctx,
+                    extra_note=_server_note,
                 )
                 self._user_cooldowns[user_id] = time.time()
                 await self._send_biki_reply(message, reply)

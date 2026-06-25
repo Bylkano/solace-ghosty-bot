@@ -69,6 +69,7 @@ class Bot(commands.Bot):
             owner_id=config.OWNER_ID or None,
             help_command=None,
         )
+        self._guild_commands_synced = False
 
     async def setup_hook(self) -> None:
         for cog in COGS:
@@ -85,18 +86,41 @@ class Bot(commands.Bot):
             log.info("Synced slash commands to dev guild %s", config.DEV_GUILD_ID)
         else:
             await self.tree.sync()
-            log.info("Synced slash commands globally")
+            log.info("Synced slash commands globally (may take up to ~1 hour)")
+
+    async def _sync_guild_commands(self, guild: discord.Guild) -> None:
+        """Push slash commands to one guild — updates show up immediately in Discord."""
+        try:
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info(
+                "Synced %d slash command(s) to guild %s (%s)",
+                len(synced),
+                guild.name,
+                guild.id,
+            )
+        except Exception as exc:
+            log.error("Failed to sync commands to guild %s: %s", guild.id, exc)
 
     async def on_ready(self) -> None:
         assert self.user is not None
         log.info("Logged in as %s (ID: %s)", self.user, self.user.id)
         log.info("Connected to %d guild(s)", len(self.guilds))
+
+        if not self._guild_commands_synced:
+            for guild in self.guilds:
+                await self._sync_guild_commands(guild)
+            self._guild_commands_synced = True
+
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.listening,
                 name=f"{config.BOT_PREFIX}help",
             )
         )
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        await self._sync_guild_commands(guild)
 
 
 async def main() -> None:

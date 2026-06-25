@@ -18,12 +18,14 @@ from discord.ext import commands
 from cogs.jail_content import JAIL_REQUIREMENTS
 from store import (
     clear_jail_channel_id,
+    get_jail_category_id,
     get_jail_channel_id,
     get_jail_role_id,
     get_jail_sentence,
     list_all_active_jail_sentences,
     list_jail_sentences,
     remove_jail_sentence,
+    set_jail_category_id,
     set_jail_channel_id,
     set_jail_role_id,
     upsert_jail_sentence,
@@ -34,6 +36,19 @@ log = logging.getLogger("bot.jail")
 JAILED_ROLE_NAME = "jailed"
 JAIL_CHANNEL_NAME = "gay-jail"
 MAX_JAIL_MINUTES = 10_080  # 7 days
+
+# Channel overwrites — guild role denies lose to other roles; per-channel denies fix that.
+_JAILED_DENY = discord.PermissionOverwrite(
+    view_channel=False,
+    send_messages=False,
+    send_messages_in_threads=False,
+    create_public_threads=False,
+    create_private_threads=False,
+    connect=False,
+    speak=False,
+    stream=False,
+    add_reactions=False,
+)
 
 
 class Jail(commands.Cog):
@@ -128,7 +143,67 @@ class Jail(commands.Cog):
             except discord.HTTPException as exc:
                 log.warning("Could not reposition jailed role in guild %s: %s", guild.id, exc)
 
+        await self._sync_jailed_overwrites(guild, role, get_jail_channel_id(guild.id))
         return role
+
+    async def _resolve_jail_category(
+        self, guild: discord.Guild
+    ) -> discord.CategoryChannel | None:
+        category_id = get_jail_category_id(guild.id)
+        if not category_id:
+            return None
+        channel = guild.get_channel(category_id)
+        if isinstance(channel, discord.CategoryChannel):
+            return channel
+        return None
+
+    async def _sync_jailed_overwrites(
+        self,
+        guild: discord.Guild,
+        jailed_role: discord.Role,
+        jail_channel_id: int | None,
+    ) -> None:
+        """Apply jailed denies on every channel; jail room keeps its own allows."""
+
+        sem = asyncio.Semaphore(5)
+
+        async def apply(channel: discord.abc.GuildChannel) -> None:
+            async with sem:
+                try:
+                    if channel.id == jail_channel_id and isinstance(
+                        channel, discord.TextChannel
+                    ):
+                        await self._apply_jail_channel_overwrites(channel, jailed_role)
+                        return
+                    if isinstance(
+                        channel,
+                        (
+                            discord.TextChannel,
+                            discord.VoiceChannel,
+                            discord.ForumChannel,
+                            discord.StageChannel,
+                            discord.CategoryChannel,
+                        ),
+                    ):
+                        await channel.set_permissions(
+                            jailed_role,
+                            overwrite=_JAILED_DENY,
+                            reason="Gay jail: block jailed members outside jail",
+                        )
+                except discord.Forbidden:
+                    log.debug(
+                        "No permission to sync jail overwrites on %s in guild %s",
+                        channel.id,
+                        guild.id,
+                    )
+                except discord.HTTPException as exc:
+                    log.warning(
+                        "Failed jail overwrite sync on channel %s: %s",
+                        channel.id,
+                        exc,
+                    )
+
+        await asyncio.gather(*(apply(ch) for ch in guild.channels))
 
     @staticmethod
     async def _sync_jailed_role_permissions(role: discord.Role) -> None:
@@ -170,6 +245,7 @@ class Jail(commands.Cog):
             jailed_role: discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
+                read_message_history=True,
                 add_reactions=False,
             ),
             guild.me: discord.PermissionOverwrite(
@@ -180,12 +256,15 @@ class Jail(commands.Cog):
             ),
         }
 
+        category = await self._resolve_jail_category(guild)
         channel = await guild.create_text_channel(
             name=JAIL_CHANNEL_NAME,
+            category=category,
             overwrites=overwrites,
             reason="Gay jail: auto-created shared jail channel",
         )
         set_jail_channel_id(guild.id, channel.id)
+        await self._sync_jailed_overwrites(guild, jailed_role, channel.id)
         return channel
 
     @staticmethod
@@ -202,6 +281,7 @@ class Jail(commands.Cog):
             jailed_role: discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
+                read_message_history=True,
                 add_reactions=False,
             ),
             guild.me: discord.PermissionOverwrite(
@@ -303,6 +383,25 @@ class Jail(commands.Cog):
 
         log.info("Restored gay-jail sentence timers from database")
 
+        synced_guilds: set[int] = set()
+        for row in list_all_active_jail_sentences():
+            guild_id = row["guild_id"]
+            if guild_id in synced_guilds:
+                continue
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                continue
+            role_id = get_jail_role_id(guild_id)
+            if not role_id:
+                continue
+            role = guild.get_role(role_id)
+            if role is None:
+                continue
+            await self._sync_jailed_overwrites(
+                guild, role, get_jail_channel_id(guild_id)
+            )
+            synced_guilds.add(guild_id)
+
     async def _post_jail_requirement(
         self,
         channel: discord.TextChannel,
@@ -376,6 +475,9 @@ class Jail(commands.Cog):
         try:
             jailed_role = await self._ensure_jailed_role(interaction.guild)
             jail_channel = await self._ensure_jail_channel(interaction.guild, jailed_role)
+            await self._sync_jailed_overwrites(
+                interaction.guild, jailed_role, jail_channel.id
+            )
 
             if jailed_role in member.roles:
                 pass
@@ -461,9 +563,115 @@ class Jail(commands.Cog):
             except discord.HTTPException:
                 pass
 
+    @app_commands.command(
+        name="setjailcategory",
+        description="Set which category gay-jail channels are created in (admins/owner only).",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        category="Category where #gay-jail will be created (and moved to if already open).",
+    )
+    async def setjailcategory(
+        self,
+        interaction: discord.Interaction,
+        category: discord.CategoryChannel,
+    ) -> None:
+        assert interaction.guild is not None and interaction.guild_id is not None
+
+        if not self._can_use_jail_commands(interaction):
+            await interaction.response.send_message(
+                "❌ Only the server owner or administrators can use this command.",
+                ephemeral=True,
+            )
+            return
+
+        set_jail_category_id(interaction.guild_id, category.id)
+
+        channel_id = get_jail_channel_id(interaction.guild_id)
+        moved = False
+        if channel_id:
+            channel = interaction.guild.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.edit(
+                        category=category,
+                        reason="Gay jail: moved to configured category",
+                    )
+                    moved = True
+                except discord.Forbidden:
+                    await interaction.response.send_message(
+                        "✅ Category saved, but I couldn't move the active jail channel — "
+                        "check **Manage Channels**.",
+                        ephemeral=True,
+                    )
+                    return
+                except discord.HTTPException as exc:
+                    await interaction.response.send_message(
+                        f"✅ Category saved, but moving the jail channel failed: `{exc}`",
+                        ephemeral=True,
+                    )
+                    return
+
+        msg = f"✅ Gay jail will use category **{category.name}**."
+        if moved:
+            msg += " The active jail channel was moved there."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @app_commands.command(
+        name="getjailcategory",
+        description="Show which category gay-jail channels are created in.",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def getjailcategory(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild_id is not None
+        category_id = get_jail_category_id(interaction.guild_id)
+        if not category_id:
+            await interaction.response.send_message(
+                "⚠️ No jail category set. Use `/setjailcategory` — otherwise jail opens at the top of the channel list.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"📁 Gay jail category: <#{category_id}>",
+            ephemeral=True,
+        )
+
     # ------------------------------------------------------------------
     # Events
     # ------------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
+        guild = channel.guild
+        role_id = get_jail_role_id(guild.id)
+        if not role_id:
+            return
+        role = guild.get_role(role_id)
+        if role is None:
+            return
+        jail_channel_id = get_jail_channel_id(guild.id)
+        try:
+            if channel.id == jail_channel_id and isinstance(channel, discord.TextChannel):
+                await self._apply_jail_channel_overwrites(channel, role)
+            elif isinstance(
+                channel,
+                (
+                    discord.TextChannel,
+                    discord.VoiceChannel,
+                    discord.ForumChannel,
+                    discord.StageChannel,
+                    discord.CategoryChannel,
+                ),
+            ):
+                await channel.set_permissions(
+                    role,
+                    overwrite=_JAILED_DENY,
+                    reason="Gay jail: block jailed members on new channel",
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:

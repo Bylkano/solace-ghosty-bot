@@ -74,6 +74,16 @@ def _init() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'guild_jail' AND column_name = 'category_id'
+                """
+            )
+            if not cur.fetchone():
+                cur.execute(
+                    "ALTER TABLE guild_jail ADD COLUMN category_id BIGINT"
+                )
         con.commit()
 
 
@@ -298,6 +308,40 @@ def get_jail_channel_id(guild_id: int) -> int | None:
             )
             row = cur.fetchone()
             return row["channel_id"] if row and row["channel_id"] else None
+
+
+def get_jail_category_id(guild_id: int) -> int | None:
+    with _connect() as con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT category_id FROM guild_jail WHERE guild_id = %s",
+                (guild_id,),
+            )
+            row = cur.fetchone()
+            return row["category_id"] if row and row["category_id"] else None
+
+
+def set_jail_category_id(guild_id: int, category_id: int) -> None:
+    with _connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO guild_jail (guild_id, category_id) VALUES (%s, %s)
+                ON CONFLICT (guild_id) DO UPDATE SET category_id = EXCLUDED.category_id
+                """,
+                (guild_id, category_id),
+            )
+        con.commit()
+
+
+def clear_jail_category_id(guild_id: int) -> None:
+    with _connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "UPDATE guild_jail SET category_id = NULL WHERE guild_id = %s",
+                (guild_id,),
+            )
+        con.commit()
 
 
 def set_jail_role_id(guild_id: int, role_id: int) -> None:

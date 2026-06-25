@@ -54,6 +54,26 @@ def _init() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_jail (
+                    guild_id   BIGINT PRIMARY KEY,
+                    channel_id BIGINT,
+                    role_id    BIGINT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS jail_sentences (
+                    guild_id   BIGINT NOT NULL,
+                    user_id    BIGINT NOT NULL,
+                    release_at BIGINT NOT NULL,
+                    jailed_by  BIGINT,
+                    PRIMARY KEY (guild_id, user_id)
+                )
+                """
+            )
         con.commit()
 
 
@@ -254,3 +274,135 @@ def set_ping_role(guild_id: int, role_id: int) -> None:
 def clear_ping_role(guild_id: int) -> None:
     """Disable drop pings by clearing the saved role."""
     _set_value(guild_id, "drops_ping_role_id", 0)
+
+
+# ── Gay jail ─────────────────────────────────────────────────────
+
+def get_jail_role_id(guild_id: int) -> int | None:
+    with _connect() as con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT role_id FROM guild_jail WHERE guild_id = %s",
+                (guild_id,),
+            )
+            row = cur.fetchone()
+            return row["role_id"] if row and row["role_id"] else None
+
+
+def get_jail_channel_id(guild_id: int) -> int | None:
+    with _connect() as con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT channel_id FROM guild_jail WHERE guild_id = %s",
+                (guild_id,),
+            )
+            row = cur.fetchone()
+            return row["channel_id"] if row and row["channel_id"] else None
+
+
+def set_jail_role_id(guild_id: int, role_id: int) -> None:
+    with _connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO guild_jail (guild_id, role_id) VALUES (%s, %s)
+                ON CONFLICT (guild_id) DO UPDATE SET role_id = EXCLUDED.role_id
+                """,
+                (guild_id, role_id),
+            )
+        con.commit()
+
+
+def set_jail_channel_id(guild_id: int, channel_id: int) -> None:
+    with _connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO guild_jail (guild_id, channel_id) VALUES (%s, %s)
+                ON CONFLICT (guild_id) DO UPDATE SET channel_id = EXCLUDED.channel_id
+                """,
+                (guild_id, channel_id),
+            )
+        con.commit()
+
+
+def clear_jail_channel_id(guild_id: int) -> None:
+    with _connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "UPDATE guild_jail SET channel_id = NULL WHERE guild_id = %s",
+                (guild_id,),
+            )
+        con.commit()
+
+
+def upsert_jail_sentence(
+    guild_id: int,
+    user_id: int,
+    release_at: int,
+    jailed_by: int | None,
+) -> None:
+    with _connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO jail_sentences (guild_id, user_id, release_at, jailed_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (guild_id, user_id) DO UPDATE
+                SET release_at = EXCLUDED.release_at,
+                    jailed_by = EXCLUDED.jailed_by
+                """,
+                (guild_id, user_id, release_at, jailed_by),
+            )
+        con.commit()
+
+
+def remove_jail_sentence(guild_id: int, user_id: int) -> None:
+    with _connect() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                "DELETE FROM jail_sentences WHERE guild_id = %s AND user_id = %s",
+                (guild_id, user_id),
+            )
+        con.commit()
+
+
+def get_jail_sentence(guild_id: int, user_id: int) -> dict | None:
+    with _connect() as con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT user_id, release_at, jailed_by
+                FROM jail_sentences
+                WHERE guild_id = %s AND user_id = %s
+                """,
+                (guild_id, user_id),
+            )
+            return cur.fetchone()
+
+
+def list_jail_sentences(guild_id: int) -> list[dict]:
+    with _connect() as con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT user_id, release_at, jailed_by
+                FROM jail_sentences
+                WHERE guild_id = %s
+                ORDER BY release_at
+                """,
+                (guild_id,),
+            )
+            return cur.fetchall()
+
+
+def list_all_active_jail_sentences() -> list[dict]:
+    with _connect() as con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT guild_id, user_id, release_at, jailed_by
+                FROM jail_sentences
+                """
+            )
+            return cur.fetchall()

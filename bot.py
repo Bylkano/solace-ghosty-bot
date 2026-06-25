@@ -45,6 +45,7 @@ log = logging.getLogger("bot")
 
 COGS = [
     "cogs.moderation",
+    "cogs.jail",
     "cogs.events",
     "cogs.server_drops_economy",
     "cogs.ai_companion",

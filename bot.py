@@ -48,7 +48,7 @@ COGS = [
     "cogs.jail",
     "cogs.events",
     "cogs.server_drops_economy",
-    "cogs.ai_companion",
+    "cogs.family_tree",
 ]
 
 

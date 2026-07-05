@@ -49,6 +49,8 @@ COGS = [
     "cogs.events",
     "cogs.server_drops_economy",
     "cogs.family_tree",
+    "cogs.crush",        
+    "cogs.dna_test",
 ]
 
 

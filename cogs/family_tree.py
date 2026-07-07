@@ -14,6 +14,7 @@ Commands
   /couple      [@user]        – Show couple stats
   /family      [@user]        – Show a user's family branch image
   /tree        [@user]        – Full server tree, or a single user's branch
+  /relationship @user         – Show how you are related to someone
   /runaway                    – (Child) Cut ties with your parents
   /familystats                – Family leaderboards for this server
   /familyconfig incest ...    – (Admin) Allow or disallow incest
@@ -36,6 +37,7 @@ import logging
 import pathlib
 import sys
 import time as _time
+from collections import deque
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
@@ -489,6 +491,133 @@ def _find_connected_roots(roots: list[FamilyNode], user_id: int) -> list[FamilyN
     return [r for r in roots if _contains(r)]
 
 
+def _great_prefix(steps_above_parent: int) -> str:
+    if steps_above_parent <= 0:
+        return ""
+    return "great-" * steps_above_parent
+
+
+def _ancestor_term(distance: int) -> str:
+    if distance == 1:
+        return "parent"
+    if distance == 2:
+        return "grandparent"
+    return f"{_great_prefix(distance - 2)}grandparent"
+
+
+def _descendant_term(distance: int) -> str:
+    if distance == 1:
+        return "child"
+    if distance == 2:
+        return "grandchild"
+    return f"{_great_prefix(distance - 2)}grandchild"
+
+
+def _steps_up(
+    start: int,
+    target: int,
+    parents_of: dict[int, set[int]],
+) -> int | None:
+    """Distance from start to target by walking parent links only."""
+    q: deque[tuple[int, int]] = deque([(start, 0)])
+    seen = {start}
+    while q:
+        node, dist = q.popleft()
+        if node == target:
+            return dist
+        for p in parents_of.get(node, set()):
+            if p in seen:
+                continue
+            seen.add(p)
+            q.append((p, dist + 1))
+    return None
+
+
+def _ancestor_distances(
+    start: int,
+    parents_of: dict[int, set[int]],
+) -> dict[int, int]:
+    """Map ancestor_id -> steps up from start (minimum steps in DAG)."""
+    dists: dict[int, int] = {start: 0}
+    q: deque[int] = deque([start])
+    while q:
+        node = q.popleft()
+        base = dists[node]
+        for p in parents_of.get(node, set()):
+            new_dist = base + 1
+            old = dists.get(p)
+            if old is not None and old <= new_dist:
+                continue
+            dists[p] = new_dist
+            q.append(p)
+    return dists
+
+
+def _ordinal(n: int) -> str:
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _pibling_term(distance_from_user_to_ancestor: int) -> str:
+    if distance_from_user_to_ancestor == 1:
+        return "aunt/uncle"
+    if distance_from_user_to_ancestor == 2:
+        return "great-aunt/uncle"
+    return f"{_great_prefix(distance_from_user_to_ancestor - 2)}great-aunt/uncle"
+
+
+def _nibling_term(distance_from_member_to_ancestor: int) -> str:
+    if distance_from_member_to_ancestor == 1:
+        return "niece/nephew"
+    if distance_from_member_to_ancestor == 2:
+        return "grand-niece/nephew"
+    return f"{_great_prefix(distance_from_member_to_ancestor - 2)}grand-niece/nephew"
+
+
+def _cousin_term(m: int, n: int) -> str:
+    degree = min(m, n) - 1
+    removed = abs(m - n)
+    base = f"{_ordinal(degree)} cousin"
+    if removed == 0:
+        return base
+    if removed == 1:
+        return f"{base} once removed"
+    if removed == 2:
+        return f"{base} twice removed"
+    return f"{base} {removed} times removed"
+
+
+def _shortest_family_path(
+    start: int,
+    target: int,
+    adjacency: dict[int, set[int]],
+) -> list[int]:
+    """Shortest undirected path through family edges (parents + spouses)."""
+    if start == target:
+        return [start]
+    q: deque[int] = deque([start])
+    prev: dict[int, int | None] = {start: None}
+    while q:
+        node = q.popleft()
+        for nxt in adjacency.get(node, set()):
+            if nxt in prev:
+                continue
+            prev[nxt] = node
+            if nxt == target:
+                path: list[int] = [target]
+                cur = target
+                while prev[cur] is not None:
+                    cur = prev[cur]
+                    path.append(cur)
+                path.reverse()
+                return path
+            q.append(nxt)
+    return []
+
+
 # ---------------------------------------------------------------------------
 # The Cog
 # ---------------------------------------------------------------------------
@@ -498,6 +627,122 @@ class FamilyTree(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    # ── /relationship ──────────────────────────────────────────────────────
+
+    @app_commands.command(name="relationship", description="🧬 See how you're related to another member.")
+    @app_commands.describe(member="The member you want to check your relationship with.")
+    @app_commands.guild_only()
+    async def relationship(self, interaction: discord.Interaction, member: discord.Member):
+        await interaction.response.defer()
+
+        guild_id = interaction.guild_id
+        user = interaction.user
+
+        if member.id == user.id:
+            return await interaction.followup.send(
+                embed=discord.Embed(
+                    title="🧬 Relationship Check",
+                    description="That's you. You're related to yourself. 😄",
+                    color=0x6699CC,
+                )
+            )
+
+        marriages = await _run_in_thread(db.get_all_active_marriages, guild_id)
+        pc_rows = await _run_in_thread(db.get_all_active_parent_child, guild_id)
+
+        spouse_of: dict[int, int] = {}
+        parents_of: dict[int, set[int]] = {}
+        children_of: dict[int, set[int]] = {}
+        adjacency: dict[int, set[int]] = {}
+
+        def _link(a: int, b: int) -> None:
+            adjacency.setdefault(a, set()).add(b)
+            adjacency.setdefault(b, set()).add(a)
+
+        for m in marriages:
+            if m.get("divorced_at"):
+                continue
+            a = m["user1_id"]
+            b = m["user2_id"]
+            spouse_of[a] = b
+            spouse_of[b] = a
+            _link(a, b)
+
+        for row in pc_rows:
+            p = row["parent_id"]
+            c = row["child_id"]
+            parents_of.setdefault(c, set()).add(p)
+            children_of.setdefault(p, set()).add(c)
+            _link(p, c)
+
+        uid = user.id
+        vid = member.id
+
+        relation: str
+        path_detail: str | None = None
+        if spouse_of.get(uid) == vid:
+            relation = "💍 You are married to each other."
+        elif vid in parents_of.get(uid, set()):
+            relation = "👨‍👩‍👧 They are your parent."
+        elif uid in parents_of.get(vid, set()):
+            relation = "👶 They are your child."
+        elif parents_of.get(uid, set()) & parents_of.get(vid, set()):
+            relation = "🧑‍🤝‍🧑 You are siblings (you share at least one parent)."
+        else:
+            up = _steps_up(uid, vid, parents_of)
+            down = _steps_up(vid, uid, parents_of)
+            if up is not None and up > 0:
+                relation = f"🌳 They are your **{_ancestor_term(up)}**."
+            elif down is not None and down > 0:
+                relation = f"🌱 They are your **{_descendant_term(down)}**."
+            else:
+                # Try richer kinship via nearest shared ancestor.
+                a_uid = _ancestor_distances(uid, parents_of)
+                a_vid = _ancestor_distances(vid, parents_of)
+                shared = set(a_uid) & set(a_vid)
+                shared.discard(uid)
+                shared.discard(vid)
+                if shared:
+                    best = min(shared, key=lambda a: (max(a_uid[a], a_vid[a]), a_uid[a] + a_vid[a]))
+                    m = a_uid[best]
+                    n = a_vid[best]
+                    if m == 1 and n >= 2:
+                        relation = f"🧬 They are your **{_nibling_term(n - 1)}**."
+                    elif n == 1 and m >= 2:
+                        relation = f"🧬 They are your **{_pibling_term(m - 1)}**."
+                    elif m >= 2 and n >= 2:
+                        relation = f"🧬 You are **{_cousin_term(m, n)}**."
+                    else:
+                        relation = "🔗 You are family-connected through a shared ancestor."
+                else:
+                    relation = "❌ No known family relationship found."
+
+                path = _shortest_family_path(uid, vid, adjacency)
+                if path:
+                    segments: list[str] = []
+                    for i in range(len(path) - 1):
+                        a = path[i]
+                        b = path[i + 1]
+                        if spouse_of.get(a) == b:
+                            edge = "spouse"
+                        elif b in parents_of.get(a, set()):
+                            edge = "parent"
+                        elif b in children_of.get(a, set()):
+                            edge = "child"
+                        else:
+                            edge = "family"
+                        segments.append(edge)
+                    path_detail = " → ".join(segments)
+
+        embed = discord.Embed(
+            title="🧬 Relationship",
+            description=f"**{user.mention}** ↔ **{member.mention}**\n\n{relation}",
+            color=0xAA88FF,
+        )
+        if path_detail:
+            embed.add_field(name="🧭 Path", value=f"`{path_detail}`", inline=False)
+        await interaction.followup.send(embed=embed)
 
     # ── /marry ────────────────────────────────────────────────────────────
 

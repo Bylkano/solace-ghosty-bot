@@ -3,6 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Neon (and some hosts) may provide postgres:// — normalise for psycopg2.
+_raw_db_url = os.getenv("DATABASE_URL", "")
+if _raw_db_url.startswith("postgres://"):
+    _raw_db_url = "postgresql://" + _raw_db_url[len("postgres://") :]
+    os.environ["DATABASE_URL"] = _raw_db_url
+
 # Accepts DISCORD_TOKEN (standard for most hosting platforms) with a
 # fallback to BOT_TOKEN so existing Replit secret configs keep working.
 BOT_TOKEN: str = os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN", "")
@@ -11,7 +17,7 @@ OWNER_ID: int = int(os.getenv("OWNER_ID", "0"))
 DEV_GUILD_ID: int | None = int(guild_id) if (guild_id := os.getenv("DEV_GUILD_ID")) else None
 
 # Database
-DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+DATABASE_URL: str = _raw_db_url or os.getenv("DATABASE_URL", "")
 
 # AI backend — DeepInfra (exclusive)
 DEEPINFRA_TOKEN: str = os.getenv("DEEPINFRA_TOKEN", "")

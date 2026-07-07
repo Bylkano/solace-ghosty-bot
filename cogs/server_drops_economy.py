@@ -12,10 +12,8 @@ Drop Types (weighted):
   Trivia           (20%)  – first correct text answer wins
   Scramble         (15%)  – unscramble the word
   Lootbox          (10%)  – click the button first
-  Boss Raid        (disabled) – co-op !attack the monster
-  Hot or Cold      (~13%) – guess a number 1–100 (higher/lower clues)
-  Fill in Blank    (~13%) – complete the phrase
-  True/False       (~11%) – click the correct button
+  Boss Raid        (10%)  – co-op !attack the monster
+  Hot or Cold      (15%)  – guess a number 1–100
   Emoji Puzzle     (15%)  – identify what the emojis represent
   Reaction Bomb    (10%)  – click AFTER the signal (not before!)
   Multiplier Drop   (5%)  – double-points or bounty event
@@ -83,20 +81,16 @@ MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 SEP    = "▬" * 22
 
 # ── Weighted event pool ────────────────────────────────────────────
-# Drops in DISABLED_DROPS are never picked (even if listed below).
-DISABLED_DROPS = frozenset({"boss", "worldboss"})
-
 EVENT_POOL = (
     ["trivia"]     * 18 +
     ["scramble"]   * 12 +
+    ["boss"]       *  8 +
     ["emoji"]      *  9 +
     ["bomb"]       *  8 +
     ["multi"]      *  5 +
     ["blackjack"]  *  5 +
     ["fastmath"]   * 12 +
-    ["fillblank"]  * 16 +
-    ["hotcold"]    * 16 +
-    ["truefalse"]  * 14 +
+    ["worldboss"]  *  4 +
     ["heist"]      *  5 +
     ["losers"]     *  5
 )
@@ -109,7 +103,7 @@ UNDERDOG_MID_MULT = 1.5            # multiplier for ranks 4-7
 UNDERDOG_LOW_MULT = 1.7            # multiplier for rank 8 and below (or unranked)
 UNDERDOG_MULT     = UNDERDOG_MID_MULT   # back-compat alias
 UNDERDOG_TOP_N    = UNDERDOG_LOCK_N     # back-compat alias (now the podium-lock size)
-RARE_DROPS        = ("blackjack", "multi", "bomb")  # doubled during Happy Hour
+RARE_DROPS        = ("boss", "blackjack", "multi", "bomb")  # doubled during Happy Hour
 HAPPY_DEFAULT_MIN = 60             # default Mega-Drop Happy Hour length (minutes)
 HAPPY_MAX_MIN     = 360            # safety cap on Happy Hour length
 WORLDBOSS_HP      = 750            # default World Boss health pool
@@ -1410,13 +1404,9 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
 
     def _pick_drop(self) -> str:
         """Pick a drop type, doubling rare drops during Happy Hour."""
-        pool = [d for d in EVENT_POOL if d not in DISABLED_DROPS]
-        if not pool:
-            log.error("EVENT_POOL is empty after filtering DISABLED_DROPS")
-            return "trivia"
         if self._happy_active():
-            return random.choice(pool + [d for d in pool if d in RARE_DROPS])
-        return random.choice(pool)
+            return random.choice(list(EVENT_POOL) + [d for d in EVENT_POOL if d in RARE_DROPS])
+        return random.choice(EVENT_POOL)
 
     # ──────────────────── message listener ────────────
 
@@ -1456,10 +1446,10 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
                 await self._check_text_answer(message, drop)
             elif dtype == "hotcold":
                 await self._check_number_guess(message, drop)
-            # elif dtype == "boss":
-            #     await self._handle_boss_attack(message, drop)
-            # elif dtype == "worldboss":
-            #     await self._handle_worldboss_attack(message, drop)
+            elif dtype == "boss":
+                await self._handle_boss_attack(message, drop)
+            elif dtype == "worldboss":
+                await self._handle_worldboss_attack(message, drop)
             elif dtype == "hotpotato":
                 await self._handle_potato_pass(message, drop)
             elif dtype == "losers":
@@ -1510,6 +1500,7 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
             "trivia":     self._start_trivia,
             "scramble":   self._start_scramble,
             "lootbox":    self._start_lootbox,
+            "boss":       self._start_boss,
             "hotcold":    self._start_hotcold,
             "emoji":      self._start_emoji,
             "bomb":       self._start_bomb,
@@ -1519,6 +1510,7 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
             "fillblank":  self._start_fillblank,
             "fastmath":   self._start_fastmath,
             "truefalse":  self._start_truefalse,
+            "worldboss":  self._start_worldboss,
             "heist":      self._start_heist,
             "losers":     self._start_losers,
         }
@@ -2516,7 +2508,7 @@ class ServerDropsEconomy(commands.Cog, name="ServerDropsEconomy"):
             f"{SEP}\n"
             f"**Happy Hour is LIVE for `{mins}` minutes!**\n\n"
             f"\U0001f4ac Drop trigger **halved** \u2014 drops fire twice as fast\n"
-            f"\U0001f3b2 Rare drops (blackjack, multiplier, bomb) **2\u00d7 more likely**\n"
+            f"\U0001f3b2 Rare drops (boss, blackjack, multiplier, bomb) **2\u00d7 more likely**\n"
             f"{SEP}"
         )
         e.set_footer(text="SOLACE EVENT  \u2022  Happy Hour")

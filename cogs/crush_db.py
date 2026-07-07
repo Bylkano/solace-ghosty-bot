@@ -8,18 +8,23 @@ Tables
 
 from __future__ import annotations
 
+import logging
 import os
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
 from datetime import datetime
 
-_DATABASE_URL: str = os.environ["DATABASE_URL"]
+log = logging.getLogger("bot.crush_db")
+
+_DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
 
 
 @contextmanager
 def _connect():
-    con = psycopg2.connect(_DATABASE_URL)
+    if not _DATABASE_URL:
+        raise RuntimeError("DATABASE_URL not set in environment")
+    con = psycopg2.connect(_DATABASE_URL, sslmode="require")
     try:
         yield con
     finally:
@@ -41,6 +46,12 @@ def init_tables() -> None:
                 )
             """)
         con.commit()
+
+
+try:
+    init_tables()
+except Exception as exc:
+    log.error("Failed to initialise crush DB tables: %s", exc)
 
 
 # ── Crush CRUD ────────────────────────────────────────────────────────────────

@@ -57,9 +57,9 @@ def _init() -> None:
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS guild_jail (
-                    guild_id   BIGINT PRIMARY KEY,
-                    channel_id BIGINT,
-                    role_id    BIGINT
+                    guild_id    BIGINT PRIMARY KEY,
+                    channel_id  BIGINT,
+                    role_id     BIGINT
                 )
                 """
             )
@@ -393,8 +393,8 @@ def upsert_jail_sentence(
                 INSERT INTO jail_sentences (guild_id, user_id, release_at, jailed_by)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (guild_id, user_id) DO UPDATE
-                SET release_at = EXCLUDED.release_at,
-                    jailed_by = EXCLUDED.jailed_by
+                    SET release_at = EXCLUDED.release_at,
+                        jailed_by = EXCLUDED.jailed_by
                 """,
                 (guild_id, user_id, release_at, jailed_by),
             )

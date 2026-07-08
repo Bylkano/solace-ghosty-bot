@@ -34,9 +34,9 @@ HEADER_COLOR   = (175, 135, 255)
 ACCENT_TEAL    = (60, 220, 200)
 
 # Node dimensions
-AVATAR_SIZE = 72
-CARD_W      = 120
-CARD_H      = 120
+AVATAR_SIZE = 56
+CARD_W      = 100
+CARD_H      = 100
 H_GAP       = 55
 V_GAP       = 110
 COUPLE_GAP  = 18   # gap between the two spouse cards
@@ -427,7 +427,7 @@ async def render_tree(
     title: str = "Solace Family Tree",
 ) -> io.BytesIO:
     """
-    Render the full family tree to a PNG BytesIO.
+    Render the full family tree to a WEBP BytesIO.
 
     roots        – list of top-level FamilyNode objects (no parents above them)
     avatar_urls  – {user_id: avatar_url}  (any user appearing in the tree)
@@ -493,7 +493,7 @@ async def render_tree(
 
     # Output
     out = io.BytesIO()
-    canvas.convert("RGB").save(out, format="PNG", optimize=True)
+    canvas.convert("RGB").save(out, format="WEBP", quality=75, method=6)
     out.seek(0)
     return out
 
@@ -506,6 +506,6 @@ def _empty_canvas(title: str) -> io.BytesIO:
     draw.text((350, 165), "No family relationships exist yet.", font=_load_font(14),
               fill=TEXT_MUTED, anchor="mm")
     out = io.BytesIO()
-    canvas.save(out, format="PNG")
+    canvas.save(out, format="WEBP", quality=75, method=6)
     out.seek(0)
     return out

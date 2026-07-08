@@ -80,7 +80,7 @@ def _fmt_date(dt) -> str:
 
 
 def _avatar_url(member: discord.Member | discord.User) -> str:
-    return member.display_avatar.with_format("png").with_size(128).url
+    return member.display_avatar.with_format("webp").with_size(64).url
 
 
 def _is_admin(interaction: discord.Interaction) -> bool:
@@ -101,7 +101,9 @@ async def _run_in_thread(func, *args):
 # ---------------------------------------------------------------------------
 
 _render_cache: dict[str, tuple[bytes, float]] = {}
-_CACHE_TTL = 90  # seconds
+_render_attempts: dict[str, float] = {}
+_CACHE_TTL = 60 * 60 * 24 * 7  # 7 days
+_RENDER_COOLDOWN = 60 * 15  # 15 minutes
 
 
 def _cache_get(key: str) -> bytes | None:
@@ -115,54 +117,30 @@ def _cache_set(key: str, data: bytes) -> None:
     _render_cache[key] = (data, _time.monotonic())
 
 
+def _render_cooldown_remaining(key: str) -> int:
+    last_attempt = _render_attempts.get(key)
+    if last_attempt is None:
+        return 0
+    remaining = _RENDER_COOLDOWN - (_time.monotonic() - last_attempt)
+    return max(0, int(remaining))
+
+
+def _mark_render_attempt(key: str) -> None:
+    _render_attempts[key] = _time.monotonic()
+
+
+async def _send_render_cooldown(interaction: discord.Interaction) -> None:
+    await interaction.followup.send(
+        "Family tree is regenerating, try again in a few minutes.",
+        ephemeral=True,
+    )
+
+
 def _invalidate_guild_cache(guild_id: int) -> None:
     stale = [k for k in _render_cache
              if k == f"tree:{guild_id}" or k.startswith(f"family:{guild_id}:")]
     for k in stale:
         _render_cache.pop(k, None)
-
-
-async def _rewarm_guild_cache(guild: discord.Guild) -> None:
-    """
-    Rebuild the full-guild tree PNG in the background immediately after a
-    mutation.  This keeps /tree instant — the cache is always pre-populated
-    rather than only warm for 90 s after the first manual render.
-    """
-    guild_id = guild.id
-    try:
-        marriages = await _run_in_thread(db.get_all_active_marriages, guild_id)
-        pc_rows   = await _run_in_thread(db.get_all_active_parent_child, guild_id)
-
-        if not marriages and not pc_rows:
-            return  # empty server — nothing to render
-
-        roots = _build_family_tree(marriages, pc_rows)
-        if not roots:
-            return
-
-        all_ids = _collect_ids_from_roots(roots)
-        name_map: dict[int, str] = {}
-        av_urls:  dict[int, str] = {}
-        for uid in all_ids:
-            m = guild.get_member(uid)
-            if m:
-                name_map[uid] = m.display_name
-                av_urls[uid]  = _avatar_url(m)
-            else:
-                name_map[uid] = f"User {uid}"
-
-        _fill_display_names(roots, name_map)
-
-        img_buf = await render_tree(
-            roots=roots,
-            avatar_urls=av_urls,
-            title="Solace Family Tree",
-        )
-        img_buf.seek(0)
-        _cache_set(f"tree:{guild_id}", img_buf.read())
-        log.debug("Background tree rewarm complete for guild %s", guild_id)
-    except Exception:
-        log.exception("Background tree rewarm failed for guild %s", guild_id)
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +804,6 @@ class FamilyTree(commands.Cog):
 
         await _run_in_thread(db.create_marriage, guild_id, proposer.id, member.id)
         _invalidate_guild_cache(guild_id)
-        asyncio.create_task(_rewarm_guild_cache(interaction.guild))
 
         success_embed = discord.Embed(
             title="❤️ Just Married!",
@@ -884,7 +861,6 @@ class FamilyTree(commands.Cog):
 
         await _run_in_thread(db.divorce, guild_id, user.id)
         _invalidate_guild_cache(guild_id)
-        asyncio.create_task(_rewarm_guild_cache(interaction.guild))
 
         await interaction.channel.send(
             embed=discord.Embed(
@@ -1022,7 +998,6 @@ class FamilyTree(commands.Cog):
             if not already2:
                 await _run_in_thread(db.add_parent_child, guild_id, pid, member.id, True)
         _invalidate_guild_cache(guild_id)
-        asyncio.create_task(_rewarm_guild_cache(interaction.guild))
 
         success_embed = discord.Embed(
             title="🌟 Adopted!",
@@ -1053,7 +1028,6 @@ class FamilyTree(commands.Cog):
 
         await _run_in_thread(db.disown_child, guild_id, parent.id, member.id)
         _invalidate_guild_cache(guild_id)
-        asyncio.create_task(_rewarm_guild_cache(interaction.guild))
 
         await interaction.followup.send(
             embed=discord.Embed(
@@ -1181,7 +1155,7 @@ class FamilyTree(commands.Cog):
         if cached_png:
             await interaction.followup.send(
                 embed=discord.Embed(title=f"🌳 {target.display_name}'s Family", color=0x6699CC),
-                file=discord.File(io.BytesIO(cached_png), filename="family.png"),
+                file=discord.File(io.BytesIO(cached_png), filename="family.webp"),
             )
             return
 
@@ -1199,6 +1173,10 @@ class FamilyTree(commands.Cog):
                     color=0x445566,
                 )
             )
+
+        if _render_cooldown_remaining(cache_key):
+            return await _send_render_cooldown(interaction)
+        _mark_render_attempt(cache_key)
 
         all_ids = _collect_ids_from_roots(connected_roots)
 
@@ -1229,15 +1207,15 @@ class FamilyTree(commands.Cog):
         )
 
         img_buf.seek(0)
-        png_bytes = img_buf.read()
-        _cache_set(cache_key, png_bytes)
+        webp_bytes = img_buf.read()
+        _cache_set(cache_key, webp_bytes)
 
         await status_msg.edit(
             embed=discord.Embed(
                 title=f"🌳 {target.display_name}'s Family",
                 color=0x6699CC,
             ),
-            attachments=[discord.File(io.BytesIO(png_bytes), filename="family.png")],
+            attachments=[discord.File(io.BytesIO(webp_bytes), filename="family.webp")],
         )
 
     # ── /tree ─────────────────────────────────────────────────────────────
@@ -1260,7 +1238,7 @@ class FamilyTree(commands.Cog):
             if cached_png:
                 await interaction.followup.send(
                     embed=discord.Embed(title=f"🌳 {member.display_name}'s Family", color=0x6699CC),
-                    file=discord.File(io.BytesIO(cached_png), filename="family.png"),
+                    file=discord.File(io.BytesIO(cached_png), filename="family.webp"),
                 )
                 return
 
@@ -1276,6 +1254,10 @@ class FamilyTree(commands.Cog):
                         color=0x445566,
                     )
                 )
+
+            if _render_cooldown_remaining(cache_key):
+                return await _send_render_cooldown(interaction)
+            _mark_render_attempt(cache_key)
 
             all_ids = _collect_ids_from_roots(connected)
             name_map: dict[int, str] = {}
@@ -1302,11 +1284,11 @@ class FamilyTree(commands.Cog):
                 title=f"{member.display_name}'s Family — Solace",
             )
             img_buf.seek(0)
-            png_bytes = img_buf.read()
-            _cache_set(cache_key, png_bytes)
+            webp_bytes = img_buf.read()
+            _cache_set(cache_key, webp_bytes)
             await status_msg.edit(
                 embed=discord.Embed(title=f"🌳 {member.display_name}'s Family", color=0x6699CC),
-                attachments=[discord.File(io.BytesIO(png_bytes), filename="family.png")],
+                attachments=[discord.File(io.BytesIO(webp_bytes), filename="family.webp")],
             )
             return
 
@@ -1316,7 +1298,7 @@ class FamilyTree(commands.Cog):
         if cached_png:
             await interaction.followup.send(
                 embed=discord.Embed(title="🌲 Solace Family Tree", color=0xAA88FF),
-                file=discord.File(io.BytesIO(cached_png), filename="solace_family_tree.png"),
+                file=discord.File(io.BytesIO(cached_png), filename="solace_family_tree.webp"),
             )
             return
 
@@ -1335,6 +1317,10 @@ class FamilyTree(commands.Cog):
                     color=0x334455,
                 )
             )
+
+        if _render_cooldown_remaining(cache_key):
+            return await _send_render_cooldown(interaction)
+        _mark_render_attempt(cache_key)
 
         all_ids = _collect_ids_from_roots(roots)
         name_map = {}
@@ -1357,8 +1343,8 @@ class FamilyTree(commands.Cog):
         )
         img_buf = await render_tree(roots=roots, avatar_urls=av_urls, title="Solace Family Tree")
         img_buf.seek(0)
-        png_bytes = img_buf.read()
-        _cache_set(cache_key, png_bytes)
+        webp_bytes = img_buf.read()
+        _cache_set(cache_key, webp_bytes)
 
         total_couples = len(marriages)
         total_pc      = len(pc_rows)
@@ -1375,7 +1361,7 @@ class FamilyTree(commands.Cog):
                 ),
                 color=0xAA88FF,
             ).set_footer(text="💞 Relationships update automatically."),
-            attachments=[discord.File(io.BytesIO(png_bytes), filename="solace_family_tree.png")],
+            attachments=[discord.File(io.BytesIO(webp_bytes), filename="solace_family_tree.webp")],
         )
 
     # ── /runaway ──────────────────────────────────────────────────────────
@@ -1427,7 +1413,6 @@ class FamilyTree(commands.Cog):
             )
 
         _invalidate_guild_cache(guild_id)
-        asyncio.create_task(_rewarm_guild_cache(interaction.guild))
         await msg.edit(
             embed=discord.Embed(description="✅ Done. You ran away.", color=0x666677),
             view=None,

@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: solace-ghosty-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: BOT_PREFIX
+        value: "!"
+      - key: DEV_GUILD_ID
+        sync: false
+      - key: DEEPINFRA_TOKEN
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"

@@ -6,7 +6,7 @@ Setup:
   2. Install dependencies:  pip install -r requirements.txt
   3. Run the bot:           python bot.py
 
-On Railway, set Variables (not .env):
+On Render, set Environment variables (not .env in the repo):
   DISCORD_TOKEN (or BOT_TOKEN), DATABASE_URL, OWNER_ID, optional DEV_GUILD_ID / DEEPINFRA_TOKEN.
 
 Slash commands:
@@ -25,10 +25,10 @@ from discord.ext import commands
 
 import config
 
-# --- Keep-alive web server for Railway health checks ---
-# Railway injects PORT; healthchecks probe that port, so do not hardcode 10000.
+# --- Keep-alive web server for Render health checks ---
+# Render injects PORT; the service must listen on it.
 _flask_app = Flask(__name__)
-_PORT = int(os.environ.get("PORT", "8080"))
+_PORT = int(os.environ.get("PORT", "10000"))
 
 
 @_flask_app.route("/")

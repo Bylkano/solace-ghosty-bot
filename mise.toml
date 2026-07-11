@@ -1,0 +1,6 @@
+[settings]
+# Python 3.11.9 prebuilds have no GitHub attestations; Railpack/mise fails without this.
+python.github_attestations = false
+
+[tools]
+python = "3.11.9"

@@ -2,17 +2,21 @@
 Discord bot entry point.
 
 Setup:
-  1. Copy .env.example to .env and fill in BOT_TOKEN (and optionally OWNER_ID, DEV_GUILD_ID).
+  1. Copy env.example to .env and fill in DISCORD_TOKEN + DATABASE_URL.
   2. Install dependencies:  pip install -r requirements.txt
   3. Run the bot:           python bot.py
 
+On Railway, set Variables (not .env):
+  DISCORD_TOKEN (or BOT_TOKEN), DATABASE_URL, OWNER_ID, optional DEV_GUILD_ID / DEEPINFRA_TOKEN.
+
 Slash commands:
   - By default, commands sync globally (may take up to 1 hour on first run).
-  - Set DEV_GUILD_ID in .env to sync instantly to a single test server during development.
+  - Set DEV_GUILD_ID to sync instantly to a single test server during development.
 """
 
 import asyncio
 import logging
+import os
 import threading
 
 from flask import Flask
@@ -22,21 +26,29 @@ from discord.ext import commands
 import config
 
 # --- Keep-alive web server for Railway health checks ---
+# Railway injects PORT; healthchecks probe that port, so do not hardcode 10000.
 _flask_app = Flask(__name__)
+_PORT = int(os.environ.get("PORT", "8080"))
 
 
 @_flask_app.route("/")
+@_flask_app.route("/health")
 def _index():
     return "I am alive", 200
 
 
 def _start_web_server() -> None:
     thread = threading.Thread(
-        target=lambda: _flask_app.run(host="0.0.0.0", port=10000),
+        target=lambda: _flask_app.run(
+            host="0.0.0.0",
+            port=_PORT,
+            use_reloader=False,
+            threaded=True,
+        ),
         daemon=True,
     )
     thread.start()
-    log.info("Keep-alive web server started on port 10000")
+    log.info("Keep-alive web server started on port %s", _PORT)
 
 
 logging.basicConfig(

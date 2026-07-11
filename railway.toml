@@ -1,11 +1,9 @@
 [build]
-builder = "nixpacks"
+builder = "RAILPACK"
 
 [deploy]
 startCommand = "python bot.py"
-restartPolicyType = "always"
 healthcheckPath = "/"
-healthcheckTimeout = 30
-
-[[services]]
-port = 10000
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

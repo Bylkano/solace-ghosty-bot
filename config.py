@@ -24,10 +24,10 @@ DEEPINFRA_TOKEN: str = os.getenv("DEEPINFRA_TOKEN", "")
 
 if not BOT_TOKEN:
     raise ValueError(
-        "No token found. Set DISCORD_TOKEN (or BOT_TOKEN) in your environment or .env file."
+        "No token found. Set DISCORD_TOKEN or BOT_TOKEN in Railway Variables (or .env)."
     )
 
 if not DATABASE_URL:
     raise ValueError(
-        "DATABASE_URL is required. Set it in your environment or .env file."
+        "DATABASE_URL is required. Set it in Railway Variables (or .env) to your Neon URL."
     )

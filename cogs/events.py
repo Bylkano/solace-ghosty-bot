@@ -33,10 +33,12 @@ BLOCKED_PREFIXES: tuple[str, ...] = (
     "? send 458302301187342336",
     "?give 458302301187342336",
     "? give 458302301187342336",
+    "? date",
+    "?date",
 )
 
 # Warn settings
-SHORT_MUTE_MINUTES = 3      # mute duration per warn
+SHORT_MUTE_MINUTES = 5     # mute duration per warn
 LONG_MUTE_MINUTES = 30      # mute duration at max warns
 MAX_WARNS = 3               # warns before long mute
 

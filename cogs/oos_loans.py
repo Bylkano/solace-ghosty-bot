@@ -4,9 +4,11 @@ oos_loans.py – Shared notebook for oos debts (not an economy).
 Only stores reminders of who owes whom. The real oos currency lives in
 another bot — this never moves balances.
 
+One command adds both sides of the note:
+  /owe @user amount  → you owe them, and it shows as a lend on their /debts
+
 Commands
 --------
-  /lend @user amount [note]   – Note that you lent them oos
   /owe  @user amount [note]   – Note that you owe them oos
   /pay  id [amount]           – Mark paid / reduce the noted amount
   /loan-delete id             – Remove a note
@@ -123,8 +125,10 @@ class OosLoans(commands.Cog):
         embed = discord.Embed(
             title=title,
             description=(
-                f"{_mention(interaction.guild, borrower.id)} owes "
-                f"{_mention(interaction.guild, lender.id)} **{_fmt(amount)}**"
+                f"**You owe** {_mention(interaction.guild, lender.id)} "
+                f"**{_fmt(amount)}**\n"
+                f"On their `/debts` this shows as a **lend** "
+                f"({_mention(interaction.guild, borrower.id)} owes them)."
             ),
             color=COLOR,
         )
@@ -134,40 +138,11 @@ class OosLoans(commands.Cog):
         embed.set_footer(text="Notebook only — mark paid with /pay · list with /debts")
         await interaction.followup.send(embed=embed)
 
-    # ── /lend ──────────────────────────────────────────────────────────────
-
-    @app_commands.command(
-        name="lend",
-        description="💸 Note that you lent oos to someone (they owe you).",
-    )
-    @app_commands.describe(
-        member="Who you lent oos to",
-        amount="How much oos (note only — does not move currency)",
-        note="Optional reminder (why / when)",
-    )
-    @app_commands.guild_only()
-    async def lend(
-        self,
-        interaction: discord.Interaction,
-        member: discord.Member,
-        amount: app_commands.Range[int, 1, MAX_AMOUNT],
-        note: Optional[str] = None,
-    ) -> None:
-        await interaction.response.defer()
-        await self._add(
-            interaction,
-            lender=interaction.user,  # type: ignore[arg-type]
-            borrower=member,
-            amount=int(amount),
-            note=note,
-            title="💸 Debt note saved",
-        )
-
     # ── /owe ───────────────────────────────────────────────────────────────
 
     @app_commands.command(
         name="owe",
-        description="🧾 Note that you owe someone oos.",
+        description="🧾 Note that you owe someone oos (shows as a lend on their side).",
     )
     @app_commands.describe(
         member="Who you owe",
@@ -355,7 +330,7 @@ class OosLoans(commands.Cog):
                     inline=False,
                 )
 
-        embed.set_footer(text="Notes only — oos stays in your other bot · /lend · /owe · /pay")
+        embed.set_footer(text="Notes only — oos stays in your other bot · /owe · /pay · /debts")
         await interaction.followup.send(embed=embed)
 
     # ── /debt ──────────────────────────────────────────────────────────────

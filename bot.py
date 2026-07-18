@@ -16,40 +16,11 @@ Slash commands:
 
 import asyncio
 import logging
-import os
-import threading
 
-from flask import Flask
 import discord
 from discord.ext import commands
 
 import config
-
-# --- Keep-alive web server for Render health checks ---
-# Render injects PORT; the service must listen on it.
-_flask_app = Flask(__name__)
-_PORT = int(os.environ.get("PORT", "10000"))
-
-
-@_flask_app.route("/")
-@_flask_app.route("/health")
-def _index():
-    return "I am alive", 200
-
-
-def _start_web_server() -> None:
-    thread = threading.Thread(
-        target=lambda: _flask_app.run(
-            host="0.0.0.0",
-            port=_PORT,
-            use_reloader=False,
-            threaded=True,
-        ),
-        daemon=True,
-    )
-    thread.start()
-    log.info("Keep-alive web server started on port %s", _PORT)
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,6 +38,7 @@ COGS = [
     "cogs.dna_test",
     "cogs.profile",
     "cogs.jail",
+    "cogs.oos_loans",
 ]
 
 
@@ -121,7 +93,6 @@ class Bot(commands.Bot):
 
 
 async def main() -> None:
-    _start_web_server()
     bot = Bot()
     async with bot:
         await bot.start(config.BOT_TOKEN)

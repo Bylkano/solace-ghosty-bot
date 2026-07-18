@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Neon (and some hosts) may provide postgres:// — normalise for psycopg2.
+# Render (and some hosts) may provide postgres:// — normalise for psycopg2.
 _raw_db_url = os.getenv("DATABASE_URL", "")
 if _raw_db_url.startswith("postgres://"):
     _raw_db_url = "postgresql://" + _raw_db_url[len("postgres://") :]
@@ -29,5 +29,5 @@ if not BOT_TOKEN:
 
 if not DATABASE_URL:
     raise ValueError(
-        "DATABASE_URL is required. Set it in Render Environment (or .env) to your Neon URL."
+        "DATABASE_URL is required. Set it in Render Environment (or .env)."
     )

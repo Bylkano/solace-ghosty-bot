@@ -49,6 +49,9 @@ GAY_EMOJI_NAMES: tuple[str, ...] = (
     "GAYY",
     "gays",
     "t_Gay_hella",
+    "GAY",
+    "gay",
+    "gay_bruh",
 )
 
 

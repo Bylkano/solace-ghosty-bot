@@ -42,6 +42,15 @@ SHORT_MUTE_MINUTES = 5     # mute duration per warn
 LONG_MUTE_MINUTES = 30      # mute duration at max warns
 MAX_WARNS = 3               # warns before long mute
 
+# Reply with "?gay" → react on the parent message with these custom emojis
+GAY_TRIGGER = "?gay"
+GAY_EMOJI_NAMES: tuple[str, ...] = (
+    "pepegay",
+    "GAYY",
+    "gays",
+    "t_Gay_hella",
+)
+
 
 class Events(commands.Cog):
     """Handles Discord gateway events and auto-moderation."""
@@ -119,10 +128,50 @@ class Events(commands.Cog):
     async def on_member_remove(self, member: discord.Member) -> None:
         pass
 
+    def _find_emoji(self, guild: discord.Guild, name: str) -> discord.Emoji | None:
+        emoji = discord.utils.get(guild.emojis, name=name)
+        if emoji is not None:
+            return emoji
+        emoji = discord.utils.get(self.bot.emojis, name=name)
+        if emoji is not None:
+            return emoji
+        # Case-insensitive fallback (Discord names can vary in casing)
+        lower = name.lower()
+        for candidate in (*guild.emojis, *self.bot.emojis):
+            if candidate.name.lower() == lower:
+                return candidate
+        return None
+
+    async def _check_gay_reply(self, message: discord.Message) -> None:
+        if message.guild is None or message.reference is None:
+            return
+        if message.content.strip().lower() != GAY_TRIGGER:
+            return
+
+        target = message.reference.resolved
+        if not isinstance(target, discord.Message):
+            if message.reference.message_id is None:
+                return
+            try:
+                target = await message.channel.fetch_message(message.reference.message_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+
+        for name in GAY_EMOJI_NAMES:
+            emoji = self._find_emoji(message.guild, name)
+            if emoji is None:
+                log.warning("?gay: emoji %r not found in guild %s", name, message.guild.id)
+                continue
+            try:
+                await target.add_reaction(emoji)
+            except discord.HTTPException as exc:
+                log.warning("?gay: failed to react with %s: %s", name, exc)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
+        await self._check_gay_reply(message)
         await self._check_blocked_prefixes(message)
         await self._check_lockdown_phrases(message)
 

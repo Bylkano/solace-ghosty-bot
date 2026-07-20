@@ -64,6 +64,7 @@ COGS = [
     "cogs.profile",
     "cogs.jail",
     "cogs.oos_loans",
+    "cogs.plato_tournament",
 ]
 
 

@@ -145,78 +145,7 @@ def set_group(guild_id: int, group_code: str, user_ids: list[int]) -> None:
         con.commit()
 
 
-def get_player_group(guild_id: int, user_id: int) -> Optional[str]:
-    with _connect() as con:
-        with con.cursor() as cur:
-            cur.execute(
-                """
-                SELECT group_code FROM plato_players
-                WHERE guild_id = %s AND user_id = %s
-                LIMIT 1
-                """,
-                (guild_id, user_id),
-            )
-            row = cur.fetchone()
-            return row[0] if row else None
-
-
-def get_player_matches(guild_id: int, user_id: int) -> dict[str, Any]:
-    """
-    Return match sheet for a player:
-      group, points, played[{opponent_id, my_score, their_score}], remaining[opponent_id]
-    """
-    group = get_player_group(guild_id, user_id)
-    if not group:
-        raise LookupError("this member is not in any Plato group")
-
-    players = get_group_players(guild_id, group)
-    opponents = [uid for uid in players if uid != user_id]
-
-    with _connect() as con:
-        with con.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT player_low, player_high, score_low, score_high, created_at
-                FROM plato_results
-                WHERE guild_id = %s AND group_code = %s
-                  AND (player_low = %s OR player_high = %s)
-                ORDER BY created_at ASC, id ASC
-                """,
-                (guild_id, group, user_id, user_id),
-            )
-            rows = [dict(r) for r in cur.fetchall()]
-
-    played: list[dict[str, Any]] = []
-    played_vs: set[int] = set()
-    points = 0
-    for r in rows:
-        if r["player_low"] == user_id:
-            opp = int(r["player_high"])
-            mine, theirs = int(r["score_low"]), int(r["score_high"])
-        else:
-            opp = int(r["player_low"])
-            mine, theirs = int(r["score_high"]), int(r["score_low"])
-        points += mine
-        played_vs.add(opp)
-        played.append(
-            {
-                "opponent_id": opp,
-                "my_score": mine,
-                "their_score": theirs,
-            }
-        )
-
-    remaining = [oid for oid in opponents if oid not in played_vs]
-    total = len(opponents)
-    return {
-        "group": group,
-        "points": points,
-        "played": played,
-        "remaining": remaining,
-        "played_count": len(played),
-        "remaining_count": len(remaining),
-        "total": total,
-    }
+def get_group_players(guild_id: int, group_code: str) -> list[int]:
     group_code = group_code.upper()
     with _connect() as con:
         with con.cursor() as cur:

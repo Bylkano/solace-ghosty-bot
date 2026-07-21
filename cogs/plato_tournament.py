@@ -10,7 +10,6 @@ Admin:
 
 Everyone:
   /ranking
-  /matches
   /platohelp
 """
 
@@ -21,7 +20,6 @@ import logging
 import pathlib
 import re
 import sys
-from typing import Optional
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
@@ -378,101 +376,6 @@ class PlatoTournament(commands.Cog):
             )
         )
 
-    # ── /matches ──────────────────────────────────────────────────────────
-
-    @app_commands.command(
-        name="matches",
-        description="🏆 Show a player's finished results and remaining group matches.",
-    )
-    @app_commands.describe(member="Player to check (defaults to you)")
-    @app_commands.guild_only()
-    async def matches(
-        self,
-        interaction: discord.Interaction,
-        member: Optional[discord.Member] = None,
-    ) -> None:
-        await interaction.response.defer()
-        target = member or interaction.user
-        assert isinstance(target, (discord.Member, discord.User))
-        assert interaction.guild is not None
-
-        try:
-            sheet = await self._run(
-                db.get_player_matches, interaction.guild_id, target.id
-            )
-        except LookupError as exc:
-            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
-            return
-        except Exception as exc:
-            log.exception("matches failed")
-            await interaction.followup.send(f"❌ Could not load matches: {exc}", ephemeral=True)
-            return
-
-        group = sheet["group"]
-        embed = discord.Embed(
-            title=f"📋 {target.display_name}'s matches — Group {group}",
-            color=COLOR,
-        )
-        embed.add_field(
-            name="Progress",
-            value=(
-                f"**{sheet['played_count']}/{sheet['total']}** matches played\n"
-                f"**{sheet['remaining_count']}** left · **{sheet['points']}** pts"
-            ),
-            inline=False,
-        )
-
-        if sheet["played"]:
-            lines = []
-            for m in sheet["played"]:
-                opp = _display_name(interaction.guild, m["opponent_id"])
-                lines.append(
-                    f"✅ vs **{opp}** — `{m['my_score']}–{m['their_score']}` "
-                    f"(+{m['my_score']} pt)"
-                )
-            # Discord field limit 1024
-            chunk: list[str] = []
-            size = 0
-            field_i = 1
-            for line in lines:
-                add = len(line) + (1 if chunk else 0)
-                if chunk and size + add > 1000:
-                    embed.add_field(
-                        name="Finished" if field_i == 1 else f"Finished (cont. {field_i})",
-                        value="\n".join(chunk),
-                        inline=False,
-                    )
-                    field_i += 1
-                    chunk = [line]
-                    size = len(line)
-                else:
-                    chunk.append(line)
-                    size += add
-            if chunk:
-                embed.add_field(
-                    name="Finished" if field_i == 1 else f"Finished (cont. {field_i})",
-                    value="\n".join(chunk),
-                    inline=False,
-                )
-        else:
-            embed.add_field(name="Finished", value="*No results yet*", inline=False)
-
-        if sheet["remaining"]:
-            left = "\n".join(
-                f"⏳ vs **{_display_name(interaction.guild, oid)}**"
-                for oid in sheet["remaining"]
-            )
-            embed.add_field(name="Remaining", value=left[:1024], inline=False)
-        else:
-            embed.add_field(
-                name="Remaining",
-                value="🎉 All group matches completed!",
-                inline=False,
-            )
-
-        embed.set_footer(text="Results are stored permanently — editing games list won't erase them")
-        await interaction.followup.send(embed=embed)
-
     # ── /ranking ──────────────────────────────────────────────────────────
 
     @app_commands.command(
@@ -522,10 +425,7 @@ class PlatoTournament(commands.Cog):
         )
         embed.add_field(
             name="Everyone",
-            value=(
-                "`/ranking` — Group A / B / C / D standings\n"
-                "`/matches` — your (or someone's) results + remaining games"
-            ),
+            value="`/ranking` — Group A / B / C / D standings",
             inline=False,
         )
         embed.add_field(

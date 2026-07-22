@@ -10,8 +10,9 @@ On Render, set Environment variables (not .env in the repo):
   DISCORD_TOKEN (or BOT_TOKEN), DATABASE_URL, OWNER_ID, optional DEV_GUILD_ID / DEEPINFRA_TOKEN.
 
 Slash commands:
-  - By default, commands sync globally (may take up to 1 hour on first run).
-  - Set DEV_GUILD_ID to sync instantly to a single test server during development.
+  - Always sync globally on startup so removed cogs disappear from Discord's
+    command list (global updates can take up to ~1 hour to propagate).
+  - If DEV_GUILD_ID is set, also sync that guild for an instant local update.
 """
 
 import asyncio
@@ -95,18 +96,21 @@ class Bot(commands.Bot):
             except Exception as exc:
                 log.error("Failed to load cog %s: %s", cog, exc, exc_info=True)
 
+        # Always sync globally. Unloaded cogs (e.g. economy drops) are not in
+        # the tree, so Discord drops those slash commands from the global list.
+        # If we only sync a DEV_GUILD_ID, stale global commands stay visible.
+        synced = await self.tree.sync()
+        log.info("Synced %d slash command(s) globally", len(synced))
+
         if config.DEV_GUILD_ID:
             guild = discord.Object(id=config.DEV_GUILD_ID)
             self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
+            guild_synced = await self.tree.sync(guild=guild)
             log.info(
-                "Synced %d slash command(s) to dev guild %s",
-                len(synced),
+                "Synced %d slash command(s) to guild %s (instant)",
+                len(guild_synced),
                 config.DEV_GUILD_ID,
             )
-        else:
-            synced = await self.tree.sync()
-            log.info("Synced %d slash command(s) globally", len(synced))
 
     async def on_ready(self) -> None:
         assert self.user is not None

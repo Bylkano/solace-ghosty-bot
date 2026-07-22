@@ -57,7 +57,9 @@ def _start_port_server() -> None:
 COGS = [
     "cogs.moderation",
     "cogs.events",
-    "cogs.server_drops_economy",
+    # Economy / event drops — Solace event finished; leave unloaded.
+    # Re-enable by uncommenting: "cogs.server_drops_economy",
+    # "cogs.server_drops_economy",
     "cogs.family_tree",
     "cogs.crush",
     "cogs.dna_test",

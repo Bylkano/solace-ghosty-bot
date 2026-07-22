@@ -54,6 +54,10 @@ GAY_EMOJI_NAMES: tuple[str, ...] = (
     "gay_bruh",
 )
 
+# Type "?wispy" → bot replies "i love @xo.wispy" (pings that member)
+WISPY_TRIGGER = "?wispy"
+WISPY_USERNAME = "xo.wispy"
+
 
 class Events(commands.Cog):
     """Handles Discord gateway events and auto-moderation."""
@@ -170,11 +174,50 @@ class Events(commands.Cog):
             except discord.HTTPException as exc:
                 log.warning("?gay: failed to react with %s: %s", name, exc)
 
+    def _find_wispy_member(self, guild: discord.Guild) -> discord.Member | None:
+        """Resolve xo.wispy by username / global name / nickname (case-insensitive)."""
+        needle = WISPY_USERNAME.lower()
+        for member in guild.members:
+            if member.bot:
+                continue
+            names = (
+                member.name,
+                member.global_name or "",
+                member.display_name,
+            )
+            if any(n.lower() == needle for n in names if n):
+                return member
+        return None
+
+    async def _check_wispy(self, message: discord.Message) -> None:
+        if message.guild is None:
+            return
+        if message.content.strip().lower() != WISPY_TRIGGER:
+            return
+
+        member = self._find_wispy_member(message.guild)
+        if member is not None:
+            text = f"i love {member.mention}"
+        else:
+            # Fallback won't ping, but still replies if the member isn't cached.
+            text = f"i love @{WISPY_USERNAME}"
+            log.warning(
+                "?wispy: could not find member %r in guild %s",
+                WISPY_USERNAME,
+                message.guild.id,
+            )
+
+        try:
+            await message.channel.send(text)
+        except discord.HTTPException as exc:
+            log.warning("?wispy: failed to send reply: %s", exc)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
         await self._check_gay_reply(message)
+        await self._check_wispy(message)
         await self._check_blocked_prefixes(message)
         await self._check_lockdown_phrases(message)
 
